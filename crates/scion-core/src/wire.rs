@@ -192,6 +192,18 @@ mod tests {
     }
 
     #[test]
+    fn count_rejects_counts_the_remaining_input_cannot_hold() {
+        // Three 2-byte items fit in 6 remaining bytes; four do not, and must be
+        // rejected before any caller allocates for them.
+        let rest = [0u8; 6];
+        let input = |n: u8| [&[n][..], &rest].concat();
+        assert_eq!(Reader::new(&input(3)).count(2), Ok(3));
+        assert_eq!(Reader::new(&input(4)).count(2), Err(FormatError::Truncated));
+        assert_eq!(Reader::new(&input(7)).count(1), Err(FormatError::Truncated));
+        assert_eq!(Reader::new(&input(6)).count(1), Ok(6));
+    }
+
+    #[test]
     fn bytes_rejects_oversized_length_before_reading() {
         let mut b = Vec::new();
         put_uvarint(&mut b, MAX_FIELD_BYTES as u64 + 1);
