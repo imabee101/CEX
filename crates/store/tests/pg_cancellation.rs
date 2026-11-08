@@ -50,7 +50,6 @@ fn batch(round: u64) -> Vec<(MetaKey, Bytes)> {
             MetaKey::Derived(DerivedKey {
                 kind: 1,
                 version: 1,
-                param: 0,
                 changeset: id,
             }),
             value,

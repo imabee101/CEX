@@ -57,9 +57,6 @@ ignore = { version = "0.4.34" }
 # Exact pins fix the Unicode version for case-conflict checks; internal crates only.
 icu_normalizer = { version = "=2.4" }
 icu_casemap = { version = "=2.4" }
-# The data crates icu_normalizer and icu_casemap read; tests check their Unicode version.
-icu_normalizer_data = { version = "=2.4" }
-icu_casemap_data = { version = "=2.4" }
 imara-diff = { version = "0.2.0", default-features = false }
 fuser = { version = "0.18.0", default-features = false }
 nfsserve = { version = "0.11.0" }

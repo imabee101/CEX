@@ -102,9 +102,6 @@ impl BuggyMeta {
                 MetaKey::Changeset(scion_core::ChangesetId::from_bytes(*id.as_bytes()))
             }
             MetaKey::Derived(d) => MetaKey::Changeset(d.changeset),
-            MetaKey::Blob(id) => {
-                MetaKey::Changeset(scion_core::ChangesetId::from_bytes(*id.as_bytes()))
-            }
         }
     }
 

@@ -62,8 +62,7 @@ enum Cmd {
         #[arg(long, value_enum)]
         only: Vec<Step>,
     },
-    /// Run cargo-mutants with nextest on the diff against main, testing each
-    /// mutant with the whole workspace's fast tests.
+    /// Run cargo-mutants with nextest on the diff against main.
     Mutants {
         /// Extra arguments for cargo-mutants.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -702,26 +701,8 @@ fn mutants(args: &[OsString]) -> Result {
     std::fs::create_dir_all(&dir)?;
     let diff_file = dir.join("mutants.diff");
     std::fs::write(&diff_file, diff)?;
-    // Most of a crate's behavior is tested from other crates (derived and
-    // store from ops, for example), so every mutant runs the workspace's
-    // tests; testing only the mutated package reports caught mutants as
-    // missed.
-    let mut c = cargo([
-        "mutants",
-        "--test-tool",
-        "nextest",
-        "--test-workspace=true",
-        // The baseline runs only the mutated packages' tests, so the timeout
-        // it sets would be too short for the workspace's.
-        "--minimum-test-timeout=120",
-        "--in-diff",
-    ]);
+    let mut c = cargo(["mutants", "--test-tool", "nextest", "--in-diff"]);
     c.arg(&diff_file).args(args);
-    // The mutant source copies and their builds live under target/, not in
-    // the system temp directory, which may be small or in RAM.
-    let tmp = root().join("target/mutants-tmp");
-    std::fs::create_dir_all(&tmp)?;
-    c.env("TMPDIR", &tmp);
     run(c)
 }
 
