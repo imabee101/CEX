@@ -34,6 +34,9 @@ const PROTO_CRATE: &str = "scion-proto";
 const PROTO_DIR: &str = "crates/scion-proto/proto";
 const PROTO_GEN_DIR: &str = "crates/scion-proto/src/gen";
 
+/// scion-core's language-neutral test vectors, used as fuzz seeds.
+const VECTORS_FILE: &str = "crates/scion-core/vectors/v1.txt";
+
 #[derive(Parser)]
 #[command(about = "Scion project tooling")]
 struct Cli {
@@ -539,21 +542,58 @@ fn fuzz_targets() -> Result<Vec<String>> {
         .collect())
 }
 
+/// Runs every fuzz target for the full budget at once: the targets are
+/// independent, so running them in parallel gives each its whole budget in
+/// a fraction of the wall time.
 fn fuzz_all() -> Result {
     let targets = fuzz_targets()?;
     if targets.is_empty() {
-        eprintln!("fuzz: no fuzz targets defined");
+        return Err("fuzz: no fuzz targets defined".into());
     }
-    for target in targets {
-        fuzz(&target, Duration::from_secs(FUZZ_BUDGET_SECONDS))?;
+    let budget = Duration::from_secs(FUZZ_BUDGET_SECONDS);
+    let setup = fuzz_setup()?;
+    run(fuzz_command(&setup, "build", None, None))?;
+    let mut children = Vec::new();
+    for target in &targets {
+        let mut c = fuzz_command(&setup, "run", Some(target), Some(budget));
+        eprintln!("$ cargo fuzz run {target} (budget {}s)", budget.as_secs());
+        let child = c
+            .spawn()
+            .map_err(|e| format!("cannot start fuzzer `{target}`: {e}"))?;
+        children.push((target, child));
     }
-    Ok(())
+    let mut failed = Vec::new();
+    for (target, mut child) in children {
+        let status = child.wait()?;
+        eprintln!("fuzz: {target} finished: {status}");
+        if !status.success() {
+            failed.push(target.as_str());
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("fuzz targets failed: {failed:?}; reproducers are in fuzz/artifacts").into())
+    }
 }
 
 fn fuzz(target: &str, duration: Duration) -> Result {
     if !fuzz_targets()?.iter().any(|t| t == target) {
         return Err(format!("unknown fuzz target `{target}`").into());
     }
+    let setup = fuzz_setup()?;
+    run(fuzz_command(&setup, "run", Some(target), Some(duration)))
+}
+
+struct FuzzSetup {
+    toolchain: String,
+    host: String,
+    seeds: PathBuf,
+}
+
+/// Installs the pinned nightly, finds its host target, and writes the seed
+/// corpus.
+fn fuzz_setup() -> Result<FuzzSetup> {
     let channel = fuzz_toolchain()?;
     install_toolchain(&channel)?;
     let toolchain = format!("+{channel}");
@@ -565,18 +605,73 @@ fn fuzz(target: &str, duration: Duration) -> Result {
         .lines()
         .find_map(|l| l.strip_prefix("host: ").map(str::to_owned))
         .ok_or("rustc -vV printed no host")?;
-    run(cargo([
-        toolchain.as_str(),
+    let seeds = write_fuzz_seeds()?;
+    Ok(FuzzSetup {
+        toolchain,
+        host,
+        seeds,
+    })
+}
+
+fn fuzz_command(
+    setup: &FuzzSetup,
+    action: &str,
+    target: Option<&str>,
+    duration: Option<Duration>,
+) -> Command {
+    let mut c = cargo([
+        setup.toolchain.as_str(),
         "fuzz",
-        "run",
+        action,
         "--fuzz-dir",
         "fuzz",
         "--target",
-        &host,
-        target,
-        "--",
-        &format!("-max_total_time={}", duration.as_secs()),
-    ]))
+        &setup.host,
+    ]);
+    if let Some(target) = target {
+        // The first corpus directory collects new inputs; the second holds
+        // the seeds, which are only read.
+        let corpus = root().join("fuzz/corpus").join(target);
+        c.arg(target).arg(&corpus).arg(&setup.seeds);
+    }
+    if let Some(d) = duration {
+        c.args(["--", &format!("-max_total_time={}", d.as_secs())]);
+    }
+    c
+}
+
+/// Writes every scion-core golden vector as a seed input, so the fuzzers
+/// start from valid objects of every kind and from the known rejects.
+fn write_fuzz_seeds() -> Result<PathBuf> {
+    let vectors = std::fs::read_to_string(root().join(VECTORS_FILE))?;
+    let dir = root().join("target/xtask/fuzz-seeds");
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    std::fs::create_dir_all(&dir)?;
+    for target in fuzz_targets()? {
+        std::fs::create_dir_all(root().join("fuzz/corpus").join(target))?;
+    }
+    let mut name = None;
+    for line in vectors.lines() {
+        if let Some(n) = line.strip_prefix("name: ") {
+            name = Some(n.to_owned());
+        } else if let Some(hex) = line.strip_prefix("bytes:") {
+            let n = name.take().ok_or("vectors file: bytes without a name")?;
+            std::fs::write(dir.join(n), decode_hex(hex.trim())?)?;
+        }
+    }
+    Ok(dir)
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return Err("odd-length hex".into());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| Ok(u8::from_str_radix(&s[i..i + 2], 16)?))
+        .collect()
 }
 
 fn parse_duration(s: &str) -> Result<Duration> {

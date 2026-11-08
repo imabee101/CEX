@@ -13,5 +13,33 @@ cargo-fuzz = true
 libfuzzer-sys = { workspace = true }
 scion-core = { workspace = true }
 
+[[bin]]
+name = "changeset"
+path = "fuzz_targets/changeset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tree"
+path = "fuzz_targets/tree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_list"
+path = "fuzz_targets/chunk_list.rs"
+test = false
+doc = false
+bench = false
+
 [lints]
 workspace = true
