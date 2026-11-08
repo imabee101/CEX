@@ -170,8 +170,9 @@ pub fn named_object_store(prefix: &str) -> PrefixStore<AmazonS3> {
     PrefixStore::new(store, Path::from(prefix))
 }
 
-/// A directory under the system temp directory, owned by one test and
-/// removed when this value is dropped.
+/// A directory under the workspace's `target/test-tmp` (on disk, not in the
+/// system temp directory, which may be RAM), owned by one test and removed
+/// when this value is dropped.
 #[derive(Debug)]
 pub struct TempDir {
     path: std::path::PathBuf,
@@ -180,7 +181,9 @@ pub struct TempDir {
 impl TempDir {
     /// Creates an empty directory no other test uses.
     pub fn create() -> Self {
-        let path = std::env::temp_dir().join(format!("scion-{}", unique_name()));
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-tmp")
+            .join(format!("scion-{}", unique_name()));
         std::fs::create_dir_all(&path).expect("creating the test directory failed");
         Self { path }
     }
@@ -253,6 +256,51 @@ impl<B: crate::BlobStore, T: crate::BlobStore> crate::BlobStore for OverlayBlobS
 #[cfg(test)]
 mod tests {
     use super::TempDir;
+
+    #[tokio::test]
+    async fn an_overlay_reads_through_its_base_and_writes_only_its_top() {
+        use crate::{BlobStore, MemoryBlobStore, ObjectKey, PutOutcome, RepoId};
+        use bytes::Bytes;
+        use scion_core::BlobId;
+        let repo = RepoId(1);
+        let base = MemoryBlobStore::new();
+        let top = MemoryBlobStore::new();
+        let k = |s: &[u8]| ObjectKey::blob(BlobId::hash(s));
+        base.put_if_absent(repo, k(b"b"), Bytes::from_static(b"base"))
+            .await
+            .unwrap();
+        let o = super::OverlayBlobStore::new(base, top);
+        let (base, top) = (&o.base, &o.top);
+        // A key the base holds exists, reads from the base, and is not
+        // written again.
+        assert!(o.contains(repo, k(b"b")).await.unwrap());
+        assert_eq!(
+            o.put_if_absent(repo, k(b"b"), Bytes::from_static(b"new"))
+                .await
+                .unwrap(),
+            PutOutcome::Existed
+        );
+        assert!(!top.contains(repo, k(b"b")).await.unwrap());
+        assert_eq!(
+            o.get(repo, k(b"b")).await.unwrap(),
+            Some(Bytes::from_static(b"base"))
+        );
+        // A new key goes to the top only.
+        assert!(!o.contains(repo, k(b"t")).await.unwrap());
+        assert_eq!(
+            o.put_if_absent(repo, k(b"t"), Bytes::from_static(b"top"))
+                .await
+                .unwrap(),
+            PutOutcome::Created
+        );
+        assert!(o.contains(repo, k(b"t")).await.unwrap());
+        assert!(!base.contains(repo, k(b"t")).await.unwrap());
+        assert_eq!(
+            o.get(repo, k(b"t")).await.unwrap(),
+            Some(Bytes::from_static(b"top"))
+        );
+        assert_eq!(o.get(repo, k(b"none")).await.unwrap(), None);
+    }
 
     #[test]
     fn temp_dirs_are_removed_on_drop() {

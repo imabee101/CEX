@@ -370,6 +370,48 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
         Ok(())
     }
 
+    /// Up to `limit` names starting with `prefix` in the directory whose top
+    /// node is `id`, in name order. Reads only the shards that can hold such
+    /// names, and stops once it has `limit`: every shard is non-empty, so
+    /// this reads O(`limit` × trie depth) nodes however large the directory.
+    pub async fn find_prefixed(
+        &mut self,
+        id: TreeId,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, DeriveError> {
+        enum Item {
+            Node(TreeId),
+            Name(Vec<u8>),
+        }
+        let mut out = Vec::new();
+        let mut stack = vec![Item::Node(id)];
+        while out.len() < limit {
+            match stack.pop() {
+                None => break,
+                Some(Item::Name(n)) => out.push(n),
+                Some(Item::Node(id)) => {
+                    let node = self.get(id).await?;
+                    for e in node.entries().iter().rev() {
+                        match e.target {
+                            EntryTarget::Shard(s)
+                                if e.name.starts_with(prefix) || prefix.starts_with(&e.name) =>
+                            {
+                                stack.push(Item::Node(s));
+                            }
+                            EntryTarget::Shard(_) => {}
+                            _ if e.name.starts_with(prefix) => {
+                                stack.push(Item::Name(e.name.clone()));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Builds the node for an entry set, splitting it when it is too large.
     fn build(
         &mut self,
@@ -467,32 +509,39 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
                 apply_updates(&mut map, ups)?;
                 return self.build(map);
             };
-            if ups.iter().any(|(n, _)| !n.starts_with(&prefix)) {
-                // A new name outside the prefix shortens the common prefix,
-                // which reshapes the whole node: rebuild it from its names.
-                let mut map: BTreeMap<Vec<u8>, EntryTarget> = self
-                    .flatten(id)
-                    .await?
-                    .into_iter()
-                    .map(|e| (e.name, e.target))
-                    .collect();
-                apply_updates(&mut map, ups)?;
-                return self.build(map);
-            }
-            let mut prefix_entry: BTreeMap<Vec<u8>, EntryTarget> = node
-                .entries()
-                .iter()
-                .filter(|e| e.name == prefix)
-                .map(|e| (e.name.clone(), e.target))
-                .collect();
-            let mut groups: BTreeMap<u8, Group> = node
-                .entries()
-                .iter()
-                .filter_map(|e| match e.target {
-                    EntryTarget::Shard(s) => Some((e.name[prefix.len()], Group::Old(s))),
-                    _ => None,
-                })
-                .collect();
+            let (prefix, mut prefix_entry, mut groups) =
+                if ups.iter().all(|(n, _)| n.starts_with(&prefix)) {
+                    let prefix_entry: BTreeMap<Vec<u8>, EntryTarget> = node
+                        .entries()
+                        .iter()
+                        .filter(|e| e.name == prefix)
+                        .map(|e| (e.name.clone(), e.target))
+                        .collect();
+                    let groups: BTreeMap<u8, Group> = node
+                        .entries()
+                        .iter()
+                        .filter_map(|e| match e.target {
+                            EntryTarget::Shard(s) => Some((e.name[prefix.len()], Group::Old(s))),
+                            _ => None,
+                        })
+                        .collect();
+                    (prefix, prefix_entry, groups)
+                } else {
+                    // A new name outside the prefix shortens the common
+                    // prefix to the part it shares with it. Every old name
+                    // starts with the old prefix, so the old node is the one
+                    // group for the old prefix's next byte, and is updated
+                    // in place like any group (INV-1): no rebuild.
+                    let short = ups.iter().fold(prefix.len(), |n, (name, _)| {
+                        prefix[..n]
+                            .iter()
+                            .zip(name)
+                            .take_while(|(a, b)| a == b)
+                            .count()
+                    });
+                    let groups = BTreeMap::from([(prefix[short], Group::Old(id))]);
+                    (prefix[..short].to_vec(), BTreeMap::new(), groups)
+                };
             let mut by_group: BTreeMap<u8, Vec<(Vec<u8>, Update)>> = BTreeMap::new();
             let mut net: i64 = 0;
             let mut own = Vec::new();
@@ -808,4 +857,59 @@ fn apply_updates(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use scion_core::{BlobId, FileKind};
+
+    use super::*;
+
+    fn tree(names: usize, salt: usize) -> Tree {
+        Tree::new(
+            (0..names)
+                .map(|i| TreeEntry {
+                    name: format!("n{i:04}").into_bytes(),
+                    target: EntryTarget::File {
+                        kind: FileKind::Regular,
+                        blob: BlobId::hash(&salt.to_le_bytes()),
+                        size: 0,
+                        sha256: [0; 32],
+                    },
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_node_weighs_its_names_plus_a_cost_per_entry_and_per_node() {
+        // Two five-byte names: 2 × (5 + 96) + 64.
+        assert_eq!(tree_weight(&tree(2, 0)), 266);
+        assert_eq!(tree_weight(&tree(0, 0)), 64);
+    }
+
+    #[test]
+    fn the_tree_cache_stays_within_its_byte_budget() {
+        let budget = 200_000;
+        let cache = TreeCache::new(budget);
+        for salt in 0..200 {
+            let t = tree(100, salt);
+            cache.insert(RepoId(1), t.id(), Arc::new(t));
+        }
+        cache.inner.run_pending_tasks();
+        assert!(
+            cache.inner.weighted_size() <= budget,
+            "{}",
+            cache.inner.weighted_size()
+        );
+        // Each node weighs about 10 KB, so far fewer than 200 remain, and
+        // the cache does hold some.
+        assert!(
+            cache.inner.entry_count() <= 20,
+            "{}",
+            cache.inner.entry_count()
+        );
+        assert!(cache.inner.entry_count() >= 1);
+    }
 }

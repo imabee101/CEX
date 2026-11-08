@@ -361,6 +361,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blob_reads_are_forwarded_and_counted() {
+        let (faults, _, blobs, _, raw_blobs) = stores();
+        let there = ObjectKey::blob(BlobId::hash(b"there"));
+        let absent = ObjectKey::blob(BlobId::hash(b"absent"));
+        raw_blobs
+            .put_if_absent(REPO, there, Bytes::from_static(b"f"))
+            .await
+            .unwrap();
+        assert!(blobs.contains(REPO, there).await.unwrap());
+        assert!(!blobs.contains(REPO, absent).await.unwrap());
+        assert_eq!(
+            blobs.get(REPO, there).await.unwrap(),
+            Some(Bytes::from_static(b"f"))
+        );
+        assert_eq!(blobs.get(REPO, absent).await.unwrap(), None);
+        assert_eq!(faults.counts().blob_reads, 4);
+        faults.crash_at(0, CrashPoint::BeforeWrite);
+        assert!(
+            blobs
+                .put_if_absent(REPO, absent, Bytes::new())
+                .await
+                .is_err()
+        );
+        assert!(
+            blobs.contains(REPO, there).await.is_err(),
+            "a dead process reads nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn crash_before_a_write_skips_it_and_kills_later_calls() {
         let (faults, meta, blobs, raw_meta, raw_blobs) = stores();
         faults.crash_at(1, CrashPoint::BeforeWrite);

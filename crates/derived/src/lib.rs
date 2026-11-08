@@ -6,8 +6,9 @@
 //! changeset and its parents' values, written insert-if-absent, cached in
 //! RAM, and derived at most once at a time per key on each server (INV-20).
 //!
-//! Eager types, derived inside create: [`RootTree`], [`CommitGraph`], and
-//! [`RestrictedRoots`].
+//! Eager types, derived inside create: [`RootTree`], [`CommitGraph`],
+//! [`RestrictedRoots`], and the case-conflict index (`ops::case::CaseIndex`),
+//! which lives in the ops crate with the name folding it uses.
 
 mod blob_record;
 mod codec;
@@ -36,4 +37,7 @@ pub mod kinds {
     pub const COMMIT_GRAPH: u16 = 2;
     /// [`crate::RestrictedRoots`].
     pub const RESTRICTED_ROOTS: u16 = 3;
+    /// The case-conflict index, defined in the ops crate, which owns the
+    /// name folding it uses.
+    pub const CASE_INDEX: u16 = 4;
 }

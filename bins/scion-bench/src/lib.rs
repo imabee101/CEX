@@ -528,4 +528,115 @@ mod tests {
         };
         assert_ne!(content(&p, &a), content(&p, &b));
     }
+
+    /// (`GENERATOR_VERSION`, digest of 20,000 files, digest of 37 files).
+    const GOLDEN: (u32, &str, &str) = (
+        1,
+        "8fc48253e29cd3b60fa5e8d14a7ef9a1b45effebb00c6a6947b7f2fb4fffc487",
+        "58b491cc27a8a3beaeca34ef30b8c227926d53b58b39492df1d29dab51f80c30",
+    );
+
+    /// Digests of 64 and 47 files at depth 3 and fanout 8.
+    const GOLDEN_TIGHT: (&str, &str) = (
+        "6634e30cf8c9036bebd6f20fe1f8915d6c86201b8f3cecd8ecc54530ffd4f218",
+        "da941810fb946c6647127844dc1aba3c834409950434a455ede0cec5a839e65e",
+    );
+
+    /// A digest of the layout and of every file's contents for `p`.
+    fn digest(p: &BenchParams) -> String {
+        let mut h = blake3::Hasher::new();
+        for f in layout(p) {
+            h.update(f.path.as_bytes());
+            h.update(&f.size.to_le_bytes());
+            h.update(&f.index.to_le_bytes());
+            h.update(blake3::hash(&content(p, &f)).as_bytes());
+        }
+        h.finalize().to_hex().to_string()
+    }
+
+    /// The generator's output is fixed for a `GENERATOR_VERSION`: a change
+    /// to it must bump the version, which renames every cached repo.
+    #[test]
+    fn the_generator_output_is_locked() {
+        assert_eq!(GENERATOR_VERSION, GOLDEN.0);
+        assert_eq!(digest(&small(20_000)), GOLDEN.1);
+        assert_eq!(digest(&small(37)), GOLDEN.2);
+        // Shallow, narrow trees, where directory capacity binds.
+        for (files, want) in [(64, GOLDEN_TIGHT.0), (47, GOLDEN_TIGHT.1)] {
+            let p = BenchParams {
+                files,
+                max_depth: 3,
+                max_fanout: 8,
+                ..BENCH
+            };
+            let l = layout(&p);
+            assert_eq!(l.len() as u64, files);
+            assert!(l.iter().all(|f| f.depth() <= 3));
+            let mut entries: std::collections::HashMap<String, std::collections::HashSet<String>> =
+                std::collections::HashMap::new();
+            for f in &l {
+                let parts: Vec<&str> = f.path.split('/').collect();
+                for i in 0..parts.len() {
+                    entries
+                        .entry(parts[..i].join("/"))
+                        .or_default()
+                        .insert(parts[i].to_owned());
+                }
+            }
+            assert!(entries.values().all(|e| e.len() <= 8), "{files}");
+            assert_eq!(digest(&p), want, "{files}");
+        }
+    }
+
+    #[test]
+    fn depth_counts_path_components() {
+        let f = |path: &str| FileSpec {
+            path: path.into(),
+            size: 0,
+            index: 0,
+        };
+        assert_eq!(f("a").depth(), 1);
+        assert_eq!(f("a/b/c").depth(), 3);
+    }
+
+    #[test]
+    fn the_rng_is_splitmix64() {
+        // The reference outputs of SplitMix64 from seed 0.
+        let mut r = Rng(0);
+        assert_eq!(r.next_u64(), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(r.next_u64(), 0x6e78_9e6a_a1b9_65f4);
+        assert_eq!(r.next_u64(), 0x06c4_5d18_8009_454f);
+    }
+
+    #[test]
+    fn the_bench_repo_is_the_one_claude_md_specifies() {
+        assert_eq!(BENCH.seed, 0x5C10_2026);
+        assert_eq!(BENCH.files, 3_000_000);
+        assert_eq!((BENCH.max_depth, BENCH.max_fanout), (12, 64));
+        assert_eq!((BENCH.median_size, BENCH.sigma), (2048.0, 2.0));
+        assert_eq!(BENCH.max_size, 64 * 1024 * 1024);
+        assert_eq!(BENCH.files_per_changeset, 2000);
+    }
+
+    #[test]
+    fn cache_keys_tell_parameter_sets_apart() {
+        assert_eq!(BENCH.key(), BENCH.key());
+        let keys: std::collections::HashSet<String> = [
+            BENCH,
+            small(10_000),
+            BenchParams { seed: 1, ..BENCH },
+            BenchParams {
+                max_depth: 11,
+                ..BENCH
+            },
+            BenchParams {
+                max_size: 1,
+                ..BENCH
+            },
+        ]
+        .iter()
+        .map(BenchParams::key)
+        .collect();
+        assert_eq!(keys.len(), 5);
+    }
 }

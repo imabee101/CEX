@@ -209,3 +209,46 @@ async fn diffs_equal_a_naive_comparison() {
         }
     }
 }
+
+/// A file is "binary differs" when either side is binary: text to binary
+/// and binary to text both have no patch.
+#[tokio::test]
+async fn either_side_binary_makes_the_file_binary() {
+    let e = env().await;
+    let ops = ops(&e.meta, &e.blobs);
+    let mut m = Model::default();
+    let (c, b) = m.apply(&[
+        ("t2b", Some((FileKind::Regular, b"text\n"))),
+        ("b2t", Some((FileKind::Regular, b"bin\0ary\n"))),
+        ("t2t", Some((FileKind::Regular, b"text\n"))),
+    ]);
+    let one = commit(&ops, &[], "one", c, &b).await.unwrap();
+    let (c, b) = m.apply(&[
+        ("t2b", Some((FileKind::Regular, b"bin\0ary\n"))),
+        ("b2t", Some((FileKind::Regular, b"text\n"))),
+        ("t2t", Some((FileKind::Regular, b"other\n"))),
+    ]);
+    let two = commit(&ops, &[one], "two", c, &b).await.unwrap();
+    let out = ops
+        .diff(REPO, one, two, DiffMode::Patch, &[])
+        .await
+        .unwrap();
+    let got: Vec<(String, bool, bool)> = out
+        .iter()
+        .map(|f| {
+            (
+                String::from_utf8(f.path.clone()).unwrap(),
+                f.binary,
+                f.patch.is_empty(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("b2t".to_owned(), true, true),
+            ("t2b".to_owned(), true, true),
+            ("t2t".to_owned(), false, false),
+        ]
+    );
+}

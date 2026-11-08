@@ -14,6 +14,7 @@ use common::*;
 use derived::{AclConfig, CommitGraph, DerivedType, GraphNode, RestrictedRoots, RootTree};
 use ops::CreateOptions;
 use ops::blob::upload_blobs;
+use ops::case::CaseIndex;
 use scion_core::{ChangesetId, FileKind, RepoPath, TreeId};
 use store::fault::{FaultBlobStore, FaultMetaStore, Faults, Write};
 use store::{MetaKey, MetaStore};
@@ -168,6 +169,7 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
     d2.get(REPO, &RootTree, tip).await.unwrap();
     d2.get(REPO, &CommitGraph, tip).await.unwrap();
     d2.get(REPO, &restricted, tip).await.unwrap();
+    d2.get(REPO, &CaseIndex, tip).await.unwrap();
 
     async fn values<T: DerivedType>(
         meta: &store::PgMetaStore,
@@ -202,6 +204,11 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
             values(&first.meta, &restricted, &ancestors).await,
             values(&second.meta, &restricted, &ancestors).await,
         ),
+        (
+            "CaseIndex",
+            values(&first.meta, &CaseIndex, &ancestors).await,
+            values(&second.meta, &CaseIndex, &ancestors).await,
+        ),
     ] {
         assert!(
             a.iter().all(Option::is_some),
@@ -214,6 +221,7 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
         d2.get(REPO, &RootTree, *id).await.unwrap();
         d2.get(REPO, &CommitGraph, *id).await.unwrap();
         d2.get(REPO, &restricted, *id).await.unwrap();
+        d2.get(REPO, &CaseIndex, *id).await.unwrap();
     }
     assert_eq!(
         values(&first.meta, &RootTree, &dag.ids).await,
@@ -226,6 +234,10 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
     assert_eq!(
         values(&first.meta, &restricted, &dag.ids).await,
         values(&second.meta, &restricted, &dag.ids).await
+    );
+    assert_eq!(
+        values(&first.meta, &CaseIndex, &dag.ids).await,
+        values(&second.meta, &CaseIndex, &dag.ids).await
     );
     // And every root equals the reference root of the changeset's files.
     for id in &ancestors {
@@ -436,4 +448,52 @@ async fn concurrent_derivations_of_one_key_write_it_once() {
         .flatten()
         .unwrap();
     assert_eq!((ra.unwrap(), rb.unwrap()), (stored.clone(), stored));
+}
+
+/// A restricted root's tree is re-read when a file beneath it changes in
+/// the same changeset as a sibling whose name sorts between the root and
+/// its contents (`a/b.c` sorts between `a/b` and `a/b/c`).
+#[tokio::test]
+async fn restricted_roots_follow_changes_next_to_sorting_siblings() {
+    let env = env().await;
+    let config = acl(1, &["a/b"]);
+    let ops = ops(&env.meta, &env.blobs);
+    let opts = CreateOptions {
+        acl: config.clone(),
+        ..CreateOptions::default()
+    };
+    let restricted = RestrictedRoots::new(config);
+    let mut m = Model::default();
+    let mut parent: Vec<ChangesetId> = Vec::new();
+    for (i, round) in [
+        vec![("a/b/c", "1"), ("a/b.c", "1")],
+        vec![("a/b/c", "2"), ("a/b.c", "2")],
+        vec![("a/b/c", "3"), ("a/b-c", "3"), ("a/b.c", "3")],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let specs: Vec<Spec<'_>> = round
+            .iter()
+            .map(|(p, c)| (*p, Some((FileKind::Regular, c.as_bytes()))))
+            .collect();
+        let (changes, contents) = m.apply(&specs);
+        let d = ops.deriver();
+        upload_blobs(&**d.meta(), d.blobs(), REPO, &contents)
+            .await
+            .unwrap();
+        let id = ops
+            .create_changeset(REPO, changeset(&parent, &format!("r{i}"), changes), &opts)
+            .await
+            .unwrap();
+        let got = RestrictedRoots::decode(&d.get(REPO, &restricted, id).await.unwrap()).unwrap();
+        let mut sub = Model::default();
+        for (p, (k, c)) in &m.files {
+            if let Some(rest) = p.strip_prefix(b"a/b/") {
+                sub.files.insert(rest.to_vec(), (*k, c.clone()));
+            }
+        }
+        assert_eq!(got.get(&path("a/b")), Some(&sub.root()), "round {i}");
+        parent = vec![id];
+    }
 }

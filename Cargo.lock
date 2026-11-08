@@ -1314,6 +1314,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 name = "ops"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "derived",
  "icu_casemap",

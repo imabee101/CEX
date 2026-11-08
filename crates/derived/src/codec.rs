@@ -114,6 +114,21 @@ mod tests {
         assert!(Reader::new(&[0x80, 0x00], "test").uvarint().is_err());
         assert!(Reader::new(&[0xff; 10], "test").uvarint().is_err());
         assert!(Reader::new(&[0x80], "test").uvarint().is_err());
+        // A tenth byte may only carry the top bit of a u64.
+        let mut over = vec![0xff; 9];
+        over.push(0x02);
+        assert!(Reader::new(&over, "test").uvarint().is_err());
+        over[9] = 0x01;
+        assert_eq!(Reader::new(&over, "test").uvarint().unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn byte_strings_may_end_the_input_but_not_overrun_it() {
+        let mut r = Reader::new(&[2, 7, 8], "test");
+        assert_eq!(r.bytes().unwrap(), &[7, 8]);
+        r.finish().unwrap();
+        assert!(Reader::new(&[3, 7, 8], "test").bytes().is_err());
+        assert_eq!(Reader::new(&[0], "test").bytes().unwrap(), &[] as &[u8]);
     }
 
     #[test]

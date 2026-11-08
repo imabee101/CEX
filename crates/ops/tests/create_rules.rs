@@ -198,6 +198,16 @@ async fn path_prefix_and_file_directory_conflicts_are_rejected() {
         "a",
     )
     .await;
+    // The exception's shape over a directory: "deleting" a directory and
+    // writing beneath it would replace the directory's contents.
+    expect(
+        &ops,
+        base,
+        vec![("a", FileChange::Deleted), ("a/z", content("a/z"))],
+        Code::PathConflict,
+        "a",
+    )
+    .await;
     assert_not_stored(&env, base, vec![("b/d", content("b/d"))]).await;
     // The exception: a deleted file whose path becomes a directory.
     let id = try_create(
@@ -476,4 +486,68 @@ async fn creating_an_existing_changeset_again_succeeds_and_writes_nothing() {
         .unwrap();
     assert_eq!(id, base);
     assert!(faults.writes().is_empty(), "{:?}", faults.writes());
+}
+
+/// The limits are CLAUDE.md's, inclusive: a value at a limit is accepted
+/// and one byte (or parent) more is rejected.
+#[tokio::test]
+async fn limits_are_exact() {
+    assert_eq!(ops::MAX_AUTHOR_BYTES, 1024);
+    assert_eq!(ops::MAX_PATH_BYTES, 4096);
+    assert_eq!(ops::MAX_COMPONENT_BYTES, 255);
+    assert_eq!(ops::MAX_MESSAGE_BYTES, 1 << 20);
+    assert_eq!(ops::MAX_PARENTS, 64);
+    assert_eq!(ops::MAX_SIGNATURE_BYTES, 64 << 10);
+    let env = env().await;
+    let (ops, base) = base(&env).await;
+    let opts = CreateOptions::default();
+    let create = |parts: scion_core::ChangesetParts| {
+        let ops = &ops;
+        let opts = &opts;
+        async move {
+            ops.create_changeset(REPO, scion_core::Changeset::new(parts).unwrap(), opts)
+                .await
+        }
+    };
+    let check = |r: Result<ChangesetId, OpError>, ok: bool, what: &str| match (r, ok) {
+        (Ok(_), true) => {}
+        (Err(e), false) => assert_eq!(e.code, Code::LimitExceeded, "{what}: {e}"),
+        (r, _) => panic!("{what}: {r:?}"),
+    };
+    for (over, ok) in [(0, true), (1, false)] {
+        let mut p = changeset(&[base], &format!("a{over}"), vec![]).into_parts();
+        p.author = vec![b'a'; 1024 + over];
+        check(create(p).await, ok, "author");
+        let mut p = changeset(&[base], "", vec![]).into_parts();
+        p.message = vec![b'm'; (1 << 20) + over];
+        check(create(p).await, ok, "message");
+        let mut p = changeset(&[base], &format!("s{over}"), vec![]).into_parts();
+        p.signature = Some(vec![b's'; (64 << 10) + over]);
+        check(create(p).await, ok, "signature");
+        // 17 components of 240 bytes and 16 slashes: 4,096 bytes.
+        let mut comps = vec!["c".repeat(240); 17];
+        comps[0].push_str(&"c".repeat(over));
+        let long = comps.join("/");
+        check(
+            try_create(&ops, base, vec![(long.as_str(), content(&long))], &opts).await,
+            ok,
+            "path",
+        );
+        let name = "n".repeat(255 + over);
+        check(
+            try_create(&ops, base, vec![(name.as_str(), content(&name))], &opts).await,
+            ok,
+            "component",
+        );
+    }
+    // 64 parents are accepted, 65 are not.
+    let mut roots = Vec::new();
+    for i in 0..65 {
+        let p = changeset(&[], &format!("root {i}"), vec![]).into_parts();
+        roots.push(create(p).await.unwrap());
+    }
+    for (n, ok) in [(64, true), (65, false)] {
+        let p = changeset(&roots[..n], "merge", vec![]).into_parts();
+        check(create(p).await, ok, "parents");
+    }
 }

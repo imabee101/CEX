@@ -101,3 +101,40 @@ impl From<DeriveError> for OpError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Of the codes ops returns, only `UNAVAILABLE` is retryable (CLAUDE.md
+    /// lists `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `LAND_RETRIES_EXHAUSTED`,
+    /// and `ACL_PENDING`).
+    #[test]
+    fn only_unavailable_is_retryable() {
+        use Code::*;
+        for c in [
+            InvalidArgument,
+            NotCanonical,
+            LimitExceeded,
+            NoOpChange,
+            PathConflict,
+            CaseConflict,
+            NotFound,
+            DataLoss,
+        ] {
+            assert!(!c.retryable(), "{c:?}");
+        }
+        assert!(Unavailable.retryable());
+    }
+
+    #[test]
+    fn store_errors_keep_their_meaning() {
+        let code = |e: StoreError| OpError::from(e).code;
+        assert_eq!(
+            code(StoreError::InvalidArgument("x".into())),
+            Code::InvalidArgument
+        );
+        assert_eq!(code(StoreError::DataLoss("x".into())), Code::DataLoss);
+        assert_eq!(code(StoreError::Unavailable("x".into())), Code::Unavailable);
+    }
+}

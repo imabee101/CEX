@@ -89,11 +89,13 @@ fn touches(changes: &BTreeMap<RepoPath, scion_core::FileChange>, root: &RepoPath
     let r = root.as_bytes();
     let mut under = r.to_vec();
     under.push(b'/');
+    // Paths beneath the root sort after `root/`, but names such as
+    // `root.c` sort between `root` and `root/`; step over those (each one
+    // is a change, so this is O(changed files)).
     let beneath = changes
         .range(root.clone()..)
-        .take_while(|(p, _)| p.as_bytes() == r || p.as_bytes().starts_with(&under))
-        .next()
-        .is_some();
+        .take_while(|(p, _)| p.as_bytes() < under.as_slice() || p.as_bytes().starts_with(&under))
+        .any(|(p, _)| p.as_bytes() == r || p.as_bytes().starts_with(&under));
     beneath
         || r.iter()
             .enumerate()
@@ -166,6 +168,17 @@ mod tests {
         ] {
             let changes = BTreeMap::from([(p(changed), FileChange::Deleted)]);
             assert_eq!(touches(&changes, &root), want, "{changed}");
+        }
+        // Siblings sorting between `a/b` and `a/b/` do not hide a change
+        // beneath it.
+        for siblings in [&["a/b.c"][..], &["a/b!", "a/b-x", "a/b.c"]] {
+            let mut changes: BTreeMap<RepoPath, FileChange> = siblings
+                .iter()
+                .map(|s| (p(s), FileChange::Deleted))
+                .collect();
+            assert!(!touches(&changes, &root), "{siblings:?}");
+            changes.insert(p("a/b/c"), FileChange::Deleted);
+            assert!(touches(&changes, &root), "{siblings:?} with a/b/c");
         }
     }
 

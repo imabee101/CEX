@@ -314,6 +314,21 @@ mod tests {
     }
 
     #[test]
+    fn hunks_merge_when_their_contexts_meet() {
+        // Changes at lines 2 and 2 + gap + 1, with `gap` unchanged lines
+        // between: contexts of three lines meet when gap <= 6.
+        for (gap, hunks) in [(6, 1), (7, 2)] {
+            let a: String = (0..30).map(|i| format!("{i}\n")).collect();
+            let b = a
+                .replace("\n2\n", "\nx\n")
+                .replace(&format!("\n{}\n", 3 + gap), "\ny\n");
+            let (p, n) = patch(&a, &b);
+            assert_eq!(n, (2, 2));
+            assert_eq!(p.matches("@@ -").count(), hunks, "gap {gap}: {p}");
+        }
+    }
+
+    #[test]
     fn filters_select_files_and_the_dirs_leading_to_them() {
         let f = [RepoPath::new(&b"a/b"[..]).unwrap()];
         assert!(keep_file(b"a/b", &f));

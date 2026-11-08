@@ -12,7 +12,7 @@ use scion_core::{Changeset, ChangesetId};
 use store::{BlobStore, MetaKey, MetaStore, RepoId};
 use tokio::sync::OnceCell;
 
-use crate::case::find_conflict;
+use crate::case::CaseIndex;
 use crate::{Code, OpError};
 
 /// The longest author, in bytes.
@@ -213,27 +213,20 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
             RootTree.key(id),
             Bytes::copy_from_slice(applied.root.as_bytes()),
         );
+        let index = CaseIndex::apply(&mut cx, cs).await?;
+        cx.set_value(CaseIndex.key(id), Bytes::copy_from_slice(index.as_bytes()));
         if opts.case_check && !opts.imported {
-            for added in &applied.added {
-                let entries = cx.trees.flatten(added.node).await?;
-                if let Some((name, other)) =
-                    find_conflict(entries.iter().map(|e| e.name.as_slice()), &added.names)
-                {
-                    let mut path = added.dir.clone();
-                    if !path.is_empty() {
-                        path.push(b'/');
-                    }
-                    path.extend_from_slice(name);
-                    return Err(OpError::at(
-                        Code::CaseConflict,
-                        format!(
-                            "{} conflicts with {} in the same directory",
-                            String::from_utf8_lossy(&path),
-                            String::from_utf8_lossy(other)
-                        ),
-                        &path,
-                    ));
-                }
+            let found = CaseIndex::find_conflict(&mut cx.trees, index, &applied.added).await?;
+            if let Some((path, other)) = found {
+                return Err(OpError::at(
+                    Code::CaseConflict,
+                    format!(
+                        "{} conflicts with {} in the same directory",
+                        String::from_utf8_lossy(&path),
+                        String::from_utf8_lossy(&other)
+                    ),
+                    &path,
+                ));
             }
         }
         let graph = CommitGraph.derive(&mut cx, id, cs).await?;

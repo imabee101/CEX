@@ -13,6 +13,7 @@ use common::*;
 use derived::{AclConfig, CommitGraph, DerivedType, GraphNode, RestrictedRoots, RootTree};
 use ops::CreateOptions;
 use ops::blob::upload_blobs;
+use ops::case::CaseIndex;
 use scion_core::{
     CHUNK_BYTES, ChangesetId, ChunkList, EntryTarget, FileChange, FileKind, Frame, FrameKind, Tree,
 };
@@ -124,7 +125,12 @@ async fn check_references(meta: &PgMetaStore, blobs: &ObjectBlobStore, keys: &BT
                                 );
                             }
                         }
-                        for d in [RootTree.key(*id), CommitGraph.key(*id), restricted.key(*id)] {
+                        for d in [
+                            RootTree.key(*id),
+                            CommitGraph.key(*id),
+                            restricted.key(*id),
+                            CaseIndex.key(*id),
+                        ] {
                             assert!(
                                 meta_has(meta, MetaKey::Derived(d)).await,
                                 "changeset without eager value {d:?}"
@@ -136,6 +142,14 @@ async fn check_references(meta: &PgMetaStore, blobs: &ObjectBlobStore, keys: &BT
                             meta_has(meta, MetaKey::Changeset(d.changeset)).await,
                             "value without its changeset"
                         );
+                        if d.kind == CaseIndex.key(d.changeset).kind {
+                            let id: [u8; 32] = bytes.as_ref().try_into().unwrap();
+                            assert!(
+                                meta_has(meta, MetaKey::Tree(scion_core::TreeId::from_bytes(id)))
+                                    .await,
+                                "CaseIndex without its tree"
+                            );
+                        }
                         if d.kind == RootTree.key(d.changeset).kind {
                             let root = RootTree::decode(&bytes).unwrap();
                             assert!(
@@ -190,6 +204,10 @@ async fn a_crash_at_every_write_step_leaves_no_broken_reference() {
     let meta = Arc::new(FaultMetaStore::new(env.meta.clone(), faults.clone()));
     let blobs = Arc::new(FaultBlobStore::new(env.blobs.clone(), faults.clone()));
     flow(&meta, &blobs, base, 0).await.unwrap();
+    assert!(
+        !faults.crashed(),
+        "a run with no crash point reports a crash"
+    );
     let steps = faults.writes().len() as u64;
     assert!(steps >= 10, "{steps} write steps");
 
@@ -205,6 +223,12 @@ async fn a_crash_at_every_write_step_leaves_no_broken_reference() {
             assert!(
                 crashed.is_err() && faults.crashed(),
                 "step {step} {point:?} did not crash"
+            );
+            // Writes run concurrently, so others may start alongside, but the
+            // crash comes no earlier than the chosen write.
+            assert!(
+                faults.writes().len() as u64 > step,
+                "step {step} {point:?} crashed at an earlier write"
             );
             let mut keys = written(&faults);
             check_references(&env.meta, &env.blobs, &keys).await;
