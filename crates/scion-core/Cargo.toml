@@ -12,6 +12,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

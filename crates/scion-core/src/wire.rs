@@ -1,0 +1,220 @@
+//! Primitive canonical encodings: minimal LEB128 `uvarint`, zigzag `svarint`,
+//! length-prefixed `bytes`, and `opt<T>` tags.
+
+use crate::{FormatError, MAX_FIELD_BYTES};
+
+/// Appends the minimal unsigned LEB128 encoding of `v`.
+pub(crate) fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// Appends the zigzag-then-`uvarint` encoding of `v`.
+pub(crate) fn put_svarint(out: &mut Vec<u8>, v: i64) {
+    put_uvarint(out, ((v << 1) ^ (v >> 63)) as u64);
+}
+
+/// Appends `bytes`: a `uvarint` length, then the raw bytes.
+pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_uvarint(out, b.len() as u64);
+    out.extend_from_slice(b);
+}
+
+/// Number of bytes `put_uvarint` writes for `v`.
+pub(crate) fn uvarint_len(v: u64) -> usize {
+    let bits = 64 - (v | 1).leading_zeros() as usize;
+    bits.div_ceil(7)
+}
+
+/// A cursor over untrusted input that decodes canonical primitives.
+#[derive(Debug)]
+pub(crate) struct Reader<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Fails unless every byte was consumed.
+    pub(crate) fn finish(self) -> Result<(), FormatError> {
+        if self.buf.is_empty() {
+            Ok(())
+        } else {
+            Err(FormatError::TrailingBytes(self.buf.len()))
+        }
+    }
+
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], FormatError> {
+        if n > self.buf.len() {
+            return Err(FormatError::Truncated);
+        }
+        let (head, tail) = self.buf.split_at(n);
+        self.buf = tail;
+        Ok(head)
+    }
+
+    pub(crate) fn u8(&mut self) -> Result<u8, FormatError> {
+        Ok(self.take(1)?[0])
+    }
+
+    pub(crate) fn array32(&mut self) -> Result<[u8; 32], FormatError> {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(self.take(32)?);
+        Ok(a)
+    }
+
+    pub(crate) fn uvarint(&mut self) -> Result<u64, FormatError> {
+        let mut v: u64 = 0;
+        for i in 0..10 {
+            let b = self.u8()?;
+            if i == 9 && b > 0x01 {
+                return Err(FormatError::VarintOverflow);
+            }
+            v |= u64::from(b & 0x7f) << (7 * i);
+            if b & 0x80 == 0 {
+                if i > 0 && b == 0 {
+                    return Err(FormatError::NonMinimalVarint);
+                }
+                return Ok(v);
+            }
+        }
+        Err(FormatError::VarintOverflow)
+    }
+
+    pub(crate) fn svarint(&mut self) -> Result<i64, FormatError> {
+        let u = self.uvarint()?;
+        Ok(((u >> 1) as i64) ^ -((u & 1) as i64))
+    }
+
+    /// Reads a `bytes` field, rejecting a length over `MAX_FIELD_BYTES`
+    /// before looking at (or allocating for) its contents.
+    pub(crate) fn bytes(&mut self) -> Result<&'a [u8], FormatError> {
+        let len = self.uvarint()?;
+        if len > MAX_FIELD_BYTES as u64 {
+            return Err(FormatError::FieldTooLong { len });
+        }
+        self.take(len as usize)
+    }
+
+    /// Reads an `opt<T>` tag: `false` for `0x00`, `true` for `0x01`.
+    pub(crate) fn opt_tag(&mut self) -> Result<bool, FormatError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            t => Err(FormatError::InvalidOptionTag(t)),
+        }
+    }
+
+    /// Reads a count of items that each occupy at least `min_item_bytes`,
+    /// rejecting counts the remaining input cannot hold, so callers may
+    /// allocate for the count.
+    pub(crate) fn count(&mut self, min_item_bytes: usize) -> Result<usize, FormatError> {
+        let n = self.uvarint()?;
+        if n > (self.remaining() / min_item_bytes) as u64 {
+            return Err(FormatError::Truncated);
+        }
+        Ok(n as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enc(v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_uvarint(&mut out, v);
+        out
+    }
+
+    #[test]
+    fn uvarint_known_encodings() {
+        assert_eq!(enc(0), [0x00]);
+        assert_eq!(enc(1), [0x01]);
+        assert_eq!(enc(127), [0x7f]);
+        assert_eq!(enc(128), [0x80, 0x01]);
+        assert_eq!(enc(300), [0xac, 0x02]);
+        assert_eq!(enc(16_384), [0x80, 0x80, 0x01]);
+        assert_eq!(
+            enc(u64::MAX),
+            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
+        );
+    }
+
+    #[test]
+    fn uvarint_len_matches_encoding() {
+        for v in [0, 1, 127, 128, 16_383, 16_384, u64::MAX >> 1, u64::MAX] {
+            assert_eq!(uvarint_len(v), enc(v).len(), "{v}");
+        }
+    }
+
+    #[test]
+    fn uvarint_rejects_non_minimal_and_overflow() {
+        let read = |b: &[u8]| Reader::new(b).uvarint();
+        assert_eq!(read(&[0x80, 0x00]), Err(FormatError::NonMinimalVarint));
+        assert_eq!(
+            read(&[0x81, 0x80, 0x00]),
+            Err(FormatError::NonMinimalVarint)
+        );
+        assert_eq!(
+            read(&[0xff; 9].iter().copied().chain([0x02]).collect::<Vec<_>>()),
+            Err(FormatError::VarintOverflow)
+        );
+        assert_eq!(read(&[0xff; 10]), Err(FormatError::VarintOverflow));
+        assert_eq!(read(&[0x80]), Err(FormatError::Truncated));
+        assert_eq!(read(&[]), Err(FormatError::Truncated));
+    }
+
+    #[test]
+    fn svarint_zigzag() {
+        for (v, want) in [
+            (0i64, 0u64),
+            (-1, 1),
+            (1, 2),
+            (-2, 3),
+            (i64::MAX, u64::MAX - 1),
+            (i64::MIN, u64::MAX),
+        ] {
+            let mut out = Vec::new();
+            put_svarint(&mut out, v);
+            assert_eq!(out, enc(want), "{v}");
+            assert_eq!(Reader::new(&out).svarint(), Ok(v));
+        }
+    }
+
+    #[test]
+    fn count_rejects_counts_the_remaining_input_cannot_hold() {
+        // Three 2-byte items fit in 6 remaining bytes; four do not, and must be
+        // rejected before any caller allocates for them.
+        let rest = [0u8; 6];
+        let input = |n: u8| [&[n][..], &rest].concat();
+        assert_eq!(Reader::new(&input(3)).count(2), Ok(3));
+        assert_eq!(Reader::new(&input(4)).count(2), Err(FormatError::Truncated));
+        assert_eq!(Reader::new(&input(7)).count(1), Err(FormatError::Truncated));
+        assert_eq!(Reader::new(&input(6)).count(1), Ok(6));
+    }
+
+    #[test]
+    fn bytes_rejects_oversized_length_before_reading() {
+        let mut b = Vec::new();
+        put_uvarint(&mut b, MAX_FIELD_BYTES as u64 + 1);
+        assert_eq!(
+            Reader::new(&b).bytes(),
+            Err(FormatError::FieldTooLong {
+                len: MAX_FIELD_BYTES as u64 + 1
+            })
+        );
+        let mut b = Vec::new();
+        put_uvarint(&mut b, MAX_FIELD_BYTES as u64);
+        assert_eq!(Reader::new(&b).bytes(), Err(FormatError::Truncated));
+    }
+}

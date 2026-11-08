@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 21913d3fe661acc25e11bc26979b3aa3aeae91dae46bcaad531b3365e9fb8192 # shrinks to t = Tree { entries: [] }
+cc 04ba5b9a502f34da20e447298cd310b0c6ce6e7e4ca885351ae3a04cd492d8d4 # shrinks to c = Changeset { parts: ChangesetParts { parents: [], author: [], author_date: Timestamp { seconds: 0, offset: 0 }, committer: None, message: [], signature: None, git_headers: None, file_changes: {RepoPath("\u{1}"): Deleted, RepoPath("\u{2}"): Deleted, RepoPath("\u{3}"): Deleted, RepoPath("\u{4}"): Deleted, RepoPath("\u{5}"): Deleted, RepoPath("\u{6}"): Deleted, RepoPath("\u{7}"): Deleted, RepoPath("\u{8}"): Deleted, RepoPath("\t"): Deleted, RepoPath("\n"): Deleted, RepoPath("\u{b}"): Deleted} } }, i = 9307635004778288846, j = 15762542382884303917

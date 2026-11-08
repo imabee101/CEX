@@ -33,7 +33,7 @@ jobs:
           - step: build
           - step: clippy
           - step: test-all
-            tools: cargo-nextest@0.9.151
+            tools: cargo-nextest@0.9.151,cargo-semver-checks@0.51.0
             dev-env: true
           - step: doctest
           - step: doc
