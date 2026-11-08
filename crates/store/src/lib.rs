@@ -16,6 +16,7 @@
 mod blob;
 pub mod conformance;
 mod error;
+pub mod fault;
 mod meta;
 pub mod testing;
 
