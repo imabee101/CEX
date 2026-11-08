@@ -1,0 +1,4 @@
+# Fuzz targets alone build with this pinned, dated nightly.
+[toolchain]
+channel = "nightly-2026-10-01"
+profile = "minimal"

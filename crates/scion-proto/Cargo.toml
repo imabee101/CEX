@@ -1,0 +1,10 @@
+[package]
+name = "scion-proto"
+description = "The scion.v1 gRPC API: its protobuf definitions and generated Rust code, with tonic client and server code behind the client and server features."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

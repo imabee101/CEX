@@ -1,0 +1,33 @@
+# Test tiers. A test that takes longer than SLOW_TEST_SECONDS (30 s) belongs in
+# the slow group: name it with a `slow_` prefix. The fast tier (`cargo xtask ci`)
+# excludes the slow group, and a test outside it is terminated, and fails, after
+# 30 s. The full tier (`cargo xtask ci-full`) runs everything.
+#
+# No concurrency limit is set for tests that use the dev environment: every test
+# gets its own database and key prefix, and nextest's default of one test per CPU
+# stays far below the Postgres connection limit in compose.yaml.
+
+[test-groups]
+slow = { max-threads = "num-cpus" }
+
+[profile.default]
+default-filter = "not test(/(^|::)slow_/)"
+retries = 0
+fail-fast = true
+slow-timeout = { period = "30s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+filter = "test(/(^|::)slow_/)"
+test-group = "slow"
+slow-timeout = { period = "60s", terminate-after = 60 }
+
+# CI reports every failure instead of stopping at the first.
+[profile.ci]
+fail-fast = false
+
+[profile.full]
+default-filter = "all()"
+
+[profile.ci-full]
+default-filter = "all()"
+fail-fast = false

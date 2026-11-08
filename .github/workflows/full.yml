@@ -1,0 +1,97 @@
+# Full tier on every merge to main and nightly. Each step of
+# `cargo xtask ci-full` runs as its own job; public-crate and vfs tests also run
+# on macOS and Windows.
+name: full
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: full-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: ${{ matrix.step }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - step: fmt
+          - step: build
+          - step: clippy
+          - step: test-all
+            tools: cargo-nextest@0.9.151
+            dev-env: true
+          - step: doctest
+          - step: doc
+          - step: deny
+            tools: cargo-deny@0.20.2
+          - step: semver
+            tools: cargo-semver-checks@0.51.0
+            history: true
+          - step: buf
+            buf: true
+            history: true
+          - step: proto-check
+          - step: fuzz
+            tools: cargo-fuzz@0.13.2
+          - step: msrv
+          - step: portable
+            tools: cargo-nextest@0.9.151
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ matrix.history && '0' || '1' }}
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: full-${{ matrix.step }}
+      - if: matrix.tools
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: ${{ matrix.tools }}
+          fallback: none
+      - if: matrix.buf
+        uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1.7.0
+        with:
+          version: 1.75.0
+          setup_only: true
+      - if: matrix.dev-env
+        run: cargo xtask dev-up
+      - run: cargo xtask ci-full --only ${{ matrix.step }}
+
+  portable:
+    name: portable (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-nextest@0.9.151
+          fallback: none
+      - run: cargo xtask ci-full --only portable

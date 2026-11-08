@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap = { workspace = true, features = ["std", "derive", "help", "usage", "error-context"] }
+protox = { workspace = true }
+tonic-prost-build = { workspace = true, features = ["cleanup-markdown"] }
+toml = { workspace = true, features = ["std", "parse", "serde"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,95 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/*",
+    "bins/*",
+    "fuzz",
+    "tests/sim",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Workspace crates. Public crates carry a version so they can be published.
+scion-core = { path = "crates/scion-core", version = "0.1.0" }
+scion-proto = { path = "crates/scion-proto", version = "0.1.0" }
+scion-client = { path = "crates/scion-client", version = "0.1.0" }
+scion-conformance = { path = "crates/scion-conformance", version = "0.1.0" }
+store = { path = "crates/store" }
+derived = { path = "crates/derived" }
+ops = { path = "crates/ops" }
+rpc = { path = "crates/rpc" }
+vfs = { path = "crates/vfs" }
+import = { path = "crates/import" }
+
+# Third-party crates: the CLAUDE.md Dependencies line, each at the newest release
+# compatible with the MSRV. Members opt into the features they need.
+tokio = { version = "1.54.1", default-features = false }
+tonic = { version = "0.14.9", default-features = false }
+prost = { version = "0.14.4", default-features = false }
+tonic-prost-build = { version = "0.14.9", default-features = false }
+protox = { version = "0.10.0", default-features = false }
+tower = { version = "0.5.3", default-features = false }
+bytes = { version = "1.12.1", default-features = false }
+# Default `std` enables runtime SIMD detection, which hashing speed depends on.
+blake3 = { version = "1.8.7" }
+sha2 = { version = "0.11.1", default-features = false }
+zstd = { version = "0.14.3", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
+tracing = { version = "0.1.44", default-features = false }
+serde = { version = "1.0.229", default-features = false }
+toml = { version = "1.2.1", default-features = false }
+rustls = { version = "0.23.46", default-features = false }
+ring = { version = "0.17.14", default-features = false }
+jsonwebtoken = { version = "11.1.0", default-features = false }
+moka = { version = "0.12.16", default-features = false }
+object_store = { version = "0.14.2", default-features = false }
+tokio-postgres = { version = "0.7.18", default-features = false }
+gix = { version = "0.90.0", default-features = false }
+notify = { version = "8.2.1", default-features = false }
+ignore = { version = "0.4.34" }
+# Exact pins fix the Unicode version for case-conflict checks; internal crates only.
+icu_normalizer = { version = "=2.4" }
+icu_casemap = { version = "=2.4" }
+imara-diff = { version = "0.2.0", default-features = false }
+fuser = { version = "0.18.0", default-features = false }
+nfsserve = { version = "0.11.0" }
+windows = { version = "0.62.2", default-features = false, features = ["Win32_Storage_ProjectedFileSystem"] }
+clap = { version = "4.6.7", default-features = false }
+proptest = { version = "1.12.0", default-features = false }
+arbitrary = { version = "1.5.0" }
+libfuzzer-sys = { version = "0.4.13" }
+turmoil = { version = "0.7.2" }
+criterion = { version = "0.8.2", default-features = false }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+undocumented_unsafe_blocks = "deny"
+
+# Fast iteration: small debug info, and dependencies optimized so hashing and
+# compression in tests run at realistic speed.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+opt-level = 2

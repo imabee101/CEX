@@ -1,0 +1,17 @@
+[package]
+name = "scion-core"
+description = "Scion's core object model: typed ids, the canonical binary encoding of changesets and trees, and the frame format. It performs no I/O and no async work."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true, features = ["std"] }
+
+[lints]
+workspace = true

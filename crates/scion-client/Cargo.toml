@@ -1,0 +1,10 @@
+[package]
+name = "scion-client"
+description = "Scion client library: connecting, object fetch, sparse profiles, the dirstate, the filesystem watcher, status, and commit, usable without the scn CLI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
