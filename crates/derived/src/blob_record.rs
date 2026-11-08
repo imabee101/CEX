@@ -4,7 +4,7 @@
 use crate::DeriveError;
 use crate::codec::{Reader, put_uvarint};
 
-const RECORD_VERSION: u8 = 1;
+const RECORD_VERSION: u8 = 2;
 
 /// What the metadata database knows about a stored blob.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -15,6 +15,9 @@ pub struct BlobRecord {
     pub sha256: [u8; 32],
     /// The git SHA-1 of the blob, when it was imported.
     pub git_sha1: Option<[u8; 20]>,
+    /// Text classification computed from uploaded bytes. `None` for legacy
+    /// records whose contents must be sniffed before a textual diff.
+    pub text: Option<bool>,
 }
 
 impl BlobRecord {
@@ -30,13 +33,19 @@ impl BlobRecord {
                 out.extend_from_slice(s);
             }
         }
+        out.push(match self.text {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        });
         out
     }
 
     /// Decodes stored bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, DeriveError> {
         let mut r = Reader::new(bytes, "blob record");
-        if r.u8()? != RECORD_VERSION {
+        let version = r.u8()?;
+        if version != 1 && version != RECORD_VERSION {
             return Err(DeriveError::DataLoss("unknown blob record version".into()));
         }
         let size = r.uvarint()?;
@@ -50,11 +59,22 @@ impl BlobRecord {
             }
             _ => return Err(DeriveError::DataLoss("bad blob record tag".into())),
         };
+        let text = if version == 1 {
+            None
+        } else {
+            match r.u8()? {
+                0 => None,
+                1 => Some(true),
+                2 => Some(false),
+                _ => return Err(DeriveError::DataLoss("bad text classification tag".into())),
+            }
+        };
         r.finish()?;
         Ok(Self {
             size,
             sha256,
             git_sha1,
+            text,
         })
     }
 }
@@ -70,6 +90,7 @@ mod tests {
                 size: 1 << 40,
                 sha256: [9; 32],
                 git_sha1,
+                text: Some(false),
             };
             assert_eq!(BlobRecord::decode(&r.encode()).unwrap(), r);
         }
@@ -77,9 +98,29 @@ mod tests {
             size: 1,
             sha256: [0; 32],
             git_sha1: None,
+            text: None,
         }
         .encode();
         bad.push(0);
         assert!(BlobRecord::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn classification_versions_and_tags() {
+        // v1: version, size, SHA-256, absent git SHA-1; no classification.
+        let mut legacy = vec![1, 7];
+        legacy.extend_from_slice(&[9; 32]);
+        legacy.push(0);
+        let record = BlobRecord::decode(&legacy).unwrap();
+        assert_eq!(record.text, None);
+        for text in [None, Some(true), Some(false)] {
+            let record = BlobRecord { text, ..record };
+            assert_eq!(BlobRecord::decode(&record.encode()).unwrap(), record);
+        }
+        let mut bad = record.encode();
+        *bad.last_mut().unwrap() = 3;
+        assert!(BlobRecord::decode(&bad).is_err());
+        legacy.push(0);
+        assert!(BlobRecord::decode(&legacy).is_err());
     }
 }

@@ -109,6 +109,20 @@ async fn check_references(meta: &PgMetaStore, blobs: &ObjectBlobStore, keys: &BT
                             );
                         }
                     }
+                    MetaKey::CaseNode(_) => {
+                        for e in Tree::decode(&bytes).unwrap().entries() {
+                            let need = match e.target {
+                                EntryTarget::Tree(t) | EntryTarget::Shard(t) => {
+                                    MetaKey::CaseNode(t)
+                                }
+                                EntryTarget::File { blob, .. } => MetaKey::Blob(blob),
+                            };
+                            assert!(
+                                meta_has(meta, need).await,
+                                "index refers to missing {need:?}"
+                            );
+                        }
+                    }
                     MetaKey::Changeset(id) => {
                         let cs = scion_core::Changeset::decode(&bytes).unwrap();
                         for p in &cs.parts().parents {
@@ -145,8 +159,11 @@ async fn check_references(meta: &PgMetaStore, blobs: &ObjectBlobStore, keys: &BT
                         if d.kind == CaseIndex.key(d.changeset).kind {
                             let id: [u8; 32] = bytes.as_ref().try_into().unwrap();
                             assert!(
-                                meta_has(meta, MetaKey::Tree(scion_core::TreeId::from_bytes(id)))
-                                    .await,
+                                meta_has(
+                                    meta,
+                                    MetaKey::CaseNode(scion_core::TreeId::from_bytes(id))
+                                )
+                                .await,
                                 "CaseIndex without its tree"
                             );
                         }

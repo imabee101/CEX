@@ -65,12 +65,22 @@ pub(crate) async fn load_trees<M: MetaStore>(
     cache: &TreeCache,
     repo: RepoId,
     ids: &[TreeId],
+    private: bool,
 ) -> Result<Vec<Arc<Tree>>, DeriveError> {
     let mut out: Vec<Option<Arc<Tree>>> =
         ids.iter().map(|id| cache.inner.get(&(repo, *id))).collect();
     let missing: Vec<usize> = (0..ids.len()).filter(|&i| out[i].is_none()).collect();
     if !missing.is_empty() {
-        let keys: Vec<MetaKey> = missing.iter().map(|&i| MetaKey::Tree(ids[i])).collect();
+        let keys: Vec<MetaKey> = missing
+            .iter()
+            .map(|&i| {
+                if private {
+                    MetaKey::CaseNode(ids[i])
+                } else {
+                    MetaKey::Tree(ids[i])
+                }
+            })
+            .collect();
         let got = meta.get(repo, &keys).await?;
         for (&i, bytes) in missing.iter().zip(got) {
             let bytes = bytes
@@ -222,6 +232,7 @@ pub struct TreeWork<'a, M> {
     repo: RepoId,
     known: HashMap<TreeId, Arc<Tree>>,
     new: BTreeMap<TreeId, Arc<Tree>>,
+    private: bool,
 }
 
 impl<M> std::fmt::Debug for TreeWork<'_, M> {
@@ -241,6 +252,14 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
             repo,
             known: HashMap::new(),
             new: BTreeMap::new(),
+            private: false,
+        }
+    }
+
+    pub(crate) fn private(meta: &'a M, cache: &'a TreeCache, repo: RepoId) -> Self {
+        Self {
+            private: true,
+            ..Self::new(meta, cache, repo)
         }
     }
 
@@ -258,7 +277,7 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
         if need.is_empty() {
             return Ok(());
         }
-        let trees = load_trees(self.meta, self.cache, self.repo, &need).await?;
+        let trees = load_trees(self.meta, self.cache, self.repo, &need, self.private).await?;
         self.known.extend(need.into_iter().zip(trees));
         Ok(())
     }

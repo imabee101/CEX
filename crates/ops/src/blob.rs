@@ -101,6 +101,7 @@ pub async fn upload_blobs<M: MetaStore, B: BlobStore>(
                     size: content.len() as u64,
                     sha256: Sha256::digest(&content).into(),
                     git_sha1: None,
+                    text: Some(is_text(&content)),
                 }
                 .encode(),
             ),
@@ -160,6 +161,69 @@ fn decode_payload(bytes: &[u8], kind: FrameKind, id: [u8; 32]) -> Result<Vec<u8>
                 )
             }),
     }
+}
+
+/// Classifies from upload metadata without fetching content. Legacy records
+/// read at most the first (4 MiB) chunk, never the rest of a binary blob.
+pub(crate) async fn blob_is_text<M: MetaStore, B: BlobStore>(
+    meta: &M,
+    blobs: &B,
+    repo: RepoId,
+    id: BlobId,
+    size: u64,
+) -> Result<bool, OpError> {
+    if size > MAX_TEXT_BYTES as u64 {
+        return Ok(false);
+    }
+    let record = meta
+        .get(repo, &[MetaKey::Blob(id)])
+        .await?
+        .pop()
+        .flatten()
+        .ok_or_else(|| data_loss(id, "missing blob record"))?;
+    let record = BlobRecord::decode(&record)?;
+    if record.size != size {
+        return Err(data_loss(id, "tree and blob sizes differ"));
+    }
+    if let Some(text) = record.text {
+        return Ok(text);
+    }
+    let bytes = blobs
+        .get(repo, ObjectKey::blob(id))
+        .await?
+        .ok_or_else(|| data_loss(id, "missing frame"))?;
+    let frame = Frame::decode(&bytes).map_err(|e| data_loss(id, &e.to_string()))?;
+    if frame.header().raw_len != size {
+        return Err(data_loss(id, "frame and blob sizes differ"));
+    }
+    let raw = if frame.header().kind == FrameKind::ChunkList {
+        let list = ChunkList::decode(&decode_payload(
+            &bytes,
+            FrameKind::ChunkList,
+            *id.as_bytes(),
+        )?)
+        .map_err(|e| data_loss(id, &e.to_string()))?;
+        let first = list
+            .chunks
+            .first()
+            .ok_or_else(|| data_loss(id, "empty chunk list"))?;
+        let bytes = blobs
+            .get(repo, ObjectKey::chunk(*first))
+            .await?
+            .ok_or_else(|| data_loss(id, "missing first chunk"))?;
+        let raw = decode_payload(&bytes, FrameKind::Chunk, *first.as_bytes())?;
+        if raw.len() != CHUNK_BYTES || ChunkId::hash(&raw) != *first {
+            return Err(data_loss(id, "invalid first chunk"));
+        }
+        raw
+    } else {
+        let raw = decode_payload(&bytes, FrameKind::Blob, *id.as_bytes())?;
+        if raw.len() as u64 != size || BlobId::hash(&raw) != id {
+            return Err(data_loss(id, "invalid blob bytes"));
+        }
+        raw
+    };
+    Ok(is_text(&raw))
 }
 
 /// Reads a blob's bytes, verifying every frame and the blob's id.

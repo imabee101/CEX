@@ -114,7 +114,7 @@ impl CaseIndex {
     }
 
     /// Applies `cs`'s file changes to its first parent's index; the new
-    /// nodes are left in `cx.trees`. File entries carry the kind, blob, and
+    /// nodes are left in `cx.case_nodes`, never public tree storage. File entries carry the kind, blob, and
     /// size; their SHA-256 is unused and zero.
     pub async fn apply<M: MetaStore, B: BlobStore>(
         cx: &mut DeriveCx<'_, M, B>,
@@ -140,7 +140,7 @@ impl CaseIndex {
             };
             changes.insert(p, c);
         }
-        Ok(cx.trees.apply(parent, &changes).await?.root)
+        Ok(cx.case_nodes.apply(parent, &changes).await?.root)
     }
 
     /// The path of the first name in `added` (in order) that conflicts with
@@ -184,7 +184,7 @@ impl CaseIndex {
 
 impl DerivedType for CaseIndex {
     const KIND: u16 = kinds::CASE_INDEX;
-    const VERSION: u16 = 1;
+    const VERSION: u16 = 2;
     const MODE: Mode = Mode::Eager;
 
     async fn derive<'c, 'd, M: MetaStore, B: BlobStore>(

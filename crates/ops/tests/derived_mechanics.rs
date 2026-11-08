@@ -37,7 +37,13 @@ fn value_keys_keep_their_layout() {
     let mut acl = AclConfig::initial();
     acl.version = 9;
     assert_eq!(RestrictedRoots::new(Arc::new(acl)).key(cs), key(3, 9));
-    assert_eq!(CaseIndex.key(cs), key(4, 0));
+    assert_eq!(
+        CaseIndex.key(cs),
+        DerivedKey {
+            version: 2,
+            ..key(4, 0)
+        }
+    );
 }
 
 #[tokio::test]
@@ -109,7 +115,8 @@ async fn tree_frames_are_written_in_parallel_within_a_bound() {
         blobs.clone(),
         CacheSizes::default(),
     )));
-    // 300 directories: 300 new nodes plus the root and the case index's.
+    // 300 directories: 300 new nodes plus the root. Private index nodes
+    // have no object frames.
     let changes = (0..300)
         .map(|i| (path(&format!("d{i:03}/f")), write(b"c\n")))
         .collect();

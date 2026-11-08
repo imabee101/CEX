@@ -98,7 +98,7 @@ impl BuggyMeta {
         }
         match key {
             MetaKey::Changeset(id) => MetaKey::Changeset(id),
-            MetaKey::Tree(id) => {
+            MetaKey::Tree(id) | MetaKey::CaseNode(id) => {
                 MetaKey::Changeset(scion_core::ChangesetId::from_bytes(*id.as_bytes()))
             }
             MetaKey::Derived(d) => MetaKey::Changeset(d.changeset),

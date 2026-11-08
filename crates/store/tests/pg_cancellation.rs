@@ -43,6 +43,10 @@ fn batch(round: u64) -> Vec<(MetaKey, Bytes)> {
         let value = Bytes::from(vec![(i % 251) as u8; len]);
         entries.push((MetaKey::Changeset(id), value.clone()));
         entries.push((
+            MetaKey::CaseNode(TreeId::from_bytes(*id.as_bytes())),
+            value.clone(),
+        ));
+        entries.push((
             MetaKey::Tree(TreeId::from_bytes(*id.as_bytes())),
             value.clone(),
         ));

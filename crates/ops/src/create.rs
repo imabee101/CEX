@@ -50,7 +50,8 @@ impl Default for CreateOptions {
     }
 }
 
-type Creating = Mutex<HashMap<(RepoId, ChangesetId), Arc<OnceCell<()>>>>;
+type CreateKey = (RepoId, ChangesetId, u64, bool, bool);
+type Creating = Mutex<HashMap<CreateKey, Arc<OnceCell<()>>>>;
 
 /// Server-side operations over one pair of stores.
 pub struct Ops<M, B> {
@@ -159,11 +160,14 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
     ) -> Result<ChangesetId, OpError> {
         validate(&cs, opts)?;
         let id = cs.id();
+        // Requests under different ACL versions must each pass their own
+        // readiness gate, even when another request creates the same id.
+        let key = (repo, id, opts.acl.version, opts.case_check, opts.imported);
         let cell = self
             .creating
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry((repo, id))
+            .entry(key)
             .or_default()
             .clone();
         let result = cell
@@ -175,8 +179,8 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
                 .creating
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if map.get(&(repo, id)).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
-                map.remove(&(repo, id));
+            if map.get(&key).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
+                map.remove(&key);
             }
         }
         result.map(|()| id)
@@ -193,7 +197,19 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         let mut keys = vec![MetaKey::Changeset(id)];
         keys.extend(parts.parents.iter().map(|p| MetaKey::Changeset(*p)));
         let found = self.deriver.meta().get(repo, &keys).await?;
+        let restricted = RestrictedRoots::new(opts.acl.clone());
         if found[0].is_some() {
+            if self
+                .deriver
+                .lookup_many(repo, &[restricted.key(id)])
+                .await?[0]
+                .is_none()
+            {
+                return Err(OpError::new(
+                    Code::AclPending,
+                    "changeset awaits ACL backfill",
+                ));
+            }
             return Ok(());
         }
         if let Some((p, _)) = parts
@@ -208,6 +224,32 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
             ));
         }
         let mut cx = self.deriver.cx(repo);
+        // Create never backfills ACL history. Seed the parent's stored value
+        // so RestrictedRoots cannot invoke the recursive on-demand deriver.
+        if let Some(parent) = parts.parents.first() {
+            let key = restricted.key(*parent);
+            let value = self
+                .deriver
+                .lookup_many(repo, &[key])
+                .await?
+                .pop()
+                .flatten()
+                .ok_or_else(|| OpError::new(Code::AclPending, "parent awaits ACL backfill"))?;
+            cx.set_input(key, value);
+            // A storage-format upgrade of the private index also needs an
+            // explicit backfill, never an unbounded history walk in create.
+            let key = CaseIndex.key(*parent);
+            let value = self
+                .deriver
+                .lookup_many(repo, &[key])
+                .await?
+                .pop()
+                .flatten()
+                .ok_or_else(|| {
+                    OpError::new(Code::Unavailable, "parent case index awaits backfill")
+                })?;
+            cx.set_input(key, value);
+        }
         let applied = RootTree::apply(&mut cx, cs).await?;
         cx.set_value(
             RootTree.key(id),
@@ -216,7 +258,7 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         let index = CaseIndex::apply(&mut cx, cs).await?;
         cx.set_value(CaseIndex.key(id), Bytes::copy_from_slice(index.as_bytes()));
         if opts.case_check && !opts.imported {
-            let found = CaseIndex::find_conflict(&mut cx.trees, index, &applied.added).await?;
+            let found = CaseIndex::find_conflict(&mut cx.case_nodes, index, &applied.added).await?;
             if let Some((path, other)) = found {
                 return Err(OpError::at(
                     Code::CaseConflict,
@@ -231,7 +273,6 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         }
         let graph = CommitGraph.derive(&mut cx, id, cs).await?;
         cx.set_value(CommitGraph.key(id), graph);
-        let restricted = RestrictedRoots::new(opts.acl.clone());
         let roots = restricted.derive(&mut cx, id, cs).await?;
         cx.set_value(restricted.key(id), roots);
         self.deriver

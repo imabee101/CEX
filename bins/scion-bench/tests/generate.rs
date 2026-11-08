@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use derived::{CacheSizes, Deriver, RootTree};
+use derived::{CacheSizes, DerivedType, Deriver, RootTree};
 use scion_bench::{BENCH, BenchParams, REPO, cached_repo, content, generate, layout};
 use scion_core::{BlobId, EntryTarget, FileKind, RepoPath};
 use store::testing::{TestDatabase, base_config, object_store};
@@ -50,6 +50,30 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
 
     let db = TestDatabase::create_from(&repo.template).await;
     let meta = Arc::new(PgMetaStore::new(db.config().clone(), 4).unwrap());
+    let value = meta
+        .get(
+            REPO,
+            &[store::MetaKey::Derived(ops::case::CaseIndex.key(repo.tip))],
+        )
+        .await
+        .unwrap()
+        .pop()
+        .flatten()
+        .expect("cached repo's current case index");
+    let index = scion_core::TreeId::from_bytes(value.as_ref().try_into().unwrap());
+    let rows = meta
+        .get(
+            REPO,
+            &[store::MetaKey::CaseNode(index), store::MetaKey::Tree(index)],
+        )
+        .await
+        .unwrap();
+    assert!(
+        rows[0].is_some(),
+        "cache was not upgraded to private index storage"
+    );
+    // Older caches may retain their v1 public nodes, but current consumers
+    // must have the new private namespace available before creating.
     assert_eq!(
         meta.get_ref(REPO, "main").await.unwrap().unwrap().target,
         repo.tip

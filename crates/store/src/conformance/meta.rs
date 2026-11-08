@@ -91,14 +91,16 @@ pub async fn records_round_trip<S: MetaStore>(store: Arc<S>) {
         MetaKey::Tree(TreeId::hash(b"t1")),
         derived(1, 1, cs(1)),
         blob(1),
+        MetaKey::CaseNode(TreeId::hash(b"t1")),
     ];
     let missing = [
         MetaKey::Changeset(cs(2)),
         MetaKey::Tree(TreeId::hash(b"t2")),
         derived(1, 1, cs(2)),
         blob(2),
+        MetaKey::CaseNode(TreeId::hash(b"t2")),
     ];
-    assert_eq!(store.get(REPO, &missing).await.unwrap(), vec![None; 4]);
+    assert_eq!(store.get(REPO, &missing).await.unwrap(), vec![None; 5]);
     let entries: Vec<(MetaKey, Bytes)> = keys
         .iter()
         .enumerate()
@@ -106,13 +108,13 @@ pub async fn records_round_trip<S: MetaStore>(store: Arc<S>) {
         .collect();
     assert_eq!(
         store.put(REPO, &entries).await.unwrap(),
-        vec![PutOutcome::Created; 4]
+        vec![PutOutcome::Created; 5]
     );
     assert_eq!(store.put(REPO, &[]).await.unwrap(), vec![]);
     assert_eq!(store.get(REPO, &[]).await.unwrap(), vec![]);
     // Mixed present and absent keys, out of write order and repeated.
     let query = [
-        keys[2], missing[0], keys[0], keys[3], keys[1], keys[2], missing[3],
+        keys[2], missing[0], keys[0], keys[3], keys[1], keys[2], missing[3], keys[4], missing[4],
     ];
     let got = store.get(REPO, &query).await.unwrap();
     let want: Vec<Option<Bytes>> = vec![
@@ -122,6 +124,8 @@ pub async fn records_round_trip<S: MetaStore>(store: Arc<S>) {
         Some(entries[3].1.clone()),
         Some(entries[1].1.clone()),
         Some(entries[2].1.clone()),
+        None,
+        Some(entries[4].1.clone()),
         None,
     ];
     assert_eq!(got, want);
@@ -139,6 +143,7 @@ pub async fn put_never_overwrites<S: MetaStore>(store: Arc<S>) {
         MetaKey::Tree(TreeId::hash(b"t10")),
         derived(3, 2, cs(10)),
         blob(10),
+        MetaKey::CaseNode(TreeId::hash(b"t10")),
     ] {
         assert_eq!(
             store.put(REPO, &[(key, bytes("first"))]).await.unwrap(),
@@ -155,6 +160,7 @@ pub async fn put_never_overwrites<S: MetaStore>(store: Arc<S>) {
         let fresh = match key {
             MetaKey::Changeset(_) => MetaKey::Changeset(cs(11)),
             MetaKey::Tree(_) => MetaKey::Tree(TreeId::hash(b"t11")),
+            MetaKey::CaseNode(_) => MetaKey::CaseNode(TreeId::hash(b"t11")),
             MetaKey::Derived(_) => derived(3, 2, cs(11)),
             MetaKey::Blob(_) => blob(11),
         };
@@ -178,6 +184,7 @@ pub async fn kinds_are_separate_namespaces<S: MetaStore>(store: Arc<S>) {
     let keys = [
         MetaKey::Changeset(ChangesetId::from_bytes(raw)),
         MetaKey::Tree(TreeId::from_bytes(raw)),
+        MetaKey::CaseNode(TreeId::from_bytes(raw)),
         derived(1, 1, ChangesetId::from_bytes(raw)),
         derived(1, 2, ChangesetId::from_bytes(raw)),
         derived(2, 1, ChangesetId::from_bytes(raw)),
@@ -209,6 +216,7 @@ pub async fn repos_are_isolated<S: MetaStore>(store: Arc<S>) {
     let keys = [
         MetaKey::Changeset(cs(30)),
         MetaKey::Tree(TreeId::hash(b"t30")),
+        MetaKey::CaseNode(TreeId::hash(b"t30")),
         derived(1, 1, cs(30)),
         blob(30),
     ];

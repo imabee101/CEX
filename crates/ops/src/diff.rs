@@ -1,14 +1,15 @@
 //! Diff between two changesets' trees: the changed paths, their line
 //! counts, or a unified patch. Equal subtrees are skipped by id, so the walk
-//! costs O(changed paths × path depth) node reads plus the size of each
-//! changed directory.
+//! skips matching directory and shard ids without loading their entries.
+
+use std::collections::VecDeque;
 
 use derived::{DeriveError, RootTree, TreeWork};
 use imara_diff::{Algorithm, Diff, InternedInput};
 use scion_core::{BlobId, ChangesetId, EntryTarget, FileKind, RepoPath, TreeId};
 use store::{BlobStore, MetaStore, RepoId};
 
-use crate::blob::{is_text, read_blob};
+use crate::blob::{MAX_TEXT_BYTES, blob_is_text, is_text, read_blob};
 use crate::{OpError, Ops};
 
 /// Lines of context around each patch hunk.
@@ -107,36 +108,77 @@ async fn pairs<M: MetaStore>(
     b: Option<TreeId>,
 ) -> Result<Vec<(Vec<u8>, Option<EntryTarget>, Option<EntryTarget>)>, DeriveError> {
     let ea = match a {
-        Some(id) => work.flatten(id).await?,
+        Some(id) => work.get(id).await?.entries().to_vec(),
         None => Vec::new(),
     };
     let eb = match b {
-        Some(id) => work.flatten(id).await?,
+        Some(id) => work.get(id).await?.entries().to_vec(),
         None => Vec::new(),
     };
     let mut out = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < ea.len() || j < eb.len() {
-        let ord = match (ea.get(i), eb.get(j)) {
+    let (mut ea, mut eb) = (VecDeque::from(ea), VecDeque::from(eb));
+    while !ea.is_empty() || !eb.is_empty() {
+        // Shards name disjoint prefix ranges. Merge the two ordered
+        // frontiers, expanding only the first range that is not shared.
+        // This also aligns nodes when splits/collapses change trie shape.
+        if let (Some(x), Some(y)) = (ea.front(), eb.front())
+            && x == y
+        {
+            ea.pop_front();
+            eb.pop_front();
+            continue;
+        }
+        let ord = match (ea.front(), eb.front()) {
             (Some(x), Some(y)) => x.name.cmp(&y.name),
             (Some(_), None) => std::cmp::Ordering::Less,
             _ => std::cmp::Ordering::Greater,
         };
+        let first = if ord == std::cmp::Ordering::Greater {
+            &mut eb
+        } else {
+            &mut ea
+        };
+        if let Some(scion_core::TreeEntry {
+            target: EntryTarget::Shard(id),
+            ..
+        }) = first.front()
+        {
+            let node = work.get(*id).await?;
+            first.pop_front();
+            for entry in node.entries().iter().rev() {
+                first.push_front(entry.clone());
+            }
+            continue;
+        }
+        // An equal-name shard on the other side must be expanded too.
+        if ord == std::cmp::Ordering::Equal
+            && let Some(scion_core::TreeEntry {
+                target: EntryTarget::Shard(id),
+                ..
+            }) = eb.front()
+        {
+            let node = work.get(*id).await?;
+            eb.pop_front();
+            for entry in node.entries().iter().rev() {
+                eb.push_front(entry.clone());
+            }
+            continue;
+        }
         match ord {
             std::cmp::Ordering::Less => {
-                out.push((ea[i].name.clone(), Some(ea[i].target), None));
-                i += 1;
+                let x = ea.pop_front().expect("left entry");
+                out.push((x.name, Some(x.target), None));
             }
             std::cmp::Ordering::Greater => {
-                out.push((eb[j].name.clone(), None, Some(eb[j].target)));
-                j += 1;
+                let y = eb.pop_front().expect("right entry");
+                out.push((y.name, None, Some(y.target)));
             }
             std::cmp::Ordering::Equal => {
-                if ea[i].target != eb[j].target {
-                    out.push((ea[i].name.clone(), Some(ea[i].target), Some(eb[j].target)));
+                let x = ea.pop_front().expect("left entry");
+                let y = eb.pop_front().expect("right entry");
+                if x.target != y.target {
+                    out.push((x.name, Some(x.target), Some(y.target)));
                 }
-                i += 1;
-                j += 1;
             }
         }
     }
@@ -249,6 +291,23 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         if mode != DiffMode::Names {
             let blobs = d.blobs();
             for f in &mut out {
+                if [f.old, f.new]
+                    .into_iter()
+                    .flatten()
+                    .any(|s| s.size > MAX_TEXT_BYTES as u64)
+                {
+                    f.binary = true;
+                    continue;
+                }
+                for s in [f.old, f.new].into_iter().flatten() {
+                    if !blob_is_text(&**d.meta(), &**blobs, repo, s.blob, s.size).await? {
+                        f.binary = true;
+                        break;
+                    }
+                }
+                if f.binary {
+                    continue;
+                }
                 let old = match f.old {
                     Some(s) => read_blob(&**blobs, repo, s.blob).await?,
                     None => Vec::new(),
