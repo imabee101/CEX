@@ -107,8 +107,8 @@ fn target(shard_ok: bool) -> impl Strategy<Value = EntryTarget> {
     )
 }
 
-fn tree() -> impl Strategy<Value = Tree> {
-    btree_map(component(), target(true), 0..20).prop_map(|m| {
+fn plain_tree() -> impl Strategy<Value = Tree> {
+    btree_map(component(), target(false), 0..20).prop_map(|m| {
         Tree::new(
             m.into_iter()
                 .map(|(name, target)| TreeEntry { name, target })
@@ -116,6 +116,40 @@ fn tree() -> impl Strategy<Value = Tree> {
         )
         .unwrap()
     })
+}
+
+/// A node split by the shard rule: Shards named prefix `P` plus one byte,
+/// and possibly one entry named exactly `P`.
+fn sharded_tree() -> impl Strategy<Value = Tree> {
+    let name_byte = (1u8..=255).prop_map(|b| if b == b'/' { b'_' } else { b });
+    (
+        vec(name_byte.clone(), 0..4),
+        proptest::option::of(target(false)),
+        proptest::collection::btree_set(name_byte, 1..10),
+        id32(),
+    )
+        .prop_filter_map("needs a valid shape", |(prefix, p_entry, next, seed)| {
+            let p_entry = p_entry.filter(|_| RepoPath::new(prefix.clone()).is_ok());
+            if p_entry.is_none() && next.len() < 2 {
+                return None;
+            }
+            let mut entries: Vec<TreeEntry> = p_entry
+                .map(|target| TreeEntry {
+                    name: prefix.clone(),
+                    target,
+                })
+                .into_iter()
+                .collect();
+            entries.extend(next.into_iter().map(|b| TreeEntry {
+                name: [&prefix[..], &[b]].concat(),
+                target: EntryTarget::Shard(TreeId::hash(&[&seed[..], &[b]].concat())),
+            }));
+            Some(Tree::new(entries).expect("a valid sharded node"))
+        })
+}
+
+fn tree() -> impl Strategy<Value = Tree> {
+    prop_oneof![plain_tree(), sharded_tree()]
 }
 
 fn frame() -> impl Strategy<Value = Vec<u8>> {

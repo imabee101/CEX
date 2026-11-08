@@ -112,6 +112,11 @@
 //! Shard entry (named `P` plus that byte) per group; each shard node holds
 //! full names and is split by the same rule. Only the root tree may be empty.
 //!
+//! A node with any Shard entry is therefore rejected unless every Shard name
+//! is the same prefix `P` plus one byte, the only other entry (if any) is
+//! named exactly `P`, and, when there is no entry named `P`, there are at
+//! least two Shard entries.
+//!
 //! # Frames
 //!
 //! A frame carries one object everywhere objects are stored or sent: header,

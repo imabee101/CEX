@@ -58,6 +58,12 @@ pub enum FormatError {
     /// A tree node has more than `MAX_TREE_ENTRIES` entries.
     #[error("tree node has {0} entries, more than MAX_TREE_ENTRIES")]
     TooManyEntries(u64),
+    /// A tree node with Shard entries is not shaped by the split rule: every
+    /// Shard name must be `P` plus one byte for a single prefix `P`, the only
+    /// other entry allowed is one named exactly `P`, and without it there are
+    /// at least two shards.
+    #[error("sharded tree node does not follow the split rule")]
+    InvalidShard,
     /// A frame does not start with the magic `SCF1`.
     #[error("frame magic is not SCF1")]
     BadMagic,

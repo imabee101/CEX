@@ -57,6 +57,7 @@ impl Tree {
         if entries.windows(2).any(|w| w[0].name >= w[1].name) {
             return Err(FormatError::NotSorted);
         }
+        check_shard_shape(&entries)?;
         Ok(Self { entries })
     }
 
@@ -166,6 +167,36 @@ impl Tree {
             });
         }
         r.finish()?;
+        check_shard_shape(&entries)?;
         Ok(Self { entries })
     }
+}
+
+/// The split rule as far as one node shows it. A node with Shard entries was
+/// split with `P` the longest common prefix of the directory's names: each
+/// Shard is named `P` plus one byte, the only other entry is one named `P`,
+/// and since `P` is the longest common prefix, a node with no entry named `P`
+/// has at least two shards. Entries must already be strictly sorted.
+fn check_shard_shape(entries: &[TreeEntry]) -> Result<(), FormatError> {
+    let is_shard = |e: &TreeEntry| matches!(e.target, EntryTarget::Shard(_));
+    let Some(first) = entries.iter().find(|e| is_shard(e)) else {
+        return Ok(());
+    };
+    // Shard names are non-empty, so the prefix is the name minus its last byte.
+    let prefix = &first.name[..first.name.len() - 1];
+    let mut shards = 0;
+    for e in entries {
+        if is_shard(e) {
+            if e.name.len() != first.name.len() || !e.name.starts_with(prefix) {
+                return Err(FormatError::InvalidShard);
+            }
+            shards += 1;
+        } else if e.name != prefix {
+            return Err(FormatError::InvalidShard);
+        }
+    }
+    if shards == entries.len() && shards < 2 {
+        return Err(FormatError::InvalidShard);
+    }
+    Ok(())
 }

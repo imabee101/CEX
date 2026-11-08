@@ -185,10 +185,26 @@ fn tree_values() -> BTreeMap<&'static str, Tree> {
             .unwrap(),
         ),
         (
-            "tree-shard-dots",
+            "tree-shard-dot",
             Tree::new(vec![
                 entry(b".", EntryTarget::Shard(t(0x45))),
-                entry(b"..", EntryTarget::Shard(t(0x46))),
+                entry(b"a", EntryTarget::Shard(t(0x46))),
+            ])
+            .unwrap(),
+        ),
+        (
+            "tree-shard-dotdot",
+            Tree::new(vec![
+                entry(b"..", EntryTarget::Shard(t(0x45))),
+                entry(b".a", EntryTarget::Shard(t(0x46))),
+            ])
+            .unwrap(),
+        ),
+        (
+            "tree-shard-prefix-entry",
+            Tree::new(vec![
+                entry(b"a", tfile(FileKind::Regular, 0x22, 0, 0x33)),
+                entry(b"ab", EntryTarget::Shard(t(0x45))),
             ])
             .unwrap(),
         ),

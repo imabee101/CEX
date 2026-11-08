@@ -143,8 +143,12 @@ pub(crate) fn small() -> Vec<Vector> {
         accept("tree-mixed", Tree, "5915aedbae15bf2d74c44d4eb1ecc110de6e56213d7bc2918aceef85603db159",
             "01 04 01 61 02 {22*32} 03 {33*32} 01 62 03 {23*32} 00 {34*32}
              01 64 00 {44*32} 01 6c 04 {24*32} 01 {35*32}"),
-        accept("tree-shard-dots", Tree, "258c5b7677245888f5d7814db402792e3451bb61fcbbb9f6f106b9597568e7e4",
-            "01 02 01 2e 01 {45*32} 02 2e2e 01 {46*32}"),
+        accept("tree-shard-dot", Tree, "b67bcb8e0e72dff6a5fd7dd49ca2c979b40bc7a5d82a11a593505e067e950aac",
+            "01 02 01 2e 01 {45*32} 01 61 01 {46*32}"),
+        accept("tree-shard-dotdot", Tree, "7df71bebc60790abbc3e0bd57435d85de57152f80e1cd7a1396312f96e4aadd1",
+            "01 02 02 2e2e 01 {45*32} 02 2e61 01 {46*32}"),
+        accept("tree-shard-prefix-entry", Tree, "eb1b3e575cbe65fb4b56556ad287806a1a2ea994a1302d3f76317fb6370c27d5",
+            "01 02 01 61 02 {22*32} 00 {33*32} 02 6162 01 {45*32}"),
         accept("tree-dotted-names", Tree, "3b58af338748811ece482f51810756eb0dd25a9a257ae637b58dcf8869a8e513",
             "01 02 03 2e2e2e 00 {44*32} 02 2e61 02 {22*32} 00 {33*32}"),
         accept("tree-size-multibyte", Tree, "be7f3a78de2686331b0274d79bbf1a3d4241fe760d4b6f3f2be2f34ac10151c7",
@@ -165,6 +169,12 @@ pub(crate) fn small() -> Vec<Vector> {
         reject("tree-name-nul", Tree, "01 01 02 6100 00 {44*32}"),
         reject("tree-shard-name-slash", Tree, "01 01 03 612f62 01 {44*32}"),
         reject("tree-shard-name-empty", Tree, "01 01 00 01 {44*32}"),
+        reject("tree-shard-unequal-lengths", Tree, "01 02 01 2e 01 {45*32} 02 2e2e 01 {46*32}"),
+        reject("tree-shard-prefixes-differ", Tree, "01 02 02 6162 01 {45*32} 02 6263 01 {46*32}"),
+        reject("tree-shard-beside-file", Tree, "01 02 01 61 01 {45*32} 01 62 02 {22*32} 00 {33*32}"),
+        reject("tree-shard-beside-prefix-and-dir", Tree,
+            "01 03 01 61 02 {22*32} 00 {33*32} 02 6162 00 {44*32} 02 6163 01 {45*32}"),
+        reject("tree-single-shard", Tree, "01 01 01 61 01 {45*32}"),
         reject("tree-dir-with-size", Tree, "01 01 01 64 00 {44*32} 00 {33*32}"),
         reject("tree-file-missing-sha", Tree, "01 01 01 66 02 {22*32} 00"),
         reject("tree-nonminimal-size", Tree, "01 01 01 66 02 {22*32} 80 00 {33*32}"),
@@ -293,7 +303,6 @@ fn tree_entries(n: usize) -> Vec<(Vec<u8>, RefEntry)> {
             let name = vec![0x40 + (i / 64) as u8, 0x40 + (i % 64) as u8];
             let entry = match i % 16 {
                 0 => RefEntry::File(2 + (i / 16 % 3) as u8, rng.id(), rng.next() >> 20, rng.id()),
-                1 => RefEntry::Shard(rng.id()),
                 _ => RefEntry::Tree(rng.id()),
             };
             (name, entry)
