@@ -11,6 +11,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use object_store::ClientOptions;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path;
 use object_store::prefix::PrefixStore;
@@ -23,6 +24,9 @@ const DEFAULT_S3_ENDPOINT: &str = "http://127.0.0.1:58333";
 const DEFAULT_S3_BUCKET: &str = "scion-test";
 const DEFAULT_S3_ACCESS_KEY: &str = "scion";
 const DEFAULT_S3_SECRET_KEY: &str = "scion-dev-secret";
+
+/// How long one object-store request may take in tests.
+pub const TEST_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 const NOT_RUNNING: &str = "the dev environment is not reachable; run `cargo xtask dev-up`";
 
@@ -134,12 +138,49 @@ impl Drop for TestDatabase {
 pub fn object_store() -> PrefixStore<AmazonS3> {
     let store = AmazonS3Builder::new()
         .with_endpoint(setting("SCION_TEST_S3_ENDPOINT", DEFAULT_S3_ENDPOINT))
-        .with_allow_http(true)
         .with_region("us-east-1")
         .with_bucket_name(setting("SCION_TEST_S3_BUCKET", DEFAULT_S3_BUCKET))
         .with_access_key_id(setting("SCION_TEST_S3_ACCESS_KEY", DEFAULT_S3_ACCESS_KEY))
         .with_secret_access_key(setting("SCION_TEST_S3_SECRET_KEY", DEFAULT_S3_SECRET_KEY))
+        // A request waiting on the object store fails, retryably, after this
+        // long rather than the 30 s default; the dev store makes concurrent
+        // conditional writers of one key wait in turn.
+        .with_client_options(
+            ClientOptions::new()
+                .with_allow_http(true)
+                .with_timeout(TEST_REQUEST_TIMEOUT),
+        )
         .build()
         .expect("invalid object store settings");
     PrefixStore::new(store, Path::from(unique_name()))
+}
+
+/// A directory under the system temp directory, owned by one test and
+/// removed when this value is dropped.
+#[derive(Debug)]
+pub struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    /// Creates an empty directory no other test uses.
+    pub fn create() -> Self {
+        let path = std::env::temp_dir().join(format!("scion-{}", unique_name()));
+        std::fs::create_dir_all(&path).expect("creating the test directory failed");
+        Self { path }
+    }
+
+    /// The directory's path.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let removed = std::fs::remove_dir_all(&self.path);
+        if !std::thread::panicking() {
+            removed.expect("removing the test directory failed");
+        }
+    }
 }
