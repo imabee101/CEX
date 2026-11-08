@@ -184,3 +184,24 @@ impl Drop for TempDir {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TempDir;
+
+    #[test]
+    fn temp_dirs_are_removed_on_drop() {
+        let dir = TempDir::create();
+        let path = dir.path().to_owned();
+        std::fs::write(path.join("f"), b"x").unwrap();
+        drop(dir);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_temp_dir_that_cannot_be_removed_fails_loudly() {
+        let dir = TempDir::create();
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert!(std::panic::catch_unwind(move || drop(dir)).is_err());
+    }
+}

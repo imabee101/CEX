@@ -220,3 +220,36 @@ impl BlobStore for ObjectBlobStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_keys_expose_their_kind_and_id() {
+        let raw = *BlobId::hash(b"key").as_bytes();
+        let cases = [
+            (ObjectKey::blob(BlobId::from_bytes(raw)), ObjectKind::Blob),
+            (
+                ObjectKey::chunk(ChunkId::from_bytes(raw)),
+                ObjectKind::Chunk,
+            ),
+            (ObjectKey::tree(TreeId::from_bytes(raw)), ObjectKind::Tree),
+        ];
+        for (key, kind) in cases {
+            assert_eq!(key.kind(), kind);
+            assert_eq!(key.id(), &raw);
+        }
+    }
+
+    #[test]
+    fn object_paths_are_repo_kind_and_hex_id() {
+        let id = BlobId::from_bytes([0xab; 32]);
+        assert_eq!(
+            ObjectBlobStore::path(RepoId(42), ObjectKey::blob(id)).as_ref(),
+            format!("42/b/{}", "ab".repeat(32))
+        );
+        let store = ObjectBlobStore::new(Arc::new(object_store::memory::InMemory::new()));
+        assert!(format!("{store:?}").starts_with("ObjectBlobStore"));
+    }
+}

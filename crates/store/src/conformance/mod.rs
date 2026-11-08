@@ -27,6 +27,7 @@ macro_rules! meta_store_conformance {
             repos_are_isolated,
             batch_naming_a_key_twice_is_rejected,
             concurrent_puts_of_one_key_create_it_once,
+            concurrent_overlapping_batches_all_succeed,
             large_records_round_trip,
             ref_cas_creates_moves_and_rejects,
             list_refs_in_byte_order_with_pagination,
@@ -100,5 +101,34 @@ impl SplitMix64 {
     /// A value in `0..n`; `n` must be positive.
     pub fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SplitMix64, pseudo_random};
+
+    #[test]
+    fn splitmix64_matches_the_reference_sequence() {
+        // The first outputs of Vigna's reference SplitMix64 from seed 0.
+        let mut rng = SplitMix64(0);
+        assert_eq!(rng.next_u64(), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(rng.next_u64(), 0x6e78_9e6a_a1b9_65f4);
+        assert_eq!(rng.next_u64(), 0x06c4_5d18_8009_454f);
+        let mut rng = SplitMix64(7);
+        assert!((0..1000).all(|_| rng.below(3) < 3));
+    }
+
+    #[test]
+    fn pseudo_random_has_the_requested_length_and_varies() {
+        for len in [0, 1, 7, 8, 9, 1000] {
+            assert_eq!(pseudo_random(1, len).len(), len);
+        }
+        let a = pseudo_random(1, 64);
+        assert_eq!(a, pseudo_random(1, 64), "not deterministic");
+        assert_ne!(a, pseudo_random(2, 64), "ignores the seed");
+        assert_eq!(&a[..8], &SplitMix64(1).next_u64().to_le_bytes());
+        let distinct: std::collections::HashSet<u8> = a.iter().copied().collect();
+        assert!(distinct.len() > 16, "too few distinct bytes: {a:?}");
     }
 }

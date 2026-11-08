@@ -92,7 +92,14 @@ impl PgMetaStore {
 }
 
 fn pg(e: tokio_postgres::Error) -> StoreError {
-    StoreError::Unavailable(format!("postgres: {e}"))
+    // The top-level message of a server error is just "db error"; keep the
+    // server's message and code.
+    match e.as_db_error() {
+        Some(db) => {
+            StoreError::Unavailable(format!("postgres: {} ({})", db.message(), db.code().code()))
+        }
+        None => StoreError::Unavailable(format!("postgres: {e}")),
+    }
 }
 
 fn repo_param(repo: RepoId) -> i64 {
@@ -146,7 +153,12 @@ impl MetaStore for PgMetaStore {
         let (mut tree_ids, mut tree_bytes) = (Vec::new(), Vec::new());
         let (mut d_kinds, mut d_versions, mut d_changesets, mut d_bytes) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for (key, bytes) in entries {
+        // Insert in key order (MetaKey orders by table, then by key bytes), so
+        // concurrent batches over overlapping keys take their index locks in
+        // the same order and cannot deadlock.
+        let mut sorted: Vec<&(MetaKey, Bytes)> = entries.iter().collect();
+        sorted.sort_unstable_by_key(|(key, _)| *key);
+        for (key, bytes) in sorted {
             match key {
                 MetaKey::Changeset(id) => {
                     cs_ids.push(id.as_bytes().as_slice());
@@ -172,8 +184,8 @@ impl MetaStore for PgMetaStore {
             for row in tx
                 .query(
                     "INSERT INTO changesets (repo, id, bytes) \
-                     SELECT $1, i, b FROM UNNEST($2::bytea[], $3::bytea[]) AS t(i, b) \
-                     ON CONFLICT DO NOTHING RETURNING id",
+                     SELECT $1, i, b FROM UNNEST($2::bytea[], $3::bytea[]) WITH ORDINALITY AS t(i, b, n) \
+                     ORDER BY n ON CONFLICT DO NOTHING RETURNING id",
                     &[&repo_p, &cs_ids, &cs_bytes],
                 )
                 .await
@@ -187,8 +199,8 @@ impl MetaStore for PgMetaStore {
             for row in tx
                 .query(
                     "INSERT INTO trees (repo, id, bytes) \
-                     SELECT $1, i, b FROM UNNEST($2::bytea[], $3::bytea[]) AS t(i, b) \
-                     ON CONFLICT DO NOTHING RETURNING id",
+                     SELECT $1, i, b FROM UNNEST($2::bytea[], $3::bytea[]) WITH ORDINALITY AS t(i, b, n) \
+                     ORDER BY n ON CONFLICT DO NOTHING RETURNING id",
                     &[&repo_p, &tree_ids, &tree_bytes],
                 )
                 .await
@@ -203,8 +215,8 @@ impl MetaStore for PgMetaStore {
                 .query(
                     "INSERT INTO derived (repo, kind, version, changeset, bytes) \
                      SELECT $1, k, v, c, b \
-                     FROM UNNEST($2::int4[], $3::int4[], $4::bytea[], $5::bytea[]) AS t(k, v, c, b) \
-                     ON CONFLICT DO NOTHING RETURNING kind, version, changeset",
+                     FROM UNNEST($2::int4[], $3::int4[], $4::bytea[], $5::bytea[]) \
+                     WITH ORDINALITY AS t(k, v, c, b, n) ORDER BY n ON CONFLICT DO NOTHING RETURNING kind, version, changeset",
                     &[&repo_p, &d_kinds, &d_versions, &d_changesets, &d_bytes],
                 )
                 .await

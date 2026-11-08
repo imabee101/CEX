@@ -280,6 +280,76 @@ pub async fn concurrent_puts_of_one_key_create_it_once<S: MetaStore>(store: Arc<
     }
 }
 
+/// Concurrent batches over the same keys, each naming them in a different
+/// order, all succeed, and each key is created by exactly one of them. A
+/// backend that takes per-key locks in request order deadlocks here.
+pub async fn concurrent_overlapping_batches_all_succeed<S: MetaStore>(store: Arc<S>) {
+    // Several rounds, each on fresh keys; later rounds run on warm
+    // connections, so the batches truly overlap in the backend.
+    const ROUNDS: u64 = 8;
+    const KEYS: u64 = 64;
+    for round in 0..ROUNDS {
+        let base = 70 + round * KEYS;
+        let keys: Vec<MetaKey> = (base..base + KEYS)
+            .flat_map(|i| {
+                [
+                    MetaKey::Changeset(cs(i)),
+                    MetaKey::Tree(TreeId::from_bytes(*cs(i).as_bytes())),
+                    derived(5, 1, cs(i)),
+                ]
+            })
+            .collect();
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
+        let tasks: Vec<_> = (0..CONCURRENCY as u64)
+            .map(|w| {
+                let (store, barrier) = (store.clone(), barrier.clone());
+                // A per-writer permutation: every writer rotated, odd ones
+                // reversed.
+                let mut order = keys.clone();
+                let len = order.len();
+                order.rotate_left((w as usize * 7) % len);
+                if w % 2 == 1 {
+                    order.reverse();
+                }
+                tokio::spawn(async move {
+                    let entries: Vec<(MetaKey, Bytes)> = order
+                        .iter()
+                        .map(|k| (*k, bytes(&format!("writer {w}"))))
+                        .collect();
+                    barrier.wait().await;
+                    let outcome = store.put(REPO, &entries).await;
+                    (w, order, outcome)
+                })
+            })
+            .collect();
+        let mut created = std::collections::HashMap::new();
+        for task in tasks {
+            let (w, order, outcome) = task.await.unwrap();
+            let outcome = outcome.unwrap_or_else(|e| {
+                panic!("round {round}, writer {w}: an overlapping batch failed with {e:?}")
+            });
+            assert_eq!(outcome.len(), order.len());
+            for (k, o) in order.iter().zip(outcome) {
+                if o == PutOutcome::Created {
+                    assert!(
+                        created.insert(*k, w).is_none(),
+                        "{k:?} was created more than once"
+                    );
+                }
+            }
+        }
+        for k in &keys {
+            let w = created
+                .get(k)
+                .unwrap_or_else(|| panic!("{k:?} was never created"));
+            assert_eq!(
+                get_one(&*store, REPO, *k).await,
+                Some(bytes(&format!("writer {w}")))
+            );
+        }
+    }
+}
+
 /// Records up to several MiB round-trip byte for byte.
 pub async fn large_records_round_trip<S: MetaStore>(store: Arc<S>) {
     let big = Bytes::from(pseudo_random(60, 9 << 20));
