@@ -252,3 +252,61 @@ async fn either_side_binary_makes_the_file_binary() {
         ]
     );
 }
+
+/// Kind-only changes, symlinks, and a path that is a file on one side and a
+/// directory on the other are each reported, with filters naming them.
+#[tokio::test]
+async fn kind_changes_and_file_directory_swaps_are_reported() {
+    let e = env().await;
+    let ops = ops(&e.meta, &e.blobs);
+    let mut m = Model::default();
+    let (c, b) = m.apply(&[
+        ("x", Some((FileKind::Regular, b"file x\n"))),
+        ("y/z", Some((FileKind::Regular, b"in y\n"))),
+        ("k", Some((FileKind::Regular, b"same\n"))),
+        ("l", Some((FileKind::Symlink, b"x"))),
+    ]);
+    let one = commit(&ops, &[], "one", c, &b).await.unwrap();
+    let before = m.clone();
+    let (c, b) = m.apply(&[
+        ("x", None),
+        ("x/w", Some((FileKind::Regular, b"under x\n"))),
+        ("y/z", None),
+        ("k", Some((FileKind::Executable, b"same\n"))),
+        ("l", Some((FileKind::Symlink, b"k"))),
+    ]);
+    let mid = commit(&ops, &[one], "mid", c, &b).await.unwrap();
+    // A directory becomes a file only in a later changeset (INV-12).
+    let (c, b) = m.apply(&[("y", Some((FileKind::Regular, b"file y\n")))]);
+    let two = commit(&ops, &[mid], "two", c, &b).await.unwrap();
+    let want = |paths: &[&str]| {
+        paths
+            .iter()
+            .map(|p| p.as_bytes().to_vec())
+            .collect::<Vec<_>>()
+    };
+    for (a, bb) in [(one, two), (two, one)] {
+        let out = ops.diff(REPO, a, bb, DiffMode::Stat, &[]).await.unwrap();
+        let got: Vec<Vec<u8>> = out.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(got, want(&["k", "l", "x", "x/w", "y", "y/z"]));
+        let (ma, mb) = if a == one {
+            (&before, &m)
+        } else {
+            (&m, &before)
+        };
+        for f in &out {
+            assert_eq!(f.old.map(|s| s.kind), ma.files.get(&f.path).map(|v| v.0));
+            assert_eq!(f.new.map(|s| s.kind), mb.files.get(&f.path).map(|v| v.0));
+        }
+        let k = &out[0];
+        assert_eq!((k.added_lines, k.removed_lines), (0, 0), "kind-only change");
+        let filtered = ops
+            .diff(REPO, a, bb, DiffMode::Names, &[path("x"), path("y/z")])
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered.into_iter().map(|f| f.path).collect::<Vec<_>>(),
+            want(&["x", "x/w", "y/z"])
+        );
+    }
+}

@@ -124,3 +124,48 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
 }
+
+/// The generator uploads at most `UPLOADS_AHEAD` (6) changesets' blobs
+/// ahead of the create chain: when changeset `k` (0-based) is written, at
+/// most `k + 6` batches' blob records are stored, so its memory stays
+/// bounded however many files the repo has.
+#[tokio::test(flavor = "multi_thread")]
+async fn uploads_run_a_bounded_distance_ahead_of_creates() {
+    use store::MetaKey;
+    use store::fault::{FaultBlobStore, FaultMetaStore, Faults, Write};
+    const AHEAD: usize = 6;
+    let p = BenchParams {
+        files: 600,
+        files_per_changeset: 4,
+        ..BENCH
+    };
+    let db = TestDatabase::create().await;
+    let pg = Arc::new(PgMetaStore::new(db.config().clone(), 16).unwrap());
+    pg.migrate().await.unwrap();
+    let faults = Faults::new();
+    let meta = Arc::new(FaultMetaStore::new(pg, faults.clone()));
+    let blobs = Arc::new(FaultBlobStore::new(
+        Arc::new(ObjectBlobStore::new(Arc::new(object_store()))),
+        faults.clone(),
+    ));
+    generate(&p, meta, blobs).await;
+    let mut blob_records = 0usize;
+    let mut creates = 0usize;
+    for w in faults.writes() {
+        let Write::Meta(keys) = w else { continue };
+        blob_records += keys
+            .iter()
+            .filter(|k| matches!(k, MetaKey::Blob(_)))
+            .count();
+        if keys.iter().any(|k| matches!(k, MetaKey::Changeset(_))) {
+            // Each batch is at most files_per_changeset distinct blobs.
+            let bound = (creates + AHEAD) * p.files_per_changeset;
+            assert!(
+                blob_records <= bound,
+                "{blob_records} blob records stored at create {creates}, bound {bound}"
+            );
+            creates += 1;
+        }
+    }
+    assert_eq!(creates, 150);
+}

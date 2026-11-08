@@ -142,11 +142,6 @@ impl<'d, M: MetaStore, B: BlobStore> DeriveCx<'d, M, B> {
         self.values.insert(key, value);
     }
 
-    /// The values computed here.
-    pub fn values(&self) -> &HashMap<DerivedKey, Bytes> {
-        &self.values
-    }
-
     /// A value of type `t` for `cs`: computed here, stored, or derived now
     /// (with its underived ancestors first).
     pub async fn value<T: DerivedType>(

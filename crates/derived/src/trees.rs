@@ -244,11 +244,6 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
         }
     }
 
-    /// The nodes built so far that are not yet stored, by id.
-    pub fn new_nodes(&self) -> &BTreeMap<TreeId, Arc<Tree>> {
-        &self.new
-    }
-
     pub(crate) fn take_new(&mut self) -> BTreeMap<TreeId, Arc<Tree>> {
         std::mem::take(&mut self.new)
     }

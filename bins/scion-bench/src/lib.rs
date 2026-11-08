@@ -25,7 +25,7 @@ use scion_core::{
     BlobId, Changeset, ChangesetId, ChangesetParts, FileChange, FileKind, RepoPath, Timestamp,
 };
 use store::testing::{TEMPLATE_DATABASE, base_config, named_object_store};
-use store::{MetaStore, ObjectBlobStore, PgMetaStore, RefLogReason, RefUpdate, RepoId};
+use store::{BlobStore, MetaStore, ObjectBlobStore, PgMetaStore, RefLogReason, RefUpdate, RepoId};
 
 /// Bumped whenever the generator's output changes, so old caches are not
 /// reused.
@@ -257,10 +257,10 @@ const UPLOADS_AHEAD: usize = 6;
 
 /// Builds the tip into the given stores: uploads every file and creates a
 /// chain of changesets adding them; returns the last changeset.
-pub async fn generate(
+pub async fn generate<M: MetaStore + 'static, B: BlobStore + 'static>(
     p: &BenchParams,
-    meta: Arc<PgMetaStore>,
-    blobs: Arc<ObjectBlobStore>,
+    meta: Arc<M>,
+    blobs: Arc<B>,
 ) -> ChangesetId {
     let files = Arc::new(layout(p));
     let ops = Ops::new(Arc::new(Deriver::new(

@@ -244,3 +244,78 @@ async fn adding_a_name_outside_the_common_prefix_does_not_grow_with_directory_si
     assert!(costs[1].0 <= costs[0].0 + 4, "{costs:?}");
     assert!(costs[1].1 <= costs[0].1 + 4, "{costs:?}");
 }
+
+/// Adding a name to a sharded directory whose groups are small and flat
+/// reads only the group it lands in: a split directory that gains names
+/// stays split without counting its other groups (INV-1).
+#[tokio::test(flavor = "multi_thread")]
+async fn adding_a_name_to_a_directory_of_many_small_groups_reads_one_group() {
+    let e = env().await;
+    let ops = common::ops(&e.meta, &e.blobs);
+    let alphabet: Vec<char> = ('a'..='z')
+        .chain('0'..='9')
+        .chain("!#$%&'()+,-;=@[]^_`{}~".chars())
+        .collect();
+    // 58 groups of 73 names (4,234 names, split, every group flat; no two
+    // differ only by case) in
+    // `dir`, and 4,000 names (flat) in `flat`.
+    let mut changes: Vec<(RepoPath, FileChange)> = Vec::new();
+    for c in &alphabet {
+        for i in 0..73 {
+            changes.push((path(&format!("dir/{c}{i:03}")), write(b"same\n")));
+        }
+    }
+    for i in 0..4_000 {
+        changes.push((path(&format!("flat/n{i:04}")), write(b"same\n")));
+    }
+    let base = commit(
+        &ops,
+        &[],
+        "groups",
+        changes,
+        &[Bytes::from_static(b"same\n")],
+    )
+    .await
+    .unwrap();
+    upload_blobs(&*e.meta, &e.blobs, REPO, &[Bytes::from_static(b"new\n")])
+        .await
+        .unwrap();
+    // Each scenario on the flat directory, then on the split one: one added
+    // name; and one name removed with another added after it, which leaves
+    // the count unchanged.
+    let scenarios: [[(&str, Option<&str>); 2]; 2] = [
+        [("flat/zz", None), ("dir/q500", None)],
+        [
+            ("flat/n0001", Some("flat/zz")),
+            ("dir/a001", Some("dir/q500")),
+        ],
+    ];
+    for scenario in scenarios {
+        let mut costs = Vec::new();
+        for (first, second) in scenario {
+            let faults = Faults::new();
+            let fm = Arc::new(FaultMetaStore::new(e.meta.clone(), faults.clone()));
+            let fb = Arc::new(FaultBlobStore::new(e.blobs.clone(), faults.clone()));
+            let cold = Ops::new(Arc::new(Deriver::new(fm, fb, CacheSizes::default())));
+            let changes = match second {
+                None => vec![(path(first), write(b"new\n"))],
+                Some(added) => vec![
+                    (path(first), FileChange::Deleted),
+                    (path(added), write(b"new\n")),
+                ],
+            };
+            let cs = common::changeset(&[base], first, changes);
+            cold.create_changeset(REPO, cs, &CreateOptions::default())
+                .await
+                .unwrap();
+            costs.push(faults.counts().meta_get_keys);
+        }
+        eprintln!(
+            "metadata keys read: flat directory {}, 58-group directory {}",
+            costs[0], costs[1]
+        );
+        // One more trie level on each tree the create walks; counting every
+        // group would read dozens more.
+        assert!(costs[1] <= costs[0] + 4, "{costs:?}");
+    }
+}
