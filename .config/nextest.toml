@@ -5,10 +5,14 @@
 #
 # No concurrency limit is set for tests that use the dev environment: every test
 # gets its own database and key prefix, and nextest's default of one test per CPU
-# stays far below the Postgres connection limit in compose.yaml.
+# stays far below the Postgres connection limit in compose.yaml. The one
+# exception is the `wide` group below.
 
 [test-groups]
 slow = { max-threads = "num-cpus" }
+# Tests that open one Postgres connection per client at 64-way concurrency;
+# four at a time stay well below the connection limit in compose.yaml.
+wide = { max-threads = 4 }
 
 [profile.default]
 default-filter = "not test(/(^|::)slow_/)"
@@ -20,6 +24,10 @@ slow-timeout = { period = "30s", terminate-after = 1 }
 filter = "test(/(^|::)slow_/)"
 test-group = "slow"
 slow-timeout = { period = "60s", terminate-after = 60 }
+
+[[profile.default.overrides]]
+filter = "package(store) and test(/concurrent|64_way/)"
+test-group = "wide"
 
 # CI reports every failure instead of stopping at the first.
 [profile.ci]
