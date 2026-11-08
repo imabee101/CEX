@@ -6,5 +6,26 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[dependencies]
+bytes = { workspace = true, features = ["std"] }
+derived = { workspace = true }
+icu_casemap = { workspace = true }
+icu_normalizer = { workspace = true }
+imara-diff = { workspace = true }
+scion-core = { workspace = true }
+sha2 = { workspace = true }
+store = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["sync"] }
+zstd = { workspace = true }
+
+[dev-dependencies]
+# Read only for the Unicode version their data was generated from.
+icu_casemap_data = { workspace = true }
+icu_normalizer_data = { workspace = true }
+proptest = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio-postgres = { workspace = true }
+
 [lints]
 workspace = true

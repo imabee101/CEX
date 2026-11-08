@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use scion_core::{ChangesetId, TreeId};
+use scion_core::{BlobId, ChangesetId, TreeId};
 
 use super::linearizability::{self, Event, Op, Ret, State};
 use super::{CONCURRENCY, pseudo_random};
@@ -24,11 +24,20 @@ fn bytes(s: &str) -> Bytes {
 }
 
 fn derived(kind: u16, version: u16, changeset: ChangesetId) -> MetaKey {
+    derived_with(kind, version, 0, changeset)
+}
+
+fn derived_with(kind: u16, version: u16, param: u64, changeset: ChangesetId) -> MetaKey {
     MetaKey::Derived(DerivedKey {
         kind,
         version,
+        param,
         changeset,
     })
+}
+
+fn blob(n: u64) -> MetaKey {
+    MetaKey::Blob(BlobId::hash(&n.to_le_bytes()))
 }
 
 fn update<'a>(name: &'a str, expected: Option<ChangesetId>, new: ChangesetId) -> RefUpdate<'a> {
@@ -81,16 +90,15 @@ pub async fn records_round_trip<S: MetaStore>(store: Arc<S>) {
         MetaKey::Changeset(cs(1)),
         MetaKey::Tree(TreeId::hash(b"t1")),
         derived(1, 1, cs(1)),
+        blob(1),
     ];
     let missing = [
         MetaKey::Changeset(cs(2)),
         MetaKey::Tree(TreeId::hash(b"t2")),
         derived(1, 1, cs(2)),
+        blob(2),
     ];
-    assert_eq!(
-        store.get(REPO, &missing).await.unwrap(),
-        vec![None, None, None]
-    );
+    assert_eq!(store.get(REPO, &missing).await.unwrap(), vec![None; 4]);
     let entries: Vec<(MetaKey, Bytes)> = keys
         .iter()
         .enumerate()
@@ -98,17 +106,20 @@ pub async fn records_round_trip<S: MetaStore>(store: Arc<S>) {
         .collect();
     assert_eq!(
         store.put(REPO, &entries).await.unwrap(),
-        vec![PutOutcome::Created; 3]
+        vec![PutOutcome::Created; 4]
     );
     assert_eq!(store.put(REPO, &[]).await.unwrap(), vec![]);
     assert_eq!(store.get(REPO, &[]).await.unwrap(), vec![]);
     // Mixed present and absent keys, out of write order and repeated.
-    let query = [keys[2], missing[0], keys[0], keys[1], keys[2], missing[2]];
+    let query = [
+        keys[2], missing[0], keys[0], keys[3], keys[1], keys[2], missing[3],
+    ];
     let got = store.get(REPO, &query).await.unwrap();
     let want: Vec<Option<Bytes>> = vec![
         Some(entries[2].1.clone()),
         None,
         Some(entries[0].1.clone()),
+        Some(entries[3].1.clone()),
         Some(entries[1].1.clone()),
         Some(entries[2].1.clone()),
         None,
@@ -127,6 +138,7 @@ pub async fn put_never_overwrites<S: MetaStore>(store: Arc<S>) {
         MetaKey::Changeset(cs(10)),
         MetaKey::Tree(TreeId::hash(b"t10")),
         derived(3, 2, cs(10)),
+        blob(10),
     ] {
         assert_eq!(
             store.put(REPO, &[(key, bytes("first"))]).await.unwrap(),
@@ -144,6 +156,7 @@ pub async fn put_never_overwrites<S: MetaStore>(store: Arc<S>) {
             MetaKey::Changeset(_) => MetaKey::Changeset(cs(11)),
             MetaKey::Tree(_) => MetaKey::Tree(TreeId::hash(b"t11")),
             MetaKey::Derived(_) => derived(3, 2, cs(11)),
+            MetaKey::Blob(_) => blob(11),
         };
         assert_eq!(
             store
@@ -157,8 +170,9 @@ pub async fn put_never_overwrites<S: MetaStore>(store: Arc<S>) {
     }
 }
 
-/// Changesets, trees, and derived values with the same id bytes are separate
-/// records, and each derived type and version is its own key space.
+/// Blob records, changesets, trees, and derived values with the same id bytes
+/// are separate records, and each derived type, version, and param is its own
+/// key space.
 pub async fn kinds_are_separate_namespaces<S: MetaStore>(store: Arc<S>) {
     let raw = *cs(20).as_bytes();
     let keys = [
@@ -167,6 +181,9 @@ pub async fn kinds_are_separate_namespaces<S: MetaStore>(store: Arc<S>) {
         derived(1, 1, ChangesetId::from_bytes(raw)),
         derived(1, 2, ChangesetId::from_bytes(raw)),
         derived(2, 1, ChangesetId::from_bytes(raw)),
+        derived_with(1, 1, 1, ChangesetId::from_bytes(raw)),
+        derived_with(1, 1, u64::MAX, ChangesetId::from_bytes(raw)),
+        MetaKey::Blob(BlobId::from_bytes(raw)),
     ];
     for (i, key) in keys.iter().enumerate() {
         assert_eq!(
@@ -193,6 +210,7 @@ pub async fn repos_are_isolated<S: MetaStore>(store: Arc<S>) {
         MetaKey::Changeset(cs(30)),
         MetaKey::Tree(TreeId::hash(b"t30")),
         derived(1, 1, cs(30)),
+        blob(30),
     ];
     for key in keys {
         store.put(REPO, &[(key, bytes("a"))]).await.unwrap();
