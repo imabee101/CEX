@@ -1,5 +1,5 @@
 //! Tree and changeset ids re-derived from the byte layout and id rules in
-//! CLAUDE.md with a separate, minimal encoder written here: it uses neither
+//! AGENTS.md with a separate, minimal encoder written here: it uses neither
 //! scion-core's encoders nor the reference builder in `common`. Each case
 //! creates changesets through `Ops` on Postgres plus the object store and
 //! checks the stored root tree id, and the returned changeset id, against

@@ -55,7 +55,7 @@ pub struct BenchParams {
     pub files_per_changeset: usize,
 }
 
-/// The bench repo of CLAUDE.md: 3,000,000 files, depth ≤ 12, fanout ≤ 64,
+/// The bench repo of AGENTS.md: 3,000,000 files, depth ≤ 12, fanout ≤ 64,
 /// log-normal sizes with median 2 KiB and σ 2.0 capped at 64 MiB, seed
 /// `0x5C10_2026`, changesets of at most 2,000 files.
 pub const BENCH: BenchParams = BenchParams {

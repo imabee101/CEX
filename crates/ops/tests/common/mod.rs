@@ -158,7 +158,7 @@ enum RefNode {
 }
 
 /// The id of the root tree holding exactly these files, built from the
-/// rules in CLAUDE.md without the incremental code.
+/// rules in AGENTS.md without the incremental code.
 pub fn reference_root(files: impl IntoIterator<Item = (Vec<u8>, FileKind, Vec<u8>)>) -> TreeId {
     let mut root = BTreeMap::new();
     for (p, kind, content) in files {

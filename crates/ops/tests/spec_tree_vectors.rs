@@ -1,4 +1,4 @@
-//! Tree ids re-derived from the byte layout and id rules in CLAUDE.md by a
+//! Tree ids re-derived from the byte layout and id rules in AGENTS.md by a
 //! second hand encoder that uses only `blake3` and `sha2` (never scion-core's
 //! encoder), compared with the root trees CreateChangeset derives on Postgres
 //! plus the object store. Also checks that each hand-encoded node is the one

@@ -488,7 +488,7 @@ async fn creating_an_existing_changeset_again_succeeds_and_writes_nothing() {
     assert!(faults.writes().is_empty(), "{:?}", faults.writes());
 }
 
-/// The limits are CLAUDE.md's, inclusive: a value at a limit is accepted
+/// The limits are AGENTS.md's, inclusive: a value at a limit is accepted
 /// and one byte (or parent) more is rejected.
 #[tokio::test]
 async fn limits_are_exact() {

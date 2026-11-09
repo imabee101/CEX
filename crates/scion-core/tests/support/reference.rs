@@ -1,5 +1,5 @@
 //! A test-only reference encoder written directly from the byte layout in
-//! CLAUDE.md. It shares no code with scion-core and uses plain bytes, so a
+//! AGENTS.md. It shares no code with scion-core and uses plain bytes, so a
 //! bug in scion-core's encoder cannot leak into the expected values.
 
 /// Unsigned LEB128, written group by group from the most significant end
