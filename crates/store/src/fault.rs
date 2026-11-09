@@ -1,7 +1,8 @@
 //! Fault-injection and observation wrappers for tests: [`FaultMetaStore`] and
 //! [`FaultBlobStore`] wrap any backend and share one [`Faults`] controller,
 //! which numbers every write across both stores, can crash the "process" at
-//! any write step, can forbid ref access, and counts every call.
+//! any write step (a ref compare-and-swap is a write step too), can make one
+//! write fail transiently, can forbid ref access, and counts every call.
 //!
 //! A crash makes the chosen write fail, before or after it is applied, and
 //! every later call through either wrapper fail too, as if the process had
@@ -33,6 +34,8 @@ pub enum Write {
     Meta(Vec<MetaKey>),
     /// A [`BlobStore::put_if_absent`] of this key.
     Blob(ObjectKey),
+    /// A [`MetaStore::update_ref`] of this ref.
+    Ref(String),
 }
 
 /// Call counts through the wrappers since the last [`Faults::reset_counts`].
@@ -62,6 +65,7 @@ pub struct Counts {
 struct State {
     next_write: u64,
     crash_at: Option<(u64, CrashPoint)>,
+    fail_at: Option<u64>,
     crashed: bool,
     deny_refs: bool,
     ref_violations: Vec<String>,
@@ -92,6 +96,13 @@ impl Faults {
     /// either wrapper from now on, including writes already counted).
     pub fn crash_at(&self, step: u64, point: CrashPoint) {
         self.lock().crash_at = Some((step, point));
+    }
+
+    /// Makes write step `step` fail once with the retryable `Unavailable`,
+    /// without applying it and without crashing: a transient failure that
+    /// a caller may retry.
+    pub fn fail_transiently_at(&self, step: u64) {
+        self.lock().fail_at = Some(step);
     }
 
     /// Clears the crash, so calls succeed again, like a restarted process.
@@ -152,6 +163,10 @@ impl Faults {
         let step = s.next_write;
         s.next_write += 1;
         s.writes.push(write);
+        if s.fail_at == Some(step) {
+            s.fail_at = None;
+            return Err(StoreError::Unavailable("injected transient failure".into()));
+        }
         match s.crash_at {
             Some((at, CrashPoint::BeforeWrite)) if at == step => {
                 s.crashed = true;
@@ -263,7 +278,12 @@ impl<S: MetaStore> MetaStore for FaultMetaStore<S> {
     ) -> Result<CasOutcome, StoreError> {
         self.faults
             .ref_call(format!("update_ref({})", update.name))?;
-        self.inner.update_ref(repo, update).await
+        let report = self
+            .faults
+            .begin_write(Write::Ref(update.name.to_owned()))?;
+        let outcome = self.inner.update_ref(repo, update).await?;
+        self.faults.finish_write(report)?;
+        Ok(outcome)
     }
 
     async fn ref_log(
@@ -422,6 +442,54 @@ mod tests {
         assert!(meta.put(REPO, &[(key(3), Bytes::new())]).await.is_err());
         assert!(raw_meta.get(REPO, &[key(3)]).await.unwrap()[0].is_some());
         assert!(faults.crashed());
+    }
+
+    fn update(new: u8, expected: Option<u8>) -> RefUpdate<'static> {
+        RefUpdate {
+            name: "main",
+            expected: expected.map(|e| ChangesetId::from_bytes([e; 32])),
+            new: ChangesetId::from_bytes([new; 32]),
+            actor: "a",
+            time_micros: 0,
+            reason: RefLogReason::Manual,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ref_cas_is_a_write_step_that_can_crash_on_either_side() {
+        let (faults, meta, _, raw_meta, _) = stores();
+        faults.crash_at(0, CrashPoint::BeforeWrite);
+        assert!(meta.update_ref(REPO, &update(1, None)).await.is_err());
+        assert_eq!(raw_meta.get_ref(REPO, "main").await.unwrap(), None);
+        faults.restart();
+        faults.crash_at(1, CrashPoint::AfterWrite);
+        assert!(meta.update_ref(REPO, &update(1, None)).await.is_err());
+        assert!(faults.crashed());
+        let applied = raw_meta.get_ref(REPO, "main").await.unwrap().unwrap();
+        assert_eq!(applied.target, ChangesetId::from_bytes([1; 32]));
+        assert_eq!(
+            faults.writes(),
+            vec![Write::Ref("main".into()), Write::Ref("main".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_skips_one_write_without_crashing() {
+        let (faults, meta, blobs, raw_meta, _) = stores();
+        faults.fail_transiently_at(1);
+        meta.put(REPO, &[(key(1), Bytes::new())]).await.unwrap();
+        let failed = meta.put(REPO, &[(key(2), Bytes::new())]).await;
+        assert!(
+            matches!(failed, Err(StoreError::Unavailable(_))),
+            "{failed:?}"
+        );
+        assert!(!faults.crashed());
+        assert_eq!(raw_meta.get(REPO, &[key(2)]).await.unwrap(), vec![None]);
+        // The retry and every later call succeed.
+        meta.put(REPO, &[(key(2), Bytes::new())]).await.unwrap();
+        let obj = ObjectKey::blob(BlobId::hash(b"y"));
+        blobs.put_if_absent(REPO, obj, Bytes::new()).await.unwrap();
+        meta.update_ref(REPO, &update(1, None)).await.unwrap();
     }
 
     #[tokio::test]

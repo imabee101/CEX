@@ -2,13 +2,12 @@
 //! Postgres wire protocol.
 
 use std::collections::HashSet;
-use std::ops::{Deref, DerefMut};
-use std::sync::Mutex;
 
 use bytes::Bytes;
 use scion_core::{BlobId, ChangesetId, TreeId};
-use tokio::sync::{Semaphore, SemaphorePermit};
-use tokio_postgres::{Client, Config, NoTls, Row};
+use tokio_postgres::{Config, Row};
+
+use super::pg_pool::{PgTls, Pool, PoolLimits, with_conn};
 
 use super::{
     CasOutcome, DerivedKey, MetaKey, MetaStore, RefLogEntry, RefLogReason, RefState, RefUpdate,
@@ -16,9 +15,13 @@ use super::{
 };
 use crate::{PutOutcome, RepoId, StoreError};
 
-/// The schema. Every statement is idempotent, so applying it again is a
-/// no-op. Every key includes `repo`.
-const SCHEMA: &str = "
+/// The schema version [`PgMetaStore::migrate`] brings a database to.
+pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
+
+/// The schema migrations, in order; migration `i` brings the schema to
+/// version `i + 1`. A migration, once released, never changes: a change to
+/// the schema is a new migration. Every key includes `repo`.
+const MIGRATIONS: &[&str] = &["
 CREATE TABLE IF NOT EXISTS changesets (
     repo INT8 NOT NULL,
     id BYTEA NOT NULL CHECK (length(id) = 32),
@@ -70,48 +73,147 @@ CREATE TABLE IF NOT EXISTS ref_log (
     reason TEXT NOT NULL,
     PRIMARY KEY (repo, name, seq)
 );
-";
+"];
 
 /// A [`MetaStore`] in Postgres, or CockroachDB through the Postgres wire
 /// protocol, with a bounded connection pool.
+///
+/// Every transaction runs at `READ COMMITTED`, set explicitly. CockroachDB
+/// may run it at `SERIALIZABLE` instead; a serialization failure is then
+/// reported as retryable.
 #[derive(Debug)]
 pub struct PgMetaStore {
     pool: Pool,
 }
 
 impl PgMetaStore {
-    /// Creates a store that opens at most `max_connections` connections.
-    pub fn new(config: Config, max_connections: usize) -> Result<Self, StoreError> {
-        if max_connections == 0 {
-            return Err(StoreError::invalid("max_connections is 0"));
-        }
+    /// Creates a store that connects with `config`, secured by `tls`, within
+    /// `limits`.
+    pub fn new(config: Config, tls: PgTls, limits: PoolLimits) -> Result<Self, StoreError> {
         Ok(Self {
-            pool: Pool {
-                config,
-                permits: Semaphore::new(max_connections),
-                idle: Mutex::new(Vec::new()),
-            },
+            pool: Pool::new(config, tls, limits)?,
         })
     }
 
-    /// Creates the schema if it does not exist. Run once per database before
-    /// serving.
+    /// Brings the schema up to date by applying the migrations it lacks, in
+    /// one transaction. Concurrent calls, from any number of servers, are
+    /// serialized by a row lock, so each migration is applied exactly once.
+    /// Fails if the database's schema is newer than this code knows.
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        let mut conn = self.pool.get().await?;
-        let tx = conn.transaction().await.map_err(pg)?;
-        tx.batch_execute(SCHEMA).await.map_err(pg)?;
-        tx.commit().await.map_err(pg)
+        // Creating the version table races with other servers doing the
+        // same; Postgres reports the loser as a duplicate, which is success.
+        let (conn, ()) = with_conn!(&self.pool, |c| async {
+            match c
+                .batch_execute(
+                    "CREATE TABLE IF NOT EXISTS schema_version (version INT8 PRIMARY KEY)",
+                )
+                .await
+            {
+                Err(e) if is_duplicate_object(&e) => Ok(()),
+                other => other,
+            }
+        });
+        drop(conn);
+        let conn = self.pool.begin().await?;
+        // Row 0 is the lock every migrator takes, so only one applies
+        // migrations at a time.
+        conn.execute(
+            "INSERT INTO schema_version VALUES (0) ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .await
+        .map_err(pg)?;
+        conn.execute(
+            "SELECT version FROM schema_version WHERE version = 0 FOR UPDATE",
+            &[],
+        )
+        .await
+        .map_err(pg)?;
+        let current: i64 = conn
+            .query_one("SELECT max(version) FROM schema_version", &[])
+            .await
+            .map_err(pg)?
+            .get(0);
+        let known = MIGRATIONS.len() as i64;
+        if current > known {
+            return Err(StoreError::Internal(format!(
+                "the database schema is at version {current}, newer than this server's {known}"
+            )));
+        }
+        for (i, migration) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+            conn.batch_execute(migration).await.map_err(pg)?;
+            conn.execute("INSERT INTO schema_version VALUES ($1)", &[&(i as i64 + 1)])
+                .await
+                .map_err(pg)?;
+        }
+        conn.commit().await
     }
 }
 
-fn pg(e: tokio_postgres::Error) -> StoreError {
+/// Whether `e` reports that an object being created already exists, the
+/// outcome of racing `CREATE ... IF NOT EXISTS` statements.
+fn is_duplicate_object(e: &tokio_postgres::Error) -> bool {
+    use tokio_postgres::error::SqlState;
+    e.code().is_some_and(|c| {
+        *c == SqlState::UNIQUE_VIOLATION
+            || *c == SqlState::DUPLICATE_TABLE
+            || *c == SqlState::DUPLICATE_OBJECT
+    })
+}
+
+/// Whether a server error with SQLSTATE `code` may succeed on retry:
+/// connection exceptions (08), insufficient resources (53), serialization
+/// failures, CockroachDB's ambiguous result, deadlocks, cancelled statements
+/// (the statement timeout), and a server shutting down or starting.
+fn retryable_sqlstate(code: &str) -> bool {
+    code.starts_with("08")
+        || code.starts_with("53")
+        // 40003 is CockroachDB's ambiguous result: the statement may or may
+        // not have committed. A retried ref CAS that had committed reports a
+        // mismatch whose current target is its own; its caller must treat
+        // that as success.
+        || matches!(
+            code,
+            "40001" | "40003" | "40P01" | "57014" | "57P01" | "57P02" | "57P03" | "57P05"
+        )
+}
+
+/// Classifies a Postgres error by what a retry can fix.
+///
+/// Connection failures, serialization failures, ambiguous results, and
+/// deadlocks, a server out of resources or shutting down, and cancelled
+/// statements (the statement timeout) are retryable. Everything else the
+/// server reports (bad data, constraint violations, undefined objects,
+/// permissions, program limits) means this code or its configuration is
+/// wrong, and a retry cannot help. An error without a SQLSTATE is
+/// retryable only when the connection itself failed.
+pub(crate) fn pg(e: tokio_postgres::Error) -> StoreError {
     // The top-level message of a server error is just "db error"; keep the
     // server's message and code.
-    match e.as_db_error() {
-        Some(db) => {
-            StoreError::Unavailable(format!("postgres: {} ({})", db.message(), db.code().code()))
-        }
-        None => StoreError::Unavailable(format!("postgres: {e}")),
+    let Some(db) = e.as_db_error() else {
+        // A failure of the connection is retryable; one of encoding or
+        // decoding values, or of the protocol, is a defect.
+        return if e.is_closed() || super::pg_pool::connection_failed(&e) {
+            StoreError::Unavailable(format!("postgres: {e}"))
+        } else {
+            StoreError::Internal(format!("postgres: {e}"))
+        };
+    };
+    let code = db.code().code();
+    let message = format!("postgres: {} ({code})", db.message());
+    if retryable_sqlstate(code) {
+        StoreError::Unavailable(message)
+    } else {
+        StoreError::Internal(message)
+    }
+}
+
+/// Rolls back a transaction whose outcome is already known. If the rollback
+/// fails, the connection is closed (it is still marked as in a transaction),
+/// which rolls back too, so the known outcome stands.
+async fn release(tx: super::pg_pool::Conn<'_>) {
+    if let Err(e) = tx.rollback().await {
+        tracing::warn!(error = %e, "rolling back failed; the connection is closed instead");
     }
 }
 
@@ -172,18 +274,15 @@ impl MetaStore for PgMetaStore {
         let mut sorted: Vec<&(MetaKey, Bytes)> = entries.iter().collect();
         sorted.sort_unstable_by_key(|(key, _)| *key);
         for (key, bytes) in sorted {
-            match key {
-                MetaKey::Derived(d) => {
+            match locate(key) {
+                Located::Derived(d) => {
                     d_kinds.push(i32::from(d.kind));
                     d_versions.push(i32::from(d.version));
                     d_params.push(d.param as i64);
                     d_changesets.push(d.changeset.as_bytes().as_slice());
                     d_bytes.push(bytes.as_ref());
                 }
-                _ => {
-                    let Some((table, id)) = id_key(key) else {
-                        continue;
-                    };
+                Located::Id(table, id) => {
                     by_table[table].0.push(id);
                     by_table[table].1.push(bytes.as_ref());
                 }
@@ -191,14 +290,13 @@ impl MetaStore for PgMetaStore {
         }
         let repo_p = repo_param(repo);
         let mut created = HashSet::new();
-        let mut conn = self.pool.get().await?;
-        let tx = conn.transaction().await.map_err(pg)?;
+        let conn = self.pool.begin().await?;
         for (table, (ids, values)) in by_table.iter().enumerate() {
             if ids.is_empty() {
                 continue;
             }
             let (name, make) = ID_TABLES[table];
-            for row in tx
+            for row in conn
                 .query(
                     &format!(
                         "INSERT INTO {name} (repo, id, bytes) \
@@ -214,7 +312,7 @@ impl MetaStore for PgMetaStore {
             }
         }
         if !d_kinds.is_empty() {
-            for row in tx
+            for row in conn
                 .query(
                     "INSERT INTO derived (repo, kind, version, param, changeset, bytes) \
                      SELECT $1, k, v, p, c, b \
@@ -236,7 +334,7 @@ impl MetaStore for PgMetaStore {
                 created.insert(MetaKey::Derived(derived_key(&row)?));
             }
         }
-        tx.commit().await.map_err(pg)?;
+        conn.commit().await?;
         Ok(entries
             .iter()
             .map(|(key, _)| {
@@ -257,74 +355,74 @@ impl MetaStore for PgMetaStore {
         let (mut d_kinds, mut d_versions, mut d_params, mut d_changesets) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for key in keys {
-            match key {
-                MetaKey::Derived(d) => {
+            match locate(key) {
+                Located::Derived(d) => {
                     d_kinds.push(i32::from(d.kind));
                     d_versions.push(i32::from(d.version));
                     d_params.push(d.param as i64);
                     d_changesets.push(d.changeset.as_bytes().as_slice());
                 }
-                _ => {
-                    let Some((table, id)) = id_key(key) else {
-                        continue;
-                    };
-                    by_table[table].push(id);
-                }
+                Located::Id(table, id) => by_table[table].push(id),
             }
         }
         let repo_p = repo_param(repo);
-        let mut found = std::collections::HashMap::new();
-        let conn = self.pool.get().await?;
-        for (table, ids) in by_table.iter().enumerate() {
-            if ids.is_empty() {
-                continue;
+        let (_conn, (id_rows, derived_rows)) = with_conn!(&self.pool, |c| async {
+            let mut id_rows = Vec::new();
+            for (table, ids) in by_table.iter().enumerate() {
+                if ids.is_empty() {
+                    continue;
+                }
+                let name = ID_TABLES[table].0;
+                let rows = c
+                    .query(
+                        &format!("SELECT id, bytes FROM {name} WHERE repo = $1 AND id = ANY($2)"),
+                        &[&repo_p, ids],
+                    )
+                    .await?;
+                id_rows.push((table, rows));
             }
-            let (name, make) = ID_TABLES[table];
-            for row in conn
-                .query(
-                    &format!("SELECT id, bytes FROM {name} WHERE repo = $1 AND id = ANY($2)"),
-                    &[&repo_p, ids],
-                )
-                .await
-                .map_err(pg)?
-            {
+            let derived_rows = if d_kinds.is_empty() {
+                Vec::new()
+            } else {
+                c.query(
+                        "SELECT d.kind, d.version, d.param, d.changeset, d.bytes FROM derived d \
+                         JOIN UNNEST($2::int4[], $3::int4[], $4::int8[], $5::bytea[]) AS t(k, v, p, c) \
+                         ON d.kind = t.k AND d.version = t.v AND d.param = t.p AND d.changeset = t.c \
+                         WHERE d.repo = $1",
+                        &[&repo_p, &d_kinds, &d_versions, &d_params, &d_changesets],
+                    )
+                    .await?
+            };
+            Ok::<_, tokio_postgres::Error>((id_rows, derived_rows))
+        });
+        let mut found = std::collections::HashMap::new();
+        for (table, rows) in id_rows {
+            let make = ID_TABLES[table].1;
+            for row in rows {
                 found.insert(
                     make(id_bytes(row.get(0))?),
                     Bytes::from(row.get::<_, Vec<u8>>(1)),
                 );
             }
         }
-        if !d_kinds.is_empty() {
-            for row in conn
-                .query(
-                    "SELECT d.kind, d.version, d.param, d.changeset, d.bytes FROM derived d \
-                     JOIN UNNEST($2::int4[], $3::int4[], $4::int8[], $5::bytea[]) AS t(k, v, p, c) \
-                     ON d.kind = t.k AND d.version = t.v AND d.param = t.p AND d.changeset = t.c \
-                     WHERE d.repo = $1",
-                    &[&repo_p, &d_kinds, &d_versions, &d_params, &d_changesets],
-                )
-                .await
-                .map_err(pg)?
-            {
-                found.insert(
-                    MetaKey::Derived(derived_key(&row)?),
-                    Bytes::from(row.get::<_, Vec<u8>>(4)),
-                );
-            }
+        for row in derived_rows {
+            found.insert(
+                MetaKey::Derived(derived_key(&row)?),
+                Bytes::from(row.get::<_, Vec<u8>>(4)),
+            );
         }
         Ok(keys.iter().map(|k| found.get(k).cloned()).collect())
     }
 
     async fn get_ref(&self, repo: RepoId, name: &str) -> Result<Option<RefState>, StoreError> {
         check_name("ref name", name)?;
-        let conn = self.pool.get().await?;
-        let row = conn
-            .query_opt(
+        let (_conn, row) = with_conn!(&self.pool, |c| async {
+            c.query_opt(
                 "SELECT name, target, seq FROM refs WHERE repo = $1 AND name = $2",
                 &[&repo_param(repo), &name.as_bytes()],
             )
             .await
-            .map_err(pg)?;
+        });
         row.map(|r| ref_state(r.get(0), r.get(1), r.get(2)))
             .transpose()
     }
@@ -344,9 +442,8 @@ impl MetaStore for PgMetaStore {
         let end = prefix_end(prefix.as_bytes());
         let after = after.map(str::as_bytes);
         let limit = i64::try_from(limit).map_err(|_| StoreError::invalid("limit overflows"))?;
-        let conn = self.pool.get().await?;
-        let rows = conn
-            .query(
+        let (_conn, rows) = with_conn!(&self.pool, |c| async {
+            c.query(
                 "SELECT name, target, seq FROM refs \
                  WHERE repo = $1 AND name >= $2 \
                  AND ($3::bytea IS NULL OR name < $3) \
@@ -361,7 +458,7 @@ impl MetaStore for PgMetaStore {
                 ],
             )
             .await
-            .map_err(pg)?;
+        });
         rows.iter()
             .map(|r| ref_state(r.get(0), r.get(1), r.get(2)))
             .collect()
@@ -376,8 +473,7 @@ impl MetaStore for PgMetaStore {
         let repo_p = repo_param(repo);
         let name = update.name.as_bytes();
         let new = update.new.as_bytes().as_slice();
-        let mut conn = self.pool.get().await?;
-        let tx = conn.transaction().await.map_err(pg)?;
+        let tx = self.pool.begin().await?;
         // Lock the row, so the comparison and the write see the same state.
         let current = tx
             .query_opt(
@@ -389,6 +485,8 @@ impl MetaStore for PgMetaStore {
             .map(|r| ref_state(r.get(0), r.get(1), r.get(2)))
             .transpose()?;
         if current.as_ref().map(|c| c.target) != update.expected {
+            // Release the row lock and keep the connection for the pool.
+            release(tx).await;
             return Ok(CasOutcome::Mismatch { current });
         }
         let seq = match current {
@@ -423,12 +521,10 @@ impl MetaStore for PgMetaStore {
                             )
                             .await
                             .map_err(pg)?;
+                        let current = ref_state(current.get(0), current.get(1), current.get(2))?;
+                        release(tx).await;
                         return Ok(CasOutcome::Mismatch {
-                            current: Some(ref_state(
-                                current.get(0),
-                                current.get(1),
-                                current.get(2),
-                            )?),
+                            current: Some(current),
                         });
                     }
                 }
@@ -451,7 +547,7 @@ impl MetaStore for PgMetaStore {
         )
         .await
         .map_err(pg)?;
-        tx.commit().await.map_err(pg)?;
+        tx.commit().await?;
         Ok(CasOutcome::Updated {
             seq: seq_from(seq)?,
         })
@@ -471,15 +567,14 @@ impl MetaStore for PgMetaStore {
             return Ok(Vec::new());
         };
         let limit = i64::try_from(limit).map_err(|_| StoreError::invalid("limit overflows"))?;
-        let conn = self.pool.get().await?;
-        let rows = conn
-            .query(
+        let (_conn, rows) = with_conn!(&self.pool, |c| async {
+            c.query(
                 "SELECT seq, old, new, actor, time_micros, reason FROM ref_log \
                  WHERE repo = $1 AND name = $2 AND seq > $3 ORDER BY seq LIMIT $4",
                 &[&repo_param(repo), &name.as_bytes(), &after, &limit],
             )
             .await
-            .map_err(pg)?;
+        });
         rows.iter()
             .map(|r| {
                 Ok(RefLogEntry {
@@ -527,87 +622,197 @@ const ID_TABLES: [(&str, IdToKey); 4] = [
     ("case_nodes", |id| MetaKey::CaseNode(TreeId::from_bytes(id))),
 ];
 
-/// The index into [`ID_TABLES`] and the id bytes of a key, or `None` for
-/// [`MetaKey::Derived`], which has its own table.
-fn id_key(key: &MetaKey) -> Option<(usize, &[u8])> {
+/// The table a key's row lives in.
+enum Located<'a> {
+    /// The id-keyed table at this index into [`ID_TABLES`], and the id.
+    Id(usize, &'a [u8]),
+    /// The `derived` table.
+    Derived(&'a DerivedKey),
+}
+
+fn locate(key: &MetaKey) -> Located<'_> {
     match key {
-        MetaKey::Blob(id) => Some((0, id.as_bytes())),
-        MetaKey::Changeset(id) => Some((1, id.as_bytes())),
-        MetaKey::Tree(id) => Some((2, id.as_bytes())),
-        MetaKey::CaseNode(id) => Some((3, id.as_bytes())),
-        MetaKey::Derived(_) => None,
+        MetaKey::Blob(id) => Located::Id(0, id.as_bytes()),
+        MetaKey::Changeset(id) => Located::Id(1, id.as_bytes()),
+        MetaKey::Tree(id) => Located::Id(2, id.as_bytes()),
+        MetaKey::CaseNode(id) => Located::Id(3, id.as_bytes()),
+        MetaKey::Derived(d) => Located::Derived(d),
     }
 }
 
-/// A bounded pool: at most `permits` connections exist at once.
-#[derive(Debug)]
-struct Pool {
-    config: Config,
-    permits: Semaphore,
-    idle: Mutex<Vec<Client>>,
-}
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+    use crate::meta::pg_pool::died_idle;
+    use crate::testing::TestDatabase;
 
-impl Pool {
-    async fn get(&self) -> Result<Conn<'_>, StoreError> {
-        let permit = self
-            .permits
-            .acquire()
-            .await
-            .map_err(|_| StoreError::Unavailable("connection pool closed".into()))?;
-        let reused = loop {
-            let next = self
-                .idle
-                .lock()
-                .map_err(|_| StoreError::Unavailable("connection pool lock poisoned".into()))?
-                .pop();
-            match next {
-                Some(c) if c.is_closed() => continue,
-                other => break other,
-            }
-        };
-        let client = match reused {
-            Some(c) => c,
-            None => {
-                let (client, connection) = self.config.connect(NoTls).await.map_err(pg)?;
-                tokio::spawn(connection);
-                client
-            }
-        };
-        Ok(Conn {
-            client: Some(client),
-            pool: self,
-            _permit: permit,
-        })
-    }
-}
-
-/// A pooled connection, returned to the pool when dropped unless it closed.
-struct Conn<'a> {
-    client: Option<Client>,
-    pool: &'a Pool,
-    _permit: SemaphorePermit<'a>,
-}
-
-impl Deref for Conn<'_> {
-    type Target = Client;
-    fn deref(&self) -> &Client {
-        self.client.as_ref().expect("present until drop")
-    }
-}
-
-impl DerefMut for Conn<'_> {
-    fn deref_mut(&mut self) -> &mut Client {
-        self.client.as_mut().expect("present until drop")
-    }
-}
-
-impl Drop for Conn<'_> {
-    fn drop(&mut self) {
-        if let Some(client) = self.client.take()
-            && !client.is_closed()
-            && let Ok(mut idle) = self.pool.idle.lock()
-        {
-            idle.push(client);
+    #[test]
+    fn sqlstates_are_retryable_only_when_a_retry_can_succeed() {
+        for code in [
+            "08006", "08001", "53300", "53200", "40001", "40003", "40P01", "57014", "57P01",
+            "57P02", "57P03", "57P05",
+        ] {
+            assert!(retryable_sqlstate(code), "{code}");
         }
+        for code in [
+            "23505", "23514", "22001", "42P01", "42501", "54000", "28P01", "XX000",
+        ] {
+            assert!(!retryable_sqlstate(code), "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_side_error_is_internal_and_never_replayed() {
+        let db = TestDatabase::create().await;
+        let client = db.connect().await;
+        // A text value for an integer parameter fails to encode, client side,
+        // with no SQLSTATE.
+        let e = client
+            .query("SELECT $1::int4", &[&"not a number"])
+            .await
+            .unwrap_err();
+        assert!(e.code().is_none());
+        assert!(!died_idle(&e));
+        assert!(matches!(pg(e), StoreError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn a_dead_connection_is_retryable_and_replayable() {
+        let db = TestDatabase::create().await;
+        let client = db.connect().await;
+        let pid: i32 = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        db.connect()
+            .await
+            .query_one("SELECT pg_terminate_backend($1, 10000)", &[&pid])
+            .await
+            .unwrap();
+        let e = client.query("SELECT 1", &[]).await.unwrap_err();
+        assert!(died_idle(&e), "{e:?}");
+        assert!(matches!(pg(e), StoreError::Unavailable(_)));
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    use crate::testing::TestDatabase;
+
+    #[tokio::test]
+    async fn a_rollback_on_a_dead_connection_is_absorbed_and_the_pool_recovers() {
+        let db = TestDatabase::create().await;
+        let pool = Pool::new(
+            db.config().clone(),
+            PgTls::LoopbackPlaintext,
+            PoolLimits::new(1),
+        )
+        .unwrap();
+        let tx = pool.begin().await.unwrap();
+        let pid: i32 = tx
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        db.connect()
+            .await
+            .query_one("SELECT pg_terminate_backend($1, 10000)", &[&pid])
+            .await
+            .unwrap();
+        // The rollback fails on the dead connection; release reports nothing,
+        // because the outcome it releases is already known.
+        release(tx).await;
+        // No connection was returned to the pool.
+        assert_eq!(pool.idle_len(), 0);
+        // The next connection is a fresh one that works.
+        let conn = pool.checkout().await.unwrap();
+        let rows = conn
+            .simple_query("SELECT pg_backend_pid(), now() = statement_timestamp()")
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(row.get(0), Some(pid.to_string().as_str()));
+        assert_eq!(row.get(1), Some("t"));
+    }
+}
+
+#[cfg(test)]
+mod cancelled_release_tests {
+    use super::*;
+    use crate::meta::pg_pool::test_support::in_transaction;
+    use crate::testing::TestDatabase;
+
+    async fn backend_pid(client: &tokio_postgres::Client) -> i32 {
+        client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    /// A release abandoned while its ROLLBACK is in flight, with the
+    /// connection open, closes the connection rather than pooling it; one
+    /// that completes returns the connection to the pool outside any
+    /// transaction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_never_pools_a_transaction() {
+        let db = TestDatabase::create().await;
+        let pool = Pool::new(
+            db.config().clone(),
+            PgTls::LoopbackPlaintext,
+            PoolLimits::new(1),
+        )
+        .unwrap();
+        for polls in 1..=8u32 {
+            let tx = pool.begin().await.unwrap();
+            let pid = backend_pid(&tx).await;
+            // Poll the release up to `polls` times, yielding between polls,
+            // then abandon it unless it completed. Timers are too coarse to
+            // abandon a local ROLLBACK in flight; polling by hand can.
+            let mut pending = Box::pin(release(tx));
+            let mut completed = false;
+            for _ in 0..polls {
+                completed = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(pending.as_mut().poll(cx).is_ready())
+                })
+                .await;
+                if completed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            drop(pending);
+            let conn = if completed {
+                // The reply came in time: the connection was returned.
+                assert_eq!(pool.idle_len(), 1, "completed within {polls} polls");
+                let conn = pool.checkout().await.unwrap();
+                assert_eq!(backend_pid(&conn).await, pid);
+                conn
+            } else {
+                // Still marked as in a transaction, the connection was closed.
+                assert_eq!(pool.idle_len(), 0, "abandoned after {polls} polls");
+                let conn = pool.checkout().await.unwrap();
+                assert_ne!(backend_pid(&conn).await, pid);
+                conn
+            };
+            assert!(!in_transaction(&conn).await, "after {polls} polls");
+        }
+        // A release that completes returns its connection, outside any
+        // transaction.
+        let tx = pool.begin().await.unwrap();
+        let pid = backend_pid(&tx).await;
+        release(tx).await;
+        assert_eq!(pool.idle_len(), 1);
+        let conn = pool.checkout().await.unwrap();
+        assert_eq!(backend_pid(&conn).await, pid);
+        assert!(!in_transaction(&conn).await);
     }
 }

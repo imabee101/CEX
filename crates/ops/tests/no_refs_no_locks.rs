@@ -41,7 +41,7 @@ async fn creation_never_touches_refs() {
     let (c, b) = Model::default().apply(&[("e", Some((FileKind::Symlink, b"a/b")))]);
     commit(&ops, &[left, right], "merge", c, &b).await.unwrap();
     // Diff reads no refs either.
-    ops.diff(REPO, root, right, ops::DiffMode::Patch, &[])
+    diff_all(&ops, root, right, ops::DiffMode::Patch, &[])
         .await
         .unwrap();
     assert_eq!(faults.ref_violations(), Vec::<String>::new());
@@ -217,4 +217,70 @@ async fn a_stalled_create_does_not_block_other_creates() {
             assert!(env.meta.get(REPO, &[MetaKey::Changeset(id)]).await.unwrap()[0].is_some());
         }
     }
+}
+
+/// The locks a create holds inside its transaction, captured by a trigger at
+/// its derived-value inserts (the last of its writes) and committed with it, so the test reads them once, after the create. Only the locks every
+/// insert takes are allowed: no advisory lock and no table lock stronger than
+/// ROW EXCLUSIVE, so no two creates can wait on each other (INV-2).
+#[tokio::test]
+async fn a_create_holds_no_locks_beyond_its_row_inserts() {
+    let env = env().await;
+    let observer = env.db.connect().await;
+    observer
+        .batch_execute(
+            "CREATE TABLE create_locks (locktype TEXT, mode TEXT, object TEXT);
+             CREATE FUNCTION capture_locks() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               INSERT INTO create_locks
+                 SELECT locktype, mode, coalesce(relation::regclass::text, objid::text, '')
+                 FROM pg_locks WHERE pid = pg_backend_pid() AND granted;
+               RETURN NEW;
+             END $$;
+             CREATE TRIGGER capture BEFORE INSERT ON derived
+               FOR EACH ROW EXECUTE FUNCTION capture_locks();",
+        )
+        .await
+        .unwrap();
+    let o = ops(&env.meta, &env.blobs);
+    let base = commit(
+        &o,
+        &[],
+        "base",
+        vec![(path("a/x"), write(b"x"))],
+        &[Bytes::from_static(b"x")],
+    )
+    .await
+    .unwrap();
+    commit(
+        &o,
+        &[base],
+        "child",
+        vec![(path("a/y"), write(b"y"))],
+        &[Bytes::from_static(b"y")],
+    )
+    .await
+    .unwrap();
+    let rows: Vec<(String, String, String)> = observer
+        .query("SELECT locktype, mode, object FROM create_locks", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|(t, m, o)| t == "relation" && m == "RowExclusiveLock" && o == "trees"),
+        "the capture saw the create's own inserts: {rows:?}"
+    );
+    let forbidden: Vec<_> = rows
+        .iter()
+        .filter(|(t, m, _)| match t.as_str() {
+            "relation" => !matches!(m.as_str(), "AccessShareLock" | "RowExclusiveLock"),
+            // Every transaction holds its own ids exclusively.
+            "virtualxid" | "transactionid" => m != "ExclusiveLock",
+            _ => true,
+        })
+        .collect();
+    assert!(forbidden.is_empty(), "a create took locks: {forbidden:?}");
 }

@@ -7,9 +7,9 @@ mod support;
 use std::collections::{BTreeMap, HashSet};
 
 use scion_core::{
-    BlobId, Changeset, ChangesetId, ChangesetParts, ChunkId, Codec, Committer, EntryTarget,
-    FileChange, FileKind, Frame, FrameHeader, FrameKind, RepoPath, Timestamp, Tree, TreeEntry,
-    TreeId,
+    BlobId, Changeset, ChangesetId, ChangesetParts, ChunkId, ChunkList, Codec, Committer,
+    EntryTarget, FileChange, FileKind, Frame, FrameHeader, FrameId, FrameKind, RepoPath, Timestamp,
+    Tree, TreeEntry, TreeId,
 };
 use support::vectors::{self, Ty, Vector};
 use support::{convert, hx, id, reference, to_hex};
@@ -17,25 +17,26 @@ use support::{convert, hx, id, reference, to_hex};
 const VECTORS_FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/vectors/v1.txt");
 
 /// What scion-core decodes `v` to, re-encoded, with its id; or the error.
-fn decode(v: &Vector) -> Result<(Vec<u8>, [u8; 32]), scion_core::FormatError> {
+fn decode(v: &Vector) -> Result<(Vec<u8>, Option<[u8; 32]>), scion_core::FormatError> {
     Ok(match v.ty {
-        Ty::Blob => (v.bytes.clone(), *BlobId::hash(&v.bytes).as_bytes()),
-        Ty::Chunk => (v.bytes.clone(), *ChunkId::hash(&v.bytes).as_bytes()),
+        Ty::Blob => (v.bytes.clone(), Some(*BlobId::hash(&v.bytes).as_bytes())),
+        Ty::Chunk => (v.bytes.clone(), Some(*ChunkId::hash(&v.bytes).as_bytes())),
         Ty::Tree => {
             let t = Tree::decode(&v.bytes)?;
-            (t.encode(), *t.id().as_bytes())
+            (t.encode(), Some(*t.id().as_bytes()))
         }
         Ty::Changeset => {
             let c = Changeset::decode(&v.bytes)?;
-            (c.encode(), *c.id().as_bytes())
+            (c.encode(), Some(*c.id().as_bytes()))
         }
         Ty::Frame => {
             let f = Frame::decode(&v.bytes)?;
             let h = f.header();
-            let again = Frame::encode(h.kind, h.id, h.codec, h.raw_len, f.payload())
+            let again = Frame::encode(h.id(), h.codec(), h.raw_len(), f.payload())
                 .expect("a decoded frame re-encodes");
-            (again, h.id)
+            (again, Some(*h.id().as_bytes()))
         }
+        Ty::ChunkList => (ChunkList::decode(&v.bytes)?.encode(), None),
     })
 }
 
@@ -57,7 +58,7 @@ fn scion_core_accepts_exactly_the_accepted_vectors() {
         if v.accept {
             let (bytes, id) = got.unwrap_or_else(|e| panic!("{}: rejected: {e}", v.name));
             assert!(bytes == v.bytes, "{}: re-encoding differs", v.name);
-            assert_eq!(Some(id), v.id, "{}: id differs", v.name);
+            assert_eq!(id, v.id, "{}: id differs", v.name);
         } else {
             assert!(got.is_err(), "{}: accepted a reject vector", v.name);
         }
@@ -69,7 +70,7 @@ fn ids_and_digests_are_plain_blake3() {
     for v in vectors::all().into_iter().filter(|v| v.accept) {
         if let Some(ctx) = v.ty.context() {
             assert_eq!(Some(blake3::derive_key(ctx, &v.bytes)), v.id, "{}", v.name);
-        } else {
+        } else if v.ty == Ty::Frame {
             let (body, digest) = v.bytes.split_at(v.bytes.len() - 32);
             assert_eq!(blake3::hash(body).as_bytes(), digest, "{}", v.name);
         }
@@ -89,9 +90,15 @@ fn reference_encoder_reproduces_hand_written_vectors() {
             Ty::Frame => {
                 let f = Frame::decode(&v.bytes).unwrap();
                 let h = f.header();
-                reference::frame(h.kind.code(), &h.id, h.codec.code(), h.raw_len, f.payload())
+                reference::frame(
+                    h.kind().code(),
+                    h.id().as_bytes(),
+                    h.codec().code(),
+                    h.raw_len(),
+                    f.payload(),
+                )
             }
-            Ty::Blob | Ty::Chunk => continue,
+            Ty::Blob | Ty::Chunk | Ty::ChunkList => continue,
         };
         assert!(again == v.bytes, "{}: reference encoder disagrees", v.name);
     }
@@ -230,7 +237,13 @@ fn tree_values() -> BTreeMap<&'static str, Tree> {
 fn frame_values() -> BTreeMap<&'static str, (FrameHeader, Vec<u8>)> {
     let h = |kind, id_hex: &str, codec, raw, payload: &[u8]| {
         (
-            FrameHeader::new(kind, id(id_hex), codec, raw, payload.len() as u64).unwrap(),
+            FrameHeader::new(
+                FrameId::new(kind, id(id_hex)),
+                codec,
+                raw,
+                payload.len() as u64,
+            )
+            .unwrap(),
             payload.to_vec(),
         )
     };
@@ -317,14 +330,8 @@ fn hand_written_vectors_are_the_expected_values() {
         let f = Frame::decode(&v.bytes).unwrap();
         assert_eq!(f.header(), header, "{name}");
         assert_eq!(f.payload(), payload.as_slice(), "{name}");
-        let encoded = Frame::encode(
-            header.kind,
-            header.id,
-            header.codec,
-            header.raw_len,
-            payload,
-        )
-        .unwrap();
+        let encoded =
+            Frame::encode(header.id(), header.codec(), header.raw_len(), payload).unwrap();
         assert!(encoded == v.bytes, "{name}: encoding differs");
     }
     // Every accepted structured vector has an expected value.
@@ -333,7 +340,7 @@ fn hand_written_vectors_are_the_expected_values() {
             Ty::Changeset => cs.contains_key(v.name.as_str()),
             Ty::Tree => trees.contains_key(v.name.as_str()),
             Ty::Frame => frames.contains_key(v.name.as_str()),
-            Ty::Blob | Ty::Chunk => true,
+            Ty::Blob | Ty::Chunk | Ty::ChunkList => true,
         };
         assert!(covered, "{} has no expected value", v.name);
     }
@@ -391,5 +398,25 @@ fn vectors_file_parser_is_strict() {
         "name: n\ntype: thing\nexpect: reject\nbytes: 00\n",
     ] {
         assert!(vectors::parse(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn every_one_byte_change_to_an_accepted_frame_is_rejected() {
+    // The digest covers every byte before it, and a change to the digest
+    // itself no longer matches, so no single changed byte can be accepted.
+    for v in vectors::all()
+        .into_iter()
+        .filter(|v| v.accept && v.ty == Ty::Frame)
+    {
+        for i in 0..v.bytes.len() {
+            let mut changed = v.bytes.clone();
+            changed[i] ^= 0x01;
+            assert!(
+                Frame::decode(&changed).is_err(),
+                "{}: changed byte {i} accepted",
+                v.name
+            );
+        }
     }
 }

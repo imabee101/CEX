@@ -72,15 +72,7 @@ pub enum FormatError {
     DigestMismatch,
     /// A frame's lengths are inconsistent with its kind and codec.
     #[error("frame lengths are invalid: {0}")]
-    BadFrameLength(&'static str),
-    /// A chunk list's count does not match the blob length it describes.
-    #[error("chunk list has {actual} chunks, expected {expected}")]
-    ChunkCountMismatch {
-        /// The count the blob length requires.
-        expected: u64,
-        /// The count found.
-        actual: u64,
-    },
+    BadFrameLength(crate::FrameLengthRule),
     /// A hex id is not exactly 64 lowercase hex digits.
     #[error("invalid hex id")]
     InvalidHex,

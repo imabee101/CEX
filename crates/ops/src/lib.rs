@@ -11,7 +11,10 @@ mod error;
 
 pub use create::{
     CreateOptions, MAX_AUTHOR_BYTES, MAX_COMPONENT_BYTES, MAX_MESSAGE_BYTES, MAX_PARENTS,
-    MAX_PATH_BYTES, MAX_SIGNATURE_BYTES, Ops,
+    MAX_PATH_BYTES, MAX_SIGNATURE_BYTES, Ops, eager_types,
 };
-pub use diff::{DiffMode, FileDiff, FileState, PATCH_CONTEXT};
+pub use diff::{
+    DiffCursor, DiffMode, DiffOptions, DiffPage, FileDiff, FileState, MAX_DIFF_PAGE,
+    MAX_DIFF_PAGE_BYTES, PATCH_CONTEXT,
+};
 pub use error::{Code, OpError};

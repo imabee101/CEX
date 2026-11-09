@@ -20,8 +20,13 @@ pub enum Code {
     CaseConflict,
     /// `NOT_FOUND`.
     NotFound,
-    /// `DATA_LOSS`.
+    /// `DATA_LOSS`: stored bytes are missing or fail verification.
     DataLoss,
+    /// `INTERNAL`: a server defect, such as a violated invariant, a failed
+    /// task, or a misconfigured backend.
+    Internal,
+    /// `RESOURCE_EXHAUSTED`: the server is overloaded; retry after a delay.
+    ResourceExhausted,
     /// `UNAVAILABLE`.
     Unavailable,
     /// `ACL_PENDING`: the requested ACL version has not been backfilled.
@@ -31,7 +36,10 @@ pub enum Code {
 impl Code {
     /// Whether a retry of the same request may succeed.
     pub fn retryable(self) -> bool {
-        matches!(self, Self::Unavailable | Self::AclPending)
+        matches!(
+            self,
+            Self::ResourceExhausted | Self::Unavailable | Self::AclPending
+        )
     }
 }
 
@@ -45,6 +53,8 @@ pub struct OpError {
     pub message: String,
     /// The paths the failure is about, if any.
     pub paths: Vec<Vec<u8>>,
+    /// For `RESOURCE_EXHAUSTED`, how long to wait before retrying.
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl OpError {
@@ -54,6 +64,7 @@ impl OpError {
             code,
             message: message.into(),
             paths: Vec::new(),
+            retry_after: None,
         }
     }
 
@@ -63,18 +74,28 @@ impl OpError {
             code,
             message: message.into(),
             paths: vec![path.to_vec()],
+            retry_after: None,
         }
     }
 }
 
 impl From<StoreError> for OpError {
     fn from(e: StoreError) -> Self {
+        let retry_after = match e {
+            StoreError::Overloaded { retry_after } => Some(retry_after),
+            _ => None,
+        };
         let code = match e {
             StoreError::InvalidArgument(_) => Code::InvalidArgument,
             StoreError::DataLoss(_) => Code::DataLoss,
-            _ => Code::Unavailable,
+            StoreError::Unavailable(_) => Code::Unavailable,
+            StoreError::Overloaded { .. } => Code::ResourceExhausted,
+            StoreError::Internal(_) => Code::Internal,
         };
-        Self::new(code, e.to_string())
+        Self {
+            retry_after,
+            ..Self::new(code, e.to_string())
+        }
     }
 }
 
@@ -100,6 +121,18 @@ impl From<DeriveError> for OpError {
             }
             DeriveError::NotFound(m) => Self::new(Code::NotFound, m),
             DeriveError::DataLoss(m) => Self::new(Code::DataLoss, m),
+            DeriveError::CaseConflict { path, other } => Self::at(
+                Code::CaseConflict,
+                format!(
+                    "{} conflicts with {} in the same directory",
+                    String::from_utf8_lossy(&path),
+                    String::from_utf8_lossy(&other)
+                ),
+                &path,
+            ),
+            DeriveError::Pending(m) => Self::new(Code::Unavailable, m),
+            DeriveError::LimitExceeded(m) => Self::new(Code::LimitExceeded, m),
+            DeriveError::Internal(m) => Self::new(Code::Internal, m),
         }
     }
 }
@@ -112,7 +145,7 @@ mod tests {
     /// lists `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `LAND_RETRIES_EXHAUSTED`,
     /// and `ACL_PENDING`).
     #[test]
-    fn only_unavailable_and_acl_pending_are_retryable() {
+    fn only_overload_unavailable_and_acl_pending_are_retryable() {
         use Code::*;
         for c in [
             InvalidArgument,
@@ -123,10 +156,12 @@ mod tests {
             CaseConflict,
             NotFound,
             DataLoss,
+            Internal,
         ] {
             assert!(!c.retryable(), "{c:?}");
         }
         assert!(Unavailable.retryable());
+        assert!(ResourceExhausted.retryable());
         assert!(AclPending.retryable());
     }
 
@@ -139,5 +174,18 @@ mod tests {
         );
         assert_eq!(code(StoreError::DataLoss("x".into())), Code::DataLoss);
         assert_eq!(code(StoreError::Unavailable("x".into())), Code::Unavailable);
+        assert_eq!(code(StoreError::Internal("x".into())), Code::Internal);
+        let overloaded = OpError::from(StoreError::Overloaded {
+            retry_after: std::time::Duration::from_secs(1),
+        });
+        assert_eq!(overloaded.code, Code::ResourceExhausted);
+        assert_eq!(
+            overloaded.retry_after,
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            OpError::from(StoreError::Unavailable("x".into())).retry_after,
+            None
+        );
     }
 }

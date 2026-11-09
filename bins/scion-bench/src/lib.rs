@@ -3,33 +3,35 @@
 //! [`layout`] lays out a deterministic tree of files from [`BenchParams`]:
 //! directories of depth at most `max_depth` and at most `max_fanout`
 //! entries, file sizes log-normal with the given median and σ, capped, and
-//! filled with seeded pseudo-random bytes. [`cached_repo`] builds the repo's
-//! tip through the real write path (blob upload and CreateChangeset, in
-//! changesets of at most `files_per_changeset` files) in the dev
-//! environment, once per parameter set: the result is kept as a Postgres
-//! template database and an object-store key prefix, both named by a hash
-//! of the parameters, and later calls reuse them.
+//! filled with seeded pseudo-random bytes. [`generate`] builds that tree as
+//! a repository tip through the real write path (blob upload and
+//! CreateChangeset, in changesets of at most `files_per_changeset` files)
+//! into any stores it is given.
+//!
+//! This builds the bench repo's tip only. The full bench repo, with its
+//! 1,000,000-changeset history and a merge every 100 changesets, is built by
+//! the benchmark harness of milestone 13.
 //!
 //! Every computation is integer or IEEE-754 basic arithmetic, so the same
 //! parameters give the same files and ids on every machine.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use derived::{CacheSizes, Deriver};
-use object_store::{ObjectStoreExt, PutPayload};
+
 use ops::blob::upload_blobs;
 use ops::{CreateOptions, Ops};
 use scion_core::{
     BlobId, Changeset, ChangesetId, ChangesetParts, FileChange, FileKind, RepoPath, Timestamp,
 };
-use store::testing::{TEMPLATE_DATABASE, base_config, named_object_store};
-use store::{BlobStore, MetaStore, ObjectBlobStore, PgMetaStore, RefLogReason, RefUpdate, RepoId};
+use store::{BlobStore, CasOutcome, MetaStore, RefLogReason, RefUpdate, RepoId, StoreError};
 
 /// Bumped whenever the generator's output changes, so old caches are not
 /// reused.
-pub const GENERATOR_VERSION: u32 = 1;
+pub const GENERATOR_VERSION: u32 = 2;
 
 /// The repo id the bench repo is stored under.
 pub const REPO: RepoId = RepoId(1);
@@ -55,10 +57,11 @@ pub struct BenchParams {
     pub files_per_changeset: usize,
 }
 
-/// The bench repo of CLAUDE.md: 3,000,000 files, depth ≤ 12, fanout ≤ 64,
-/// log-normal sizes with median 2 KiB and σ 2.0 capped at 64 MiB, seed
-/// `0x5C10_2026`, changesets of at most 2,000 files.
-pub const BENCH: BenchParams = BenchParams {
+/// The tip of the bench repo of AGENTS.md: 3,000,000 files, depth ≤ 12, fanout
+/// ≤ 64, log-normal sizes with median 2 KiB and σ 2.0 capped at 64 MiB, seed
+/// `0x5C10_2026`, built in changesets of at most 2,000 files (the spec's
+/// largest changeset).
+pub const BENCH_TIP: BenchParams = BenchParams {
     seed: 0x5C10_2026,
     files: 3_000_000,
     max_depth: 12,
@@ -68,24 +71,6 @@ pub const BENCH: BenchParams = BenchParams {
     max_size: 64 << 20,
     files_per_changeset: 2000,
 };
-
-impl BenchParams {
-    /// A short name for these parameters and this generator version.
-    pub fn key(&self) -> String {
-        let desc = format!(
-            "v{GENERATOR_VERSION} seed={} files={} depth={} fanout={} median={:?} sigma={:?} max={} per={}",
-            self.seed,
-            self.files,
-            self.max_depth,
-            self.max_fanout,
-            self.median_size,
-            self.sigma,
-            self.max_size,
-            self.files_per_changeset
-        );
-        blake3::hash(desc.as_bytes()).to_hex()[..16].to_owned()
-    }
-}
 
 /// One file of the layout.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,10 +114,19 @@ impl Rng {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    /// A standard normal sample, by the Irwin–Hall sum of 12 uniforms
-    /// (additions only, so it is the same on every machine).
+    /// A standard normal sample by Marsaglia's polar method. It has the
+    /// normal distribution's full tails, which set the size of the largest
+    /// files, and uses only basic IEEE-754 operations, `sqrt` (correctly
+    /// rounded), and [`det_ln`], so it is the same on every machine.
     fn normal(&mut self) -> f64 {
-        (0..12).map(|_| self.unit()).sum::<f64>() - 6.0
+        loop {
+            let u = 2.0 * self.unit() - 1.0;
+            let v = 2.0 * self.unit() - 1.0;
+            let s = u * u + v * v;
+            if s > 0.0 && s < 1.0 {
+                return u * (-2.0 * det_ln(s) / s).sqrt();
+            }
+        }
     }
 }
 
@@ -150,6 +144,37 @@ fn det_exp(x: f64) -> f64 {
     }
     let k = k as i64;
     sum * f64::from_bits(((1023 + k) as u64) << 52)
+}
+
+/// ln x for a finite x > 0 from basic IEEE-754 operations only: x = m · 2^e
+/// with m in [1, 2), and ln m = 2 atanh((m − 1) / (m + 1)) by its series,
+/// so the result is the same on every machine.
+fn det_ln(x: f64) -> f64 {
+    const LN2: f64 = std::f64::consts::LN_2;
+    let bits = x.to_bits();
+    let (m, e) = if bits >> 52 == 0 {
+        // Subnormal: scale into the normal range first.
+        let scaled = x * f64::from_bits(((1023 + 64) as u64) << 52);
+        let b = scaled.to_bits();
+        (
+            f64::from_bits((b & ((1 << 52) - 1)) | (1023 << 52)),
+            (b >> 52) as i64 - 1023 - 64,
+        )
+    } else {
+        (
+            f64::from_bits((bits & ((1 << 52) - 1)) | (1023 << 52)),
+            (bits >> 52) as i64 - 1023,
+        )
+    };
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+    let mut term = t;
+    let mut sum = 0.0;
+    for k in 0..40 {
+        sum += term / f64::from(2 * k + 1);
+        term *= t2;
+    }
+    e as f64 * LN2 + 2.0 * sum
 }
 
 fn file_size(p: &BenchParams, rng: &mut Rng) -> u64 {
@@ -255,14 +280,26 @@ pub fn content(p: &BenchParams, f: &FileSpec) -> Vec<u8> {
 /// How many changesets' blobs are uploaded ahead of the create chain.
 const UPLOADS_AHEAD: usize = 6;
 
-/// Builds the tip into the given stores: uploads every file and creates a
-/// chain of changesets adding them; returns the last changeset.
+/// Builds the tip of [`layout`]`(p)` into the given stores; returns it.
 pub async fn generate<M: MetaStore + 'static, B: BlobStore + 'static>(
     p: &BenchParams,
     meta: Arc<M>,
     blobs: Arc<B>,
 ) -> ChangesetId {
-    let files = Arc::new(layout(p));
+    build(p, Arc::new(layout(p)), meta, blobs).await
+}
+
+/// Builds a tip holding `files`, with the contents `p` gives them, into the
+/// given stores: uploads every file and creates a chain of changesets of at
+/// most `p.files_per_changeset` files adding them in order; returns the last
+/// changeset. `files` must be non-empty, with distinct paths, none a prefix
+/// directory of another.
+pub async fn build<M: MetaStore + 'static, B: BlobStore + 'static>(
+    p: &BenchParams,
+    files: Arc<Vec<FileSpec>>,
+    meta: Arc<M>,
+    blobs: Arc<B>,
+) -> ChangesetId {
     let ops = Ops::new(Arc::new(Deriver::new(
         meta.clone(),
         blobs.clone(),
@@ -326,142 +363,29 @@ pub async fn generate<M: MetaStore + 'static, B: BlobStore + 'static>(
     parent.expect("the bench repo has files")
 }
 
-/// A generated repo in the dev environment.
-#[derive(Clone, Debug)]
-pub struct CachedRepo {
-    /// The template database holding its metadata; create test databases
-    /// from it.
-    pub template: String,
-    /// The object-store key prefix holding its frames; read it as a shared
-    /// base and write elsewhere.
-    pub prefix: String,
-    /// The tip changeset, also the target of the ref `main`.
-    pub tip: ChangesetId,
-}
-
-const MARKER: &str = "complete";
-
-async fn admin() -> tokio_postgres::Client {
-    let mut config = base_config();
-    config.dbname("postgres");
-    let (client, conn) = config
-        .connect(tokio_postgres::NoTls)
-        .await
-        .expect("the dev environment is not reachable; run `cargo xtask dev-up`");
-    tokio::spawn(conn);
-    client
-}
-
-async fn marker(prefix: &str) -> Option<ChangesetId> {
-    let store = named_object_store(prefix);
-    let got = store.get(&MARKER.into()).await.ok()?;
-    let bytes = got.bytes().await.ok()?;
-    std::str::from_utf8(&bytes).ok()?.parse().ok()
-}
-
-/// The repo for `p`, generated on first use and reused afterwards (by every
-/// process: generation holds a Postgres advisory lock).
-pub async fn cached_repo(p: &BenchParams) -> CachedRepo {
-    let key = p.key();
-    let template = format!("bench_{key}");
-    let prefix = format!("bench-{key}");
-    let admin = admin().await;
-    let lock = i64::from_str_radix(&key[..15], 16).expect("hex key");
-    admin
-        .execute("SELECT pg_advisory_lock($1)", &[&lock])
-        .await
-        .expect("lock");
-    let exists = !admin
-        .query("SELECT 1 FROM pg_database WHERE datname = $1", &[&template])
-        .await
-        .expect("query")
-        .is_empty();
-    let tip = match (exists, marker(&prefix).await) {
-        (true, Some(tip)) => {
-            // Reuse the generated history, upgrading storage and backfilling
-            // versioned indexes before handing the snapshot to timed creates.
-            // This is setup work, never part of CreateChangeset's cost.
-            let mut config = base_config();
-            config.dbname(&template);
-            let meta = Arc::new(PgMetaStore::new(config, 32).expect("store"));
-            meta.migrate().await.expect("migrate cached repo");
-            let blobs = Arc::new(ObjectBlobStore::new(Arc::new(named_object_store(&prefix))));
-            let deriver = Deriver::new(meta, blobs, CacheSizes::default());
-            deriver
-                .get(REPO, &ops::case::CaseIndex, tip)
-                .await
-                .expect("backfill cached case index");
-            tip
-        }
-        (exists, _) => {
-            if exists {
-                admin
-                    .batch_execute(&format!("DROP DATABASE \"{template}\" WITH (FORCE)"))
-                    .await
-                    .expect("drop stale template");
-            }
-            let build = format!("{template}_build");
-            admin
-                .batch_execute(&format!("DROP DATABASE IF EXISTS \"{build}\" WITH (FORCE)"))
-                .await
-                .expect("drop old build database");
-            admin
-                .batch_execute(&format!(
-                    "CREATE DATABASE \"{build}\" TEMPLATE \"{TEMPLATE_DATABASE}\" STRATEGY FILE_COPY"
-                ))
-                .await
-                .expect("create build database");
-            let mut config = base_config();
-            config.dbname(&build);
-            let meta = Arc::new(PgMetaStore::new(config, 32).expect("store"));
-            meta.migrate().await.expect("migrate");
-            let blobs = Arc::new(ObjectBlobStore::new(Arc::new(named_object_store(&prefix))));
-            let started = std::time::Instant::now();
-            let tip = generate(p, meta.clone(), blobs).await;
-            meta.update_ref(
-                REPO,
-                &RefUpdate {
-                    name: "main",
-                    expected: None,
-                    new: tip,
-                    actor: "scion-bench",
-                    time_micros: 0,
-                    reason: RefLogReason::Manual,
-                },
-            )
-            .await
-            .expect("set main");
-            drop(meta);
-            eprintln!(
-                "generated bench repo {key} ({} files) in {:?}",
-                p.files,
-                started.elapsed()
-            );
-            named_object_store(&prefix)
-                .put(
-                    &MARKER.into(),
-                    PutPayload::from(tip.to_string().into_bytes()),
-                )
-                .await
-                .expect("write marker");
-            admin
-                .batch_execute(&format!(
-                    "ALTER DATABASE \"{build}\" RENAME TO \"{template}\""
-                ))
-                .await
-                .expect("rename the built database");
-            tip
-        }
-    };
-    admin
-        .execute("SELECT pg_advisory_unlock($1)", &[&lock])
-        .await
-        .expect("unlock");
-    CachedRepo {
-        template,
-        prefix,
-        tip,
-    }
+/// Creates the ref `main` pointing at `tip`, recording the current time in
+/// its ref-log row. The CAS expects no `main`, so it fails with
+/// [`CasOutcome::Mismatch`] when one exists.
+pub async fn create_main<M: MetaStore>(
+    meta: &M,
+    tip: ChangesetId,
+) -> Result<CasOutcome, StoreError> {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after 1970");
+    let time_micros = i64::try_from(since_epoch.as_micros()).expect("the clock is before 294,000");
+    meta.update_ref(
+        REPO,
+        &RefUpdate {
+            name: "main",
+            expected: None,
+            new: tip,
+            actor: "scion-bench",
+            time_micros,
+            reason: RefLogReason::Manual,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -469,7 +393,7 @@ mod tests {
     use super::*;
 
     fn small(files: u64) -> BenchParams {
-        BenchParams { files, ..BENCH }
+        BenchParams { files, ..BENCH_TIP }
     }
 
     #[test]
@@ -510,9 +434,26 @@ mod tests {
         sizes.sort_unstable();
         let median = sizes[sizes.len() / 2] as f64;
         assert!((1800.0..2300.0).contains(&median), "median {median}");
-        // σ = 2: the 84th percentile is about e² times the median.
-        let p84 = sizes[sizes.len() * 841 / 1000] as f64;
-        assert!((5.5..9.5).contains(&(p84 / median)), "{}", p84 / median);
+        // For σ = 2, the quantile at z standard deviations is e^(2z) times
+        // the median. The tail matters most: it sets the largest files.
+        for (per_mille, z) in [(841, 1.0), (977, 2.0), (999, 3.09)] {
+            let q = sizes[sizes.len() * per_mille / 1000] as f64 / median;
+            let want = f64::exp(2.0 * z);
+            assert!(
+                (q / want - 1.0).abs() < 0.2,
+                "the {per_mille}‰ quantile is {q:.1} times the median, not {want:.1}"
+            );
+        }
+    }
+
+    #[test]
+    fn ln_is_accurate() {
+        for x in [
+            1e-300, 5e-324, 1e-10, 0.001, 0.25, 0.5, 0.999_999, 1.0, 1.5, 2.0, 10.0, 1e300,
+        ] {
+            let err = (det_ln(x) - f64::ln(x)).abs();
+            assert!(err <= 1e-14 * f64::ln(x).abs().max(1.0), "{x}: {err}");
+        }
     }
 
     #[test]
@@ -546,15 +487,15 @@ mod tests {
 
     /// (`GENERATOR_VERSION`, digest of 20,000 files, digest of 37 files).
     const GOLDEN: (u32, &str, &str) = (
-        1,
-        "8fc48253e29cd3b60fa5e8d14a7ef9a1b45effebb00c6a6947b7f2fb4fffc487",
-        "58b491cc27a8a3beaeca34ef30b8c227926d53b58b39492df1d29dab51f80c30",
+        2,
+        "ca17fd5ef740c4183e5e4ac3d4e0dbf5f102280cda8f8fdaec4b6d257122a186",
+        "dd8a0bbb492620e2e38fa692b9173af4145097fc0be53122cdb5970efb586c7b",
     );
 
     /// Digests of 64 and 47 files at depth 3 and fanout 8.
     const GOLDEN_TIGHT: (&str, &str) = (
-        "6634e30cf8c9036bebd6f20fe1f8915d6c86201b8f3cecd8ecc54530ffd4f218",
-        "da941810fb946c6647127844dc1aba3c834409950434a455ede0cec5a839e65e",
+        "1f432fac7c308e96ea8600c5c00ae0af00bcdc9ee2a65cf4eb56fc6d29b97408",
+        "6ec754e4a94dcc8521756a9bc7496f1285d028eedba36c839511868d858f5773",
     );
 
     /// A digest of the layout and of every file's contents for `p`.
@@ -582,7 +523,7 @@ mod tests {
                 files,
                 max_depth: 3,
                 max_fanout: 8,
-                ..BENCH
+                ..BENCH_TIP
             };
             let l = layout(&p);
             assert_eq!(l.len() as u64, files);
@@ -624,34 +565,12 @@ mod tests {
     }
 
     #[test]
-    fn the_bench_repo_is_the_one_claude_md_specifies() {
-        assert_eq!(BENCH.seed, 0x5C10_2026);
-        assert_eq!(BENCH.files, 3_000_000);
-        assert_eq!((BENCH.max_depth, BENCH.max_fanout), (12, 64));
-        assert_eq!((BENCH.median_size, BENCH.sigma), (2048.0, 2.0));
-        assert_eq!(BENCH.max_size, 64 * 1024 * 1024);
-        assert_eq!(BENCH.files_per_changeset, 2000);
-    }
-
-    #[test]
-    fn cache_keys_tell_parameter_sets_apart() {
-        assert_eq!(BENCH.key(), BENCH.key());
-        let keys: std::collections::HashSet<String> = [
-            BENCH,
-            small(10_000),
-            BenchParams { seed: 1, ..BENCH },
-            BenchParams {
-                max_depth: 11,
-                ..BENCH
-            },
-            BenchParams {
-                max_size: 1,
-                ..BENCH
-            },
-        ]
-        .iter()
-        .map(BenchParams::key)
-        .collect();
-        assert_eq!(keys.len(), 5);
+    fn the_bench_tip_is_the_one_agents_md_specifies() {
+        assert_eq!(BENCH_TIP.seed, 0x5C10_2026);
+        assert_eq!(BENCH_TIP.files, 3_000_000);
+        assert_eq!((BENCH_TIP.max_depth, BENCH_TIP.max_fanout), (12, 64));
+        assert_eq!((BENCH_TIP.median_size, BENCH_TIP.sigma), (2048.0, 2.0));
+        assert_eq!(BENCH_TIP.max_size, 64 * 1024 * 1024);
+        assert_eq!(BENCH_TIP.files_per_changeset, 2000);
     }
 }

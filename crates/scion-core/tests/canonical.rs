@@ -9,8 +9,8 @@ use proptest::collection::{btree_map, vec};
 use proptest::prelude::*;
 use scion_core::{
     BlobId, CHUNK_BYTES, Changeset, ChangesetId, ChangesetParts, ChunkId, ChunkList, Codec,
-    Committer, EntryTarget, FileChange, FileKind, Frame, FrameKind, RepoPath, Timestamp, Tree,
-    TreeEntry, TreeId,
+    Committer, EntryTarget, FileChange, FileKind, Frame, FrameId, FrameKind, RepoPath, Timestamp,
+    Tree, TreeEntry, TreeId,
 };
 use support::{convert, reference};
 
@@ -166,7 +166,13 @@ fn frame() -> impl Strategy<Value = Vec<u8>> {
         )
             .prop_filter("chunks are non-empty", |(k, _, p)| *k != FrameKind::Chunk
                 || !p.is_empty())
-            .prop_map(|(k, id, p)| Frame::encode(k, id, Codec::Raw, p.len() as u64, &p).unwrap()),
+            .prop_map(|(k, id, p)| Frame::encode(
+                FrameId::new(k, id),
+                Codec::Raw,
+                p.len() as u64,
+                &p
+            )
+            .unwrap()),
         // Zstd frames: the payload is shorter than the raw length.
         (
             prop_oneof![
@@ -179,7 +185,13 @@ fn frame() -> impl Strategy<Value = Vec<u8>> {
             0u64..=CHUNK_BYTES as u64
         )
             .prop_filter("zstd shrinks", |(_, _, p, extra)| (p.len() as u64) < *extra)
-            .prop_map(|(k, id, p, raw)| Frame::encode(k, id, Codec::Zstd, raw, &p).unwrap()),
+            .prop_map(|(k, id, p, raw)| Frame::encode(
+                FrameId::new(k, id),
+                Codec::Zstd,
+                raw,
+                &p
+            )
+            .unwrap()),
         // Chunk lists for blobs of up to 8 chunks.
         (
             id32(),
@@ -192,8 +204,7 @@ fn frame() -> impl Strategy<Value = Vec<u8>> {
                     .map(|i| ChunkId::hash(&[&seed[..], &[i as u8]].concat()))
                     .collect();
                 Frame::encode(
-                    FrameKind::ChunkList,
-                    id,
+                    FrameId::new(FrameKind::ChunkList, id),
                     Codec::Raw,
                     raw,
                     &ChunkList { chunks }.encode(),
@@ -258,7 +269,7 @@ fn assert_canonical_if_accepted(b: &[u8]) {
     if let Ok(f) = Frame::decode(b) {
         let h = f.header();
         assert_eq!(
-            Frame::encode(h.kind, h.id, h.codec, h.raw_len, f.payload()).unwrap(),
+            Frame::encode(h.id(), h.codec(), h.raw_len(), f.payload()).unwrap(),
             b
         );
     }
@@ -290,7 +301,7 @@ proptest! {
     fn frames_round_trip_and_match_reference(f in frame()) {
         let d = Frame::decode(&f).unwrap();
         let h = d.header();
-        prop_assert_eq!(reference::frame(h.kind.code(), &h.id, h.codec.code(), h.raw_len, d.payload()), f);
+        prop_assert_eq!(reference::frame(h.kind().code(), h.id().as_bytes(), h.codec().code(), h.raw_len(), d.payload()), f);
     }
 
     #[test]
@@ -344,10 +355,10 @@ proptest! {
     fn every_non_minimal_frame_varint_is_rejected(f in frame()) {
         let d = Frame::decode(&f).unwrap();
         let h = *d.header();
-        let (_, n) = reference::with_padded_varint(None, || reference::frame(h.kind.code(), &h.id, h.codec.code(), h.raw_len, d.payload()));
+        let (_, n) = reference::with_padded_varint(None, || reference::frame(h.kind().code(), h.id().as_bytes(), h.codec().code(), h.raw_len(), d.payload()));
         prop_assert_eq!(n, 2);
         for k in 0..n {
-            let (padded, _) = reference::with_padded_varint(Some(k), || reference::frame(h.kind.code(), &h.id, h.codec.code(), h.raw_len, d.payload()));
+            let (padded, _) = reference::with_padded_varint(Some(k), || reference::frame(h.kind().code(), h.id().as_bytes(), h.codec().code(), h.raw_len(), d.payload()));
             prop_assert!(Frame::decode(&padded).is_err(), "varint {} padded was accepted", k);
         }
     }

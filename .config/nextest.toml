@@ -1,20 +1,27 @@
 # Test tiers. A test that takes longer than SLOW_TEST_SECONDS (30 s) belongs in
 # the slow group: name it with a `slow_` prefix. The fast tier (`cargo xtask ci`)
 # excludes the slow group, and a test outside it is terminated, and fails, after
-# 30 s. The full tier (`cargo xtask ci-full`) runs everything.
+# 30 s. The full tier (`cargo xtask ci-full`) runs the slow group as its own
+# step, with the `slow` profile.
 #
-# No concurrency limit is set for tests that use the dev environment: every test
-# gets its own database and key prefix, and nextest's default of one test per CPU
-# stays far below the Postgres connection limit in compose.yaml. The one
-# exception is the `wide` group below.
+# Tests that use the dev environment run in parallel: each has its own database
+# and key prefix. Their Postgres connections must stay below max_connections
+# (1,000) in compose.yaml. A test opens at most 18 (a 16-connection pool, one
+# admin connection, and its process's owner session), except the `wide` group,
+# which opens about 66 each. With at most 32 tests at once and at most 4 of
+# them wide, the worst case is 4 × 66 + 28 × 18 = 768 connections.
 
 [test-groups]
-slow = { max-threads = "num-cpus" }
+# Slow tests build large fixtures (up to a 3M-file repo); four at once
+# fit in a 16 GB CI runner.
+slow = { max-threads = 4 }
 # Tests that open one Postgres connection per client at 64-way concurrency;
 # four at a time stay well below the connection limit in compose.yaml.
 wide = { max-threads = 4 }
 
 [profile.default]
+# The connection budget above assumes at most 32 tests at once.
+test-threads = 32
 default-filter = "not test(/(^|::)slow_/)"
 retries = 0
 fail-fast = true
@@ -29,13 +36,17 @@ slow-timeout = { period = "60s", terminate-after = 60 }
 filter = "package(store) and test(/concurrent|64_way/)"
 test-group = "wide"
 
-# CI reports every failure instead of stopping at the first.
+# CI reports every failure instead of stopping at the first, and runs one
+# test per core: CI runners have few cores, and oversubscribing them would
+# push tests past the 30 s limit for want of CPU, not because they are slow.
 [profile.ci]
 fail-fast = false
+test-threads = "num-cpus"
 
-[profile.full]
-default-filter = "all()"
+[profile.slow]
+default-filter = "test(/(^|::)slow_/)"
 
-[profile.ci-full]
-default-filter = "all()"
+[profile.ci-slow]
+default-filter = "test(/(^|::)slow_/)"
 fail-fast = false
+test-threads = "num-cpus"

@@ -6,7 +6,7 @@ use bytes::Bytes;
 use scion_core::{BlobId, ChunkId, TreeId};
 
 use super::{CONCURRENCY, pseudo_random};
-use crate::{BlobStore, ObjectKey, PutOutcome, RepoId, StoreError};
+use crate::{BlobStore, ObjectKey, PutOutcome, RepoId};
 
 const REPO: RepoId = RepoId(7);
 const OTHER_REPO: RepoId = RepoId(8);
@@ -110,11 +110,10 @@ pub async fn repos_are_isolated<S: BlobStore>(store: Arc<S>) {
     }
 }
 
-/// Concurrent puts of one key with different bytes create it exactly once,
-/// and every later read returns the winner's bytes. All three kinds race at
-/// once. Under contention a put may fail with the retryable `Unavailable`,
-/// never with anything else; retrying it then finds the key and must not
-/// create it again.
+/// Concurrent puts of one key with different bytes all succeed, create it
+/// exactly once, and every later read returns the winner's bytes. All three
+/// kinds race at once. Contention is the store's to absorb: a put that loses
+/// a race reports `Existed`, never an error.
 pub async fn concurrent_puts_of_one_key_create_it_once<S: BlobStore>(store: Arc<S>) {
     let keys = keys(b"concurrent");
     let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY * keys.len()));
@@ -142,14 +141,6 @@ pub async fn concurrent_puts_of_one_key_create_it_once<S: BlobStore>(store: Arc<
             }
             let outcome = match outcome {
                 Ok(o) => *o,
-                Err(StoreError::Unavailable(_)) => {
-                    let retried = store.put_if_absent(REPO, key, value.clone()).await;
-                    assert!(
-                        matches!(retried, Ok(PutOutcome::Existed)),
-                        "{key:?}: a retry after losing the race returned {retried:?}"
-                    );
-                    PutOutcome::Existed
-                }
                 Err(e) => panic!("{key:?}: a racing put failed with {e:?}"),
             };
             if outcome == PutOutcome::Created {

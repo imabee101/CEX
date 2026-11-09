@@ -102,6 +102,16 @@ impl SplitMix64 {
     pub fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
+
+    /// An index into a slice of length `n`, which must be positive.
+    pub fn index(&mut self, n: usize) -> usize {
+        self.below(n as u64) as usize
+    }
+
+    /// True with probability `1 / n`; `n` must be positive.
+    pub fn one_in(&mut self, n: u64) -> bool {
+        self.below(n) == 0
+    }
 }
 
 #[cfg(test)]

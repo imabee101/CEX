@@ -4,7 +4,6 @@ members = [
     "crates/*",
     "bins/*",
     "fuzz",
-    "tests/sim",
     "xtask",
 ]
 
@@ -18,17 +17,11 @@ publish = false
 [workspace.dependencies]
 # Workspace crates. Public crates carry a version so they can be published.
 scion-core = { path = "crates/scion-core", version = "0.1.0" }
-scion-proto = { path = "crates/scion-proto", version = "0.1.0" }
-scion-client = { path = "crates/scion-client", version = "0.1.0" }
-scion-conformance = { path = "crates/scion-conformance", version = "0.1.0" }
 store = { path = "crates/store" }
 derived = { path = "crates/derived" }
 ops = { path = "crates/ops" }
-rpc = { path = "crates/rpc" }
-vfs = { path = "crates/vfs" }
-import = { path = "crates/import" }
 
-# Third-party crates: the CLAUDE.md Dependencies line, each at the newest release
+# Third-party crates: the AGENTS.md Dependencies line, each at the newest release
 # compatible with the MSRV. Members opt into the features they need.
 tokio = { version = "1.54.1", default-features = false }
 tonic = { version = "0.14.9", default-features = false }
@@ -51,6 +44,7 @@ jsonwebtoken = { version = "11.1.0", default-features = false }
 moka = { version = "0.12.16", default-features = false }
 object_store = { version = "0.14.2", default-features = false }
 tokio-postgres = { version = "0.7.18", default-features = false }
+tokio-postgres-rustls = { version = "0.14.0", default-features = false }
 gix = { version = "0.90.0", default-features = false }
 notify = { version = "8.2.1", default-features = false }
 ignore = { version = "0.4.34" }
@@ -95,4 +89,10 @@ opt-level = 2
 debug = "line-tables-only"
 
 [profile.test.package."*"]
+opt-level = 2
+
+# The tree and changeset codecs run millions of times in the encoding and
+# model tests; optimized, they keep those tests fast. Debug assertions and
+# overflow checks stay on.
+[profile.test.package.scion-core]
 opt-level = 2

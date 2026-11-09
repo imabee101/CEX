@@ -15,8 +15,14 @@ thiserror = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["rt", "sync"] }
 zstd = { workspace = true }
 
+[features]
+# Test support: a seeded PRNG, random commit histories, and in-flight
+# counts. Enabled only by dev-dependencies.
+testing = ["store/testing"]
+
 [dev-dependencies]
-proptest = { workspace = true, features = ["std"] }
+derived = { path = ".", features = ["testing"] }
+store = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

@@ -7,13 +7,12 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use bytes::Bytes;
 use common::*;
 use derived::{
-    AclConfig, CacheSizes, CommitGraph, DerivedType, Deriver, RestrictedRoots, RootTree,
+    AclConfig, CacheSizes, CommitGraph, DerivedType, Deriver, FRAME_WRITES, RestrictedRoots,
+    RootTree,
 };
 use ops::Ops;
 use ops::case::CaseIndex;
@@ -38,7 +37,7 @@ fn value_keys_keep_their_layout() {
     acl.version = 9;
     assert_eq!(RestrictedRoots::new(Arc::new(acl)).key(cs), key(3, 9));
     assert_eq!(
-        CaseIndex.key(cs),
+        CaseIndex::default().key(cs),
         DerivedKey {
             version: 2,
             ..key(4, 0)
@@ -66,25 +65,59 @@ async fn a_warm_server_reads_values_and_trees_from_ram() {
     assert_eq!(faults.counts().meta_gets, 0, "{:?}", faults.counts());
 }
 
-/// A blob store that records the most puts in flight at once.
-struct Concurrency<B> {
+/// A blob store whose puts wait, without timers, until `FRAME_WRITES` puts
+/// are in flight at once (or every expected put has started), and which
+/// records the most in flight. A writer with a lower bound never fills the
+/// gate and hangs; one with no bound starts more than `FRAME_WRITES`.
+struct Gate<B> {
     inner: Arc<B>,
-    now: AtomicUsize,
-    max: AtomicUsize,
+    total: usize,
+    state: std::sync::Mutex<GateState>,
+    opened: tokio::sync::Notify,
 }
 
-impl<B: BlobStore> BlobStore for Concurrency<B> {
+#[derive(Default)]
+struct GateState {
+    now: usize,
+    max: usize,
+    started: usize,
+    /// Bumped each time the gate opens, releasing every put waiting on it.
+    generation: u64,
+}
+
+impl<B: BlobStore> BlobStore for Gate<B> {
     async fn put_if_absent(
         &self,
         repo: RepoId,
         key: ObjectKey,
         bytes: Bytes,
     ) -> Result<PutOutcome, StoreError> {
-        let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max.fetch_max(n, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        let waiting = {
+            let mut s = self.state.lock().unwrap();
+            s.now += 1;
+            s.started += 1;
+            s.max = s.max.max(s.now);
+            if s.now == FRAME_WRITES || s.started == self.total {
+                s.generation += 1;
+                self.opened.notify_waiters();
+                None
+            } else {
+                Some(s.generation)
+            }
+        };
+        if let Some(generation) = waiting {
+            loop {
+                let opened = self.opened.notified();
+                tokio::pin!(opened);
+                opened.as_mut().enable();
+                if self.state.lock().unwrap().generation != generation {
+                    break;
+                }
+                opened.await;
+            }
+        }
         let r = self.inner.put_if_absent(repo, key, bytes).await;
-        self.now.fetch_sub(1, Ordering::SeqCst);
+        self.state.lock().unwrap().now -= 1;
         r
     }
 
@@ -97,36 +130,58 @@ impl<B: BlobStore> BlobStore for Concurrency<B> {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn tree_frames_are_written_in_parallel_within_a_bound() {
+/// On a single-threaded runtime, a writer spawns every frame write it may
+/// before any is polled, so the most in flight is exactly its bound.
+#[tokio::test]
+async fn tree_frames_are_written_in_parallel_up_to_exactly_the_bound() {
     let e = env().await;
-    let content = Bytes::from_static(b"c\n");
+    // 300 directories with different contents: 300 new nodes plus the
+    // root, each with a frame. Private index nodes have none.
+    let files: Vec<(Vec<u8>, FileKind, Vec<u8>)> = (0..300)
+        .map(|i| {
+            (
+                format!("d{i:03}/f").into_bytes(),
+                FileKind::Regular,
+                format!("{i}\n").into_bytes(),
+            )
+        })
+        .collect();
     // Upload first, so every counted put is a tree frame.
-    ops::blob::upload_blobs(&*e.meta, &e.blobs, REPO, std::slice::from_ref(&content))
+    let contents: Vec<Bytes> = files.iter().map(|f| Bytes::from(f.2.clone())).collect();
+    ops::blob::upload_blobs(&*e.meta, &e.blobs, REPO, &contents)
         .await
         .unwrap();
-    let blobs = Arc::new(Concurrency {
+    let total = reference_nodes(files.clone())
+        .1
+        .into_values()
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    assert_eq!(total, 301);
+    let blobs = Arc::new(Gate {
         inner: e.blobs.clone(),
-        now: AtomicUsize::new(0),
-        max: AtomicUsize::new(0),
+        total,
+        state: std::sync::Mutex::default(),
+        opened: tokio::sync::Notify::new(),
     });
     let ops = Ops::new(Arc::new(Deriver::new(
         e.meta.clone(),
         blobs.clone(),
         CacheSizes::default(),
     )));
-    // 300 directories: 300 new nodes plus the root. Private index nodes
-    // have no object frames.
-    let changes = (0..300)
-        .map(|i| (path(&format!("d{i:03}/f")), write(b"c\n")))
+    let changes = files
+        .iter()
+        .map(|(p, _, c)| (path(std::str::from_utf8(p).unwrap()), write(c)))
         .collect();
-    let cs = changeset(&[], "many", changes);
-    ops.create_changeset(REPO, cs, &ops::CreateOptions::default())
-        .await
-        .unwrap();
-    let max = blobs.max.load(Ordering::SeqCst);
-    assert!(max > 1, "tree frames were written one at a time");
-    assert!(max <= 32, "{max} tree frame writes in flight");
+    ops.create_changeset(
+        REPO,
+        changeset(&[], "many", changes),
+        &ops::CreateOptions::default(),
+    )
+    .await
+    .unwrap();
+    let s = blobs.state.lock().unwrap();
+    assert_eq!((s.started, s.max), (total, FRAME_WRITES));
 }
 
 #[tokio::test]
@@ -156,9 +211,9 @@ async fn frames_are_compressed_when_that_shrinks_them() {
         async move { blobs.get(REPO, k).await.unwrap().unwrap() }
     };
     let f = frame(ObjectKey::blob(scion_core::BlobId::hash(&text))).await;
-    assert_eq!(Frame::decode(&f).unwrap().header().codec, Codec::Zstd);
+    assert_eq!(Frame::decode(&f).unwrap().header().codec(), Codec::Zstd);
     let f = frame(ObjectKey::blob(scion_core::BlobId::hash(&random))).await;
-    assert_eq!(Frame::decode(&f).unwrap().header().codec, Codec::Raw);
+    assert_eq!(Frame::decode(&f).unwrap().header().codec(), Codec::Raw);
     let root = root_of(&ops, id).await;
     let f = frame(ObjectKey::tree(root)).await;
     Frame::decode(&f).unwrap();
@@ -251,12 +306,18 @@ async fn reads_reject_frames_that_name_another_object() {
         (FrameKind::Chunk, id.as_bytes()),
     ] {
         let repo = RepoId(REPO.0 + 1 + kind as u64);
-        let frame = Frame::encode(kind, *named, Codec::Raw, content.len() as u64, content).unwrap();
+        let frame = Frame::encode(
+            scion_core::FrameId::new(kind, *named),
+            Codec::Raw,
+            content.len() as u64,
+            content,
+        )
+        .unwrap();
         e.blobs
             .put_if_absent(repo, ObjectKey::blob(id), Bytes::from(frame))
             .await
             .unwrap();
-        let err = ops::blob::read_blob(&*e.blobs, repo, id)
+        let err = ops::blob::read_blob(&*e.blobs, repo, id, content.len() as u64)
             .await
             .expect_err("a frame naming another object was read");
         assert_eq!(err.code, ops::Code::DataLoss, "{kind:?}: {err}");
@@ -287,8 +348,7 @@ async fn diff_reads_only_differing_reachable_trees() {
             let meta = Arc::new(FaultMetaStore::new(e.meta.clone(), faults.clone()));
             let blobs = Arc::new(FaultBlobStore::new(e.blobs.clone(), faults.clone()));
             let ops = ops(&meta, &blobs);
-            let out = ops
-                .diff(REPO, a, b, ops::DiffMode::Names, &paths)
+            let out = diff_all(&ops, a, b, ops::DiffMode::Names, &paths)
                 .await
                 .unwrap();
             (out.len(), faults.counts().meta_get_keys)

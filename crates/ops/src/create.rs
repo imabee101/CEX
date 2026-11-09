@@ -3,14 +3,13 @@
 //! in one transaction. It takes no locks and never reads or writes a ref
 //! (INV-2); its cost is O(changed files × path depth) (INV-1).
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use bytes::Bytes;
-use derived::{AclConfig, CommitGraph, DerivedType, Deriver, RestrictedRoots, RootTree};
+use derived::{AclConfig, AnyType, CommitGraph, Deriver, Mode, RestrictedRoots, RootTree};
 use scion_core::{Changeset, ChangesetId};
 use store::{BlobStore, MetaKey, MetaStore, RepoId};
-use tokio::sync::OnceCell;
 
 use crate::case::CaseIndex;
 use crate::{Code, OpError};
@@ -51,7 +50,7 @@ impl Default for CreateOptions {
 }
 
 type CreateKey = (RepoId, ChangesetId, u64, bool, bool);
-type Creating = Mutex<HashMap<CreateKey, Arc<OnceCell<()>>>>;
+type Creating = store::Coalescer<CreateKey, ()>;
 
 /// Server-side operations over one pair of stores.
 pub struct Ops<M, B> {
@@ -128,7 +127,7 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
     pub fn new(deriver: Arc<Deriver<M, B>>) -> Self {
         Self {
             deriver,
-            creating: Mutex::new(HashMap::new()),
+            creating: store::Coalescer::default(),
         }
     }
 
@@ -150,9 +149,10 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
     }
 
     /// Creates a changeset. Creating an existing changeset again writes
-    /// nothing, provided its requested ACL version is ready. Concurrent
-    /// creates with the same id, ACL version, case-check setting, and import
-    /// setting on this server share one computation and one write.
+    /// only the eager values it lacks for these options (such as
+    /// RestrictedRoots for a newer ACL config version). Concurrent creates
+    /// with the same id, ACL version, case-check setting, and import setting
+    /// on this server share one computation and one write.
     pub async fn create_changeset(
         &self,
         repo: RepoId,
@@ -161,30 +161,11 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
     ) -> Result<ChangesetId, OpError> {
         validate(&cs, opts)?;
         let id = cs.id();
-        // Requests under different ACL versions must each pass their own
-        // readiness gate, even when another request creates the same id.
         let key = (repo, id, opts.acl.version, opts.case_check, opts.imported);
-        let cell = self
-            .creating
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key)
-            .or_default()
-            .clone();
-        let result = cell
-            .get_or_try_init(|| self.create_inner(repo, id, &cs, opts))
-            .await
-            .map(|_| ());
-        {
-            let mut map = self
-                .creating
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if map.get(&key).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
-                map.remove(&key);
-            }
-        }
-        result.map(|()| id)
+        self.creating
+            .run(key, || self.create_inner(repo, id, &cs, opts))
+            .await?;
+        Ok(id)
     }
 
     async fn create_inner(
@@ -198,18 +179,17 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         let mut keys = vec![MetaKey::Changeset(id)];
         keys.extend(parts.parents.iter().map(|p| MetaKey::Changeset(*p)));
         let found = self.deriver.meta().get(repo, &keys).await?;
-        let restricted = RestrictedRoots::new(opts.acl.clone());
         if found[0].is_some() {
-            if self
-                .deriver
-                .lookup_many(repo, &[restricted.key(id)])
-                .await?[0]
-                .is_none()
-            {
-                return Err(OpError::new(
-                    Code::AclPending,
-                    "changeset awaits ACL backfill",
-                ));
+            // Created before, perhaps under another ACL config version: make
+            // sure every eager value these options name exists. The case
+            // check applies only to a changeset being created, never to one
+            // that exists or to its ancestors, which may be exempt imports.
+            let unchecked = CreateOptions {
+                case_check: false,
+                ..opts.clone()
+            };
+            for t in &eager_types::<M, B>(&unchecked) {
+                self.deriver.get_any(repo, &**t, id).await?;
             }
             return Ok(());
         }
@@ -224,64 +204,57 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
                 format!("parent changeset {p}"),
             ));
         }
-        let mut cx = self.deriver.cx(repo);
-        // Create never backfills ACL history. Seed the parent's stored value
-        // so RestrictedRoots cannot invoke the recursive on-demand deriver.
-        if let Some(parent) = parts.parents.first() {
-            let key = restricted.key(*parent);
-            let value = self
-                .deriver
-                .lookup_many(repo, &[key])
-                .await?
-                .pop()
-                .flatten()
-                .ok_or_else(|| OpError::new(Code::AclPending, "parent awaits ACL backfill"))?;
-            cx.set_input(key, value);
-            // A storage-format upgrade of the private index also needs an
-            // explicit backfill, never an unbounded history walk in create.
-            let key = CaseIndex.key(*parent);
-            let value = self
-                .deriver
-                .lookup_many(repo, &[key])
-                .await?
-                .pop()
-                .flatten()
-                .ok_or_else(|| {
-                    OpError::new(
-                        Code::DataLoss,
-                        "parent lacks the required case index; operator backfill is required",
-                    )
-                })?;
-            cx.set_input(key, value);
-        }
-        let applied = RootTree::apply(&mut cx, cs).await?;
-        cx.set_value(
-            RootTree.key(id),
-            Bytes::copy_from_slice(applied.root.as_bytes()),
-        );
-        let index = CaseIndex::apply(&mut cx, cs).await?;
-        cx.set_value(CaseIndex.key(id), Bytes::copy_from_slice(index.as_bytes()));
-        if opts.case_check && !opts.imported {
-            let found = CaseIndex::find_conflict(&mut cx.case_nodes, index, &applied.added).await?;
-            if let Some((path, other)) = found {
-                return Err(OpError::at(
-                    Code::CaseConflict,
-                    format!(
-                        "{} conflicts with {} in the same directory",
-                        String::from_utf8_lossy(&path),
-                        String::from_utf8_lossy(&other)
-                    ),
-                    &path,
-                ));
+        // Bring every type's parent values up to date first, each within its
+        // own per-request bound, so one request makes progress on all of them
+        // and a retry continues every type from where it stopped. Ancestors
+        // are never case-checked: only the changeset being created is.
+        let unchecked = CreateOptions {
+            case_check: false,
+            ..opts.clone()
+        };
+        let mut pending = None;
+        for t in &eager_types::<M, B>(&unchecked) {
+            if !t.reads_parents() {
+                continue;
+            }
+            for p in &parts.parents {
+                match self.deriver.get_any(repo, &**t, *p).await {
+                    Ok(_) => {}
+                    Err(e @ derived::DeriveError::Pending(_)) => pending = Some(e),
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
-        let graph = CommitGraph.derive(&mut cx, id, cs).await?;
-        cx.set_value(CommitGraph.key(id), graph);
-        let roots = restricted.derive(&mut cx, id, cs).await?;
-        cx.set_value(restricted.key(id), roots);
+        if let Some(e) = pending {
+            return Err(e.into());
+        }
+        let mut cx = self.deriver.cx(repo);
+        for t in &eager_types::<M, B>(opts) {
+            let value = t.derive_any(&mut cx, id, cs).await?;
+            cx.set_value(t.key(id), value);
+        }
         self.deriver
             .write(cx, vec![(MetaKey::Changeset(id), Bytes::from(cs.encode()))])
             .await?;
         Ok(())
     }
+}
+
+/// Every eager derived type, in the order create derives them; later types
+/// read earlier types' values for the same changeset. This is the one list
+/// of eager types: create derives exactly these, in one transaction with the
+/// changeset.
+pub fn eager_types<M: MetaStore, B: BlobStore>(
+    opts: &CreateOptions,
+) -> Vec<Box<dyn AnyType<M, B>>> {
+    let types: Vec<Box<dyn AnyType<M, B>>> = vec![
+        Box::new(RootTree),
+        Box::new(CaseIndex {
+            check: opts.case_check && !opts.imported,
+        }),
+        Box::new(CommitGraph),
+        Box::new(RestrictedRoots::new(opts.acl.clone())),
+    ];
+    debug_assert!(types.iter().all(|t| t.mode() == Mode::Eager));
+    types
 }

@@ -1,12 +1,27 @@
-# Fast tier on every push. Each step of `cargo xtask ci` runs as its own job.
+# CI runs on pull requests to main and on pushes to main, never on a
+# schedule. The fast tier (`cargo xtask ci`) runs as two jobs: `lint`, the
+# steps that need no build or dev environment and finish in minutes, and
+# `test`, the build and the tests. The full tier's own steps start once
+# `lint` passes, alongside `test`, and only on pull requests that are ready
+# for review, so a draft gets fast feedback for a fraction of the cost. A
+# push to main runs the fast tier, the MSRV check, and the portable step on
+# the merged tree, and refreshes the build caches every pull request starts
+# from; fuzzing has nothing to do there, and the slow tests ran on the pull
+# request's merge commit.
 name: ci
 
 on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
+    branches: [main]
 
+# A new push to a pull request supersedes the run for the previous one. Runs
+# on main are never cancelled: each verifies a merged commit.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -15,51 +30,148 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: ${{ matrix.step }}
+  lint:
+    name: lint
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - step: fmt
-          - step: build
-          - step: clippy
-          - step: test
-            tools: cargo-nextest@0.9.151
-            dev-env: true
-          - step: doctest
-          - step: doc
-          - step: deny
-            tools: cargo-deny@0.20.2
-          - step: semver
-            tools: cargo-semver-checks@0.51.0
-            history: true
-          - step: buf
-            buf: true
-            history: true
-          - step: proto-check
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: ${{ matrix.history && '0' || '1' }}
+          # semver-checks and buf breaking compare against release tags.
+          fetch-depth: 0
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: ${{ matrix.step }}
-      - if: matrix.tools
-        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+          shared-key: linux-lint
+          # Only main writes the caches, so pull requests never evict them.
+          save-if: ${{ github.event_name == 'push' }}
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
-          tool: ${{ matrix.tools }}
+          tool: cargo-deny@0.20.2,cargo-semver-checks@0.51.0
           fallback: none
-      - if: matrix.buf
-        uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1.7.0
+      - uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1.7.0
         with:
           version: 1.75.0
           setup_only: true
-      - if: matrix.dev-env
-        run: cargo xtask dev-up
-      - run: cargo xtask ci --only ${{ matrix.step }}
+      - run: cargo xtask ci --part lint
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux-test
+          save-if: ${{ github.event_name == 'push' }}
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-nextest@0.9.151
+          fallback: none
+      - run: cargo xtask dev-up
+      - run: cargo xtask ci --part test
+
+  slow:
+    name: slow
+    needs: lint
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # The test job's build: the slow tests are in the same binaries.
+          shared-key: linux-test
+          save-if: false
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-nextest@0.9.151,cargo-semver-checks@0.51.0
+          fallback: none
+      - run: cargo xtask dev-up
+      - run: cargo xtask ci-full --only test-slow
+
+  fuzz:
+    name: fuzz (${{ matrix.shard }})
+    needs: lint
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1/2, 2/2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The fuzz step compares against main.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Main never fuzzes, so this cache is per pull request.
+          key: fuzz
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-binstall@1.26.2
+          fallback: none
+      # install-action has no cargo-fuzz manifest; take cargo-fuzz's own
+      # release binary, never a mirror or a source build.
+      - run: cargo binstall --no-confirm --disable-strategies quick-install,compile cargo-fuzz@0.13.2
+      - run: cargo xtask ci-full --only fuzz --fuzz-shard ${{ matrix.shard }}
+
+  msrv:
+    name: msrv
+    needs: lint
+    if: github.event_name == 'push' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: msrv
+          save-if: ${{ github.event_name == 'push' }}
+      - run: cargo xtask ci-full --only msrv
+
+  portable:
+    name: portable (${{ matrix.os }})
+    needs: lint
+    if: github.event_name == 'push' || !github.event.pull_request.draft
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-nextest@0.9.151
+          fallback: none
+      - run: cargo xtask ci-full --only portable

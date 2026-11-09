@@ -1,10 +1,34 @@
-//! Primitive canonical encodings: minimal LEB128 `uvarint`, zigzag `svarint`,
-//! length-prefixed `bytes`, and `opt<T>` tags.
+//! The canonical primitives of the encoding (see [Primitives](crate#primitives)),
+//! for formats built from them: minimal LEB128 `uvarint`, zigzag `svarint`,
+//! length-prefixed `bytes`, `opt<T>` tags, and 32-byte ids.
+//!
+//! The writers produce only the canonical form, and [`Reader`] rejects every
+//! other form with a [`FormatError`].
+//!
+//! ```
+//! use scion_core::wire::{Reader, put_bytes, put_svarint, put_uvarint};
+//!
+//! let mut out = Vec::new();
+//! put_uvarint(&mut out, 300);
+//! put_svarint(&mut out, -2);
+//! put_bytes(&mut out, b"name");
+//! assert_eq!(out, [0xac, 0x02, 0x03, 0x04, b'n', b'a', b'm', b'e']);
+//!
+//! let mut r = Reader::new(&out);
+//! assert_eq!(r.uvarint()?, 300);
+//! assert_eq!(r.svarint()?, -2);
+//! assert_eq!(r.bytes()?, b"name");
+//! r.finish()?;
+//!
+//! // A non-minimal varint is rejected.
+//! assert!(Reader::new(&[0x80, 0x00]).uvarint().is_err());
+//! # Ok::<(), scion_core::FormatError>(())
+//! ```
 
 use crate::{FormatError, MAX_FIELD_BYTES};
 
 /// Appends the minimal unsigned LEB128 encoding of `v`.
-pub(crate) fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
+pub fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         out.push((v as u8) | 0x80);
         v >>= 7;
@@ -13,12 +37,12 @@ pub(crate) fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
 }
 
 /// Appends the zigzag-then-`uvarint` encoding of `v`.
-pub(crate) fn put_svarint(out: &mut Vec<u8>, v: i64) {
+pub fn put_svarint(out: &mut Vec<u8>, v: i64) {
     put_uvarint(out, ((v << 1) ^ (v >> 63)) as u64);
 }
 
 /// Appends `bytes`: a `uvarint` length, then the raw bytes.
-pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+pub fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_uvarint(out, b.len() as u64);
     out.extend_from_slice(b);
 }
@@ -29,23 +53,28 @@ pub(crate) fn uvarint_len(v: u64) -> usize {
     bits.div_ceil(7)
 }
 
-/// A cursor over untrusted input that decodes canonical primitives.
+/// A cursor over untrusted input that decodes canonical primitives. Every
+/// method fails, consuming nothing it can use, on input that is truncated or
+/// not canonical.
 #[derive(Debug)]
-pub(crate) struct Reader<'a> {
+pub struct Reader<'a> {
     buf: &'a [u8],
 }
 
 impl<'a> Reader<'a> {
-    pub(crate) fn new(buf: &'a [u8]) -> Self {
+    /// A reader at the start of `buf`.
+    pub fn new(buf: &'a [u8]) -> Self {
         Self { buf }
     }
 
-    pub(crate) fn remaining(&self) -> usize {
+    /// How many bytes are left.
+    pub fn remaining(&self) -> usize {
         self.buf.len()
     }
 
-    /// Fails unless every byte was consumed.
-    pub(crate) fn finish(self) -> Result<(), FormatError> {
+    /// Fails with [`FormatError::TrailingBytes`] unless every byte was
+    /// consumed.
+    pub fn finish(self) -> Result<(), FormatError> {
         if self.buf.is_empty() {
             Ok(())
         } else {
@@ -53,7 +82,8 @@ impl<'a> Reader<'a> {
         }
     }
 
-    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], FormatError> {
+    /// The next `n` raw bytes.
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8], FormatError> {
         if n > self.buf.len() {
             return Err(FormatError::Truncated);
         }
@@ -62,17 +92,20 @@ impl<'a> Reader<'a> {
         Ok(head)
     }
 
-    pub(crate) fn u8(&mut self) -> Result<u8, FormatError> {
+    /// The next byte.
+    pub fn u8(&mut self) -> Result<u8, FormatError> {
         Ok(self.take(1)?[0])
     }
 
-    pub(crate) fn array32(&mut self) -> Result<[u8; 32], FormatError> {
+    /// The next 32 bytes, such as an id.
+    pub fn array32(&mut self) -> Result<[u8; 32], FormatError> {
         let mut a = [0u8; 32];
         a.copy_from_slice(self.take(32)?);
         Ok(a)
     }
 
-    pub(crate) fn uvarint(&mut self) -> Result<u64, FormatError> {
+    /// A minimal `uvarint`.
+    pub fn uvarint(&mut self) -> Result<u64, FormatError> {
         let mut v: u64 = 0;
         for i in 0..10 {
             let b = self.u8()?;
@@ -90,14 +123,15 @@ impl<'a> Reader<'a> {
         Err(FormatError::VarintOverflow)
     }
 
-    pub(crate) fn svarint(&mut self) -> Result<i64, FormatError> {
+    /// A zigzag `svarint`.
+    pub fn svarint(&mut self) -> Result<i64, FormatError> {
         let u = self.uvarint()?;
         Ok(((u >> 1) as i64) ^ -((u & 1) as i64))
     }
 
-    /// Reads a `bytes` field, rejecting a length over `MAX_FIELD_BYTES`
-    /// before looking at (or allocating for) its contents.
-    pub(crate) fn bytes(&mut self) -> Result<&'a [u8], FormatError> {
+    /// A `bytes` field, rejecting a length over [`MAX_FIELD_BYTES`] before
+    /// looking at (or allocating for) its contents.
+    pub fn bytes(&mut self) -> Result<&'a [u8], FormatError> {
         let len = self.uvarint()?;
         if len > MAX_FIELD_BYTES as u64 {
             return Err(FormatError::FieldTooLong { len });
@@ -105,8 +139,8 @@ impl<'a> Reader<'a> {
         self.take(len as usize)
     }
 
-    /// Reads an `opt<T>` tag: `false` for `0x00`, `true` for `0x01`.
-    pub(crate) fn opt_tag(&mut self) -> Result<bool, FormatError> {
+    /// An `opt<T>` tag: `false` for `0x00`, `true` for `0x01`.
+    pub fn opt_tag(&mut self) -> Result<bool, FormatError> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
@@ -114,12 +148,18 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Reads a count of items that each occupy at least `min_item_bytes`,
-    /// rejecting counts the remaining input cannot hold, so callers may
-    /// allocate for the count.
-    pub(crate) fn count(&mut self, min_item_bytes: usize) -> Result<usize, FormatError> {
+    /// A `uvarint` count of items that each occupy at least `min_item_bytes`
+    /// (taken as 1 when 0), rejecting counts the remaining input cannot hold, so a
+    /// caller may allocate for the count.
+    pub fn count(&mut self, min_item_bytes: usize) -> Result<usize, FormatError> {
         let n = self.uvarint()?;
-        if n > (self.remaining() / min_item_bytes) as u64 {
+        self.fits(n, min_item_bytes)
+    }
+
+    /// Checks that `n` items of at least `min_item_bytes` each fit in the
+    /// remaining input, so a count read from it can size an allocation.
+    pub(crate) fn fits(&self, n: u64, min_item_bytes: usize) -> Result<usize, FormatError> {
+        if n > (self.remaining() / min_item_bytes.max(1)) as u64 {
             return Err(FormatError::Truncated);
         }
         Ok(n as usize)
@@ -201,6 +241,9 @@ mod tests {
         assert_eq!(Reader::new(&input(4)).count(2), Err(FormatError::Truncated));
         assert_eq!(Reader::new(&input(7)).count(1), Err(FormatError::Truncated));
         assert_eq!(Reader::new(&input(6)).count(1), Ok(6));
+        // A zero item size counts as one byte, so it never divides by zero.
+        assert_eq!(Reader::new(&input(6)).count(0), Ok(6));
+        assert_eq!(Reader::new(&input(7)).count(0), Err(FormatError::Truncated));
     }
 
     #[test]

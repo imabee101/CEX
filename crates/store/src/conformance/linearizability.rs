@@ -292,22 +292,38 @@ pub fn max_overlap(history: &[Event]) -> usize {
 pub type Exec = Arc<dyn Fn(Op) -> Pin<Box<dyn Future<Output = Ret> + Send>> + Send + Sync>;
 
 /// Runs each script on its own task, all concurrently, and records every
-/// operation. Every client's first operation is invoked before any first
-/// operation executes, so all clients are in flight together at the start.
+/// operation. An operation's call is stamped immediately before its request
+/// is issued (its future first polled) and its return immediately after its
+/// response, so each interval holds the store call and nothing else. Each
+/// client issues its first request, then waits until every client has issued
+/// its own before it takes the response: every first request is issued
+/// while all the others are outstanding, so all clients are in flight
+/// together at the start, with each request already in the store wherever
+/// the store has not answered it on the spot.
 pub async fn record(scripts: Vec<Vec<Op>>, exec: Exec) -> Vec<Event> {
     let clock = Arc::new(AtomicU64::new(0));
-    let start = Arc::new(tokio::sync::Barrier::new(scripts.len()));
+    let issued = Arc::new(tokio::sync::Barrier::new(scripts.len()));
     let mut tasks = Vec::new();
     for (client, script) in scripts.into_iter().enumerate() {
-        let (clock, start, exec) = (clock.clone(), start.clone(), exec.clone());
+        let (clock, issued, exec) = (clock.clone(), issued.clone(), exec.clone());
         tasks.push(tokio::spawn(async move {
             let mut events = Vec::with_capacity(script.len());
             for (k, op) in script.into_iter().enumerate() {
                 let call = clock.fetch_add(1, Ordering::SeqCst);
-                if k == 0 {
-                    start.wait().await;
-                }
-                let ret = exec(op).await;
+                let mut request = exec(op);
+                let ret = if k == 0 {
+                    let first = std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(request.as_mut().poll(cx))
+                    })
+                    .await;
+                    issued.wait().await;
+                    match first {
+                        std::task::Poll::Ready(ret) => ret,
+                        std::task::Poll::Pending => request.await,
+                    }
+                } else {
+                    request.await
+                };
                 let ret_time = clock.fetch_add(1, Ordering::SeqCst);
                 events.push(Event {
                     client,

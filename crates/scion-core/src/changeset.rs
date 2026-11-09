@@ -3,10 +3,13 @@
 use std::collections::BTreeMap;
 
 use crate::wire::{Reader, put_bytes, put_svarint, put_uvarint};
-use crate::{BlobId, ChangesetId, FORMAT_VERSION, FormatError, MAX_FIELD_BYTES, RepoPath};
+use crate::{
+    BlobId, CHANGESET_FORMAT_VERSION, ChangesetId, FormatError, MAX_FIELD_BYTES, RepoPath,
+};
 
-/// The bound on a timestamp's UTC offset: `|offset| < MAX_UTC_OFFSET_SECONDS`.
-pub const MAX_UTC_OFFSET_SECONDS: i32 = 86_400;
+/// The exclusive bound on a timestamp's UTC offset: every offset obeys
+/// `|offset| < UTC_OFFSET_LIMIT_SECONDS`.
+pub const UTC_OFFSET_LIMIT_SECONDS: i32 = 86_400;
 
 /// A point in time with the author's or committer's timezone: Unix seconds
 /// and a UTC offset in seconds east, with `|offset| < 86,400`.
@@ -22,7 +25,7 @@ impl Timestamp {
     /// A timestamp at `seconds` since the Unix epoch with UTC offset
     /// `offset_seconds` east.
     pub fn new(seconds: i64, offset_seconds: i32) -> Result<Self, FormatError> {
-        if offset_seconds.unsigned_abs() >= MAX_UTC_OFFSET_SECONDS as u32 {
+        if offset_seconds.unsigned_abs() >= UTC_OFFSET_LIMIT_SECONDS as u32 {
             return Err(FormatError::OffsetOutOfRange(offset_seconds.into()));
         }
         Ok(Self {
@@ -49,7 +52,7 @@ impl Timestamp {
     fn decode(r: &mut Reader<'_>) -> Result<Self, FormatError> {
         let seconds = r.svarint()?;
         let offset = r.svarint()?;
-        if offset.unsigned_abs() >= MAX_UTC_OFFSET_SECONDS as u64 {
+        if offset.unsigned_abs() >= UTC_OFFSET_LIMIT_SECONDS as u64 {
             return Err(FormatError::OffsetOutOfRange(offset));
         }
         Self::new(seconds, offset as i32)
@@ -120,9 +123,14 @@ pub struct ChangesetParts {
 /// file changes relative to its first parent, and has no tree pointer.
 ///
 /// A `Changeset` always has a canonical encoding: every field fits within
-/// `MAX_FIELD_BYTES`. Rules that depend on the repository (no-op entries,
-/// path conflicts) or on how the changeset was made (size limits for
-/// non-imported changesets) are checked when it is created on the server.
+/// `MAX_FIELD_BYTES`.
+///
+/// The format accepts any strictly sorted set of valid paths. The rules on
+/// what a set of file changes means are checked when the changeset is
+/// created on the server, not here: no-op entries (INV-11), nested changed
+/// paths (INV-12, which forbids nesting except a deleted file whose path
+/// becomes a directory, whatever the repository), conflicts with the first
+/// parent's tree, and size limits for non-imported changesets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Changeset {
     parts: ChangesetParts,
@@ -174,7 +182,7 @@ impl Changeset {
     pub fn encode(&self) -> Vec<u8> {
         let p = &self.parts;
         let mut out = Vec::new();
-        out.push(FORMAT_VERSION);
+        out.push(CHANGESET_FORMAT_VERSION);
         put_uvarint(&mut out, p.parents.len() as u64);
         for parent in &p.parents {
             out.extend_from_slice(parent.as_bytes());
@@ -223,7 +231,7 @@ impl Changeset {
     pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
         let mut r = Reader::new(bytes);
         let version = r.u8()?;
-        if version != FORMAT_VERSION {
+        if version != CHANGESET_FORMAT_VERSION {
             return Err(FormatError::UnsupportedVersion(version));
         }
         let n = r.count(32)?;
@@ -331,7 +339,7 @@ mod tests {
     #[test]
     fn decode_rejects_huge_offset_without_truncating() {
         // An offset that does not fit in i32 must be rejected, not wrapped.
-        let mut b = vec![FORMAT_VERSION, 0, 0, 0];
+        let mut b = vec![CHANGESET_FORMAT_VERSION, 0, 0, 0];
         put_svarint(&mut b, i64::from(i32::MAX) + 86_400 * 2);
         assert!(matches!(
             Changeset::decode(&b),

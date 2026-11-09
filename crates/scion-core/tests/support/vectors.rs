@@ -13,6 +13,7 @@ pub(crate) enum Ty {
     Tree,
     Changeset,
     Frame,
+    ChunkList,
 }
 
 impl Ty {
@@ -23,13 +24,21 @@ impl Ty {
             Ty::Tree => "tree",
             Ty::Changeset => "changeset",
             Ty::Frame => "frame",
+            Ty::ChunkList => "chunk_list",
         }
     }
 
     pub(crate) fn parse(s: &str) -> Option<Self> {
-        [Ty::Blob, Ty::Chunk, Ty::Tree, Ty::Changeset, Ty::Frame]
-            .into_iter()
-            .find(|t| t.name() == s)
+        [
+            Ty::Blob,
+            Ty::Chunk,
+            Ty::Tree,
+            Ty::Changeset,
+            Ty::Frame,
+            Ty::ChunkList,
+        ]
+        .into_iter()
+        .find(|t| t.name() == s)
     }
 
     pub(crate) fn context(self) -> Option<&'static str> {
@@ -38,7 +47,7 @@ impl Ty {
             Ty::Chunk => Some("scion v1 chunk"),
             Ty::Tree => Some("scion v1 tree"),
             Ty::Changeset => Some("scion v1 changeset"),
-            Ty::Frame => None,
+            Ty::Frame | Ty::ChunkList => None,
         }
     }
 }
@@ -225,7 +234,7 @@ pub(crate) fn small() -> Vec<Vector> {
             &format!("00 80808002 21 01 {CHUNK0} dd8066deff4b870686394641e4f966ef278f24470789145fff3b04ac6a5a553d")),
         big("frame-chunk-list-short",
             &format!("00 81808002 21 01 {CHUNK0} 4c0e5a77c8add3c8a4d6cb1cf64cb1e5494f16ef6b4bbbf53ad983036969d623")),
-        big("frame-chunk-list-count-mismatch",
+        big("frame-chunk-list-count-below-chunks",
             &format!("00 81808002 41 01 {CHUNK0} {CHUNK1} ca25ddbc28fc59fdd8515c09e05b8f8551da1e5814e36b52707461db1ab1e6a8")),
         big("frame-chunk-list-zstd",
             &format!("01 81808002 41 02 {CHUNK0} {CHUNK1} 4ee14b58b90113e8c70cb8d571ca34a36f00eaad269e32591f08e74bcb99a7ff")),
@@ -241,7 +250,7 @@ fn built(name: &str, ty: Ty, bytes: Vec<u8>, ok: bool) -> Vector {
         name: name.into(),
         ty,
         accept: ok,
-        id: ok.then(|| derive(ty, &bytes)),
+        id: (ok && ty.context().is_some()).then(|| derive(ty, &bytes)),
         bytes,
     }
 }
@@ -345,6 +354,134 @@ pub(crate) fn large() -> Vec<Vector> {
             bytes: r::frame(2, &chunk_id, 0, 3000, &chunk),
         },
     ]
+    .into_iter()
+    .chain(more_changesets())
+    .chain(length_rules())
+    .chain(chunk_lists())
+    .collect()
+}
+
+fn minimal_changeset(changes: Vec<(&[u8], RefChange)>) -> Vec<u8> {
+    r::changeset(&RefChangeset {
+        author: b"x".to_vec(),
+        changes: changes.into_iter().map(|(p, c)| (p.to_vec(), c)).collect(),
+        ..RefChangeset::default()
+    })
+}
+
+/// Changesets beyond the hand-written ones: option tags past the committer,
+/// and paths whose components merely contain dots.
+fn more_changesets() -> Vec<Vector> {
+    let file = || RefChange::File(1, [0x22; 32], 1);
+    vec![
+        reject(
+            "cs-signature-tag-2",
+            Ty::Changeset,
+            "01 00 01 78 00 00 00 00 00 02 00 00",
+        ),
+        reject(
+            "cs-git-headers-tag-2",
+            Ty::Changeset,
+            "01 00 01 78 00 00 00 00 00 00 02 00",
+        ),
+        built(
+            "cs-dotted-path-names",
+            Ty::Changeset,
+            minimal_changeset(vec![(b".a/..b/...", file())]),
+            true,
+        ),
+    ]
+}
+
+/// Frame length rules not covered by the hand-written frames, each in an
+/// otherwise well-formed frame with a correct digest.
+fn length_rules() -> Vec<Vector> {
+    let chunk = CHUNK_BYTES_U64;
+    let id = [0x5a; 32];
+    let empty_blob = derive(Ty::Blob, b"");
+    let frame = |name: &str, kind, codec, raw_len, payload: &[u8]| Vector {
+        name: name.into(),
+        ty: Ty::Frame,
+        accept: false,
+        id: None,
+        bytes: r::frame(kind, &id, codec, raw_len, payload),
+    };
+    vec![
+        frame("frame-chunk-over-chunk-bytes", 2, 1, chunk + 1, b"zzz"),
+        frame("frame-tree-over-max-field", 3, 1, (64 << 20) + 1, b"zzz"),
+        Vector {
+            name: "frame-blob-zstd-empty".into(),
+            ty: Ty::Frame,
+            accept: false,
+            id: None,
+            bytes: r::frame(1, &empty_blob, 1, 0, b""),
+        },
+    ]
+}
+
+const CHUNK_BYTES_U64: u64 = 4 << 20;
+
+/// Chunk-list payloads on their own, and a frame whose list needs a two-byte
+/// count.
+fn chunk_lists() -> Vec<Vector> {
+    let chunk0 = id(CHUNK0);
+    let chunk1 = id(CHUNK1);
+    let list = |count: &[u8], ids: &[[u8; 32]]| {
+        let mut out = count.to_vec();
+        for i in ids {
+            out.extend_from_slice(i);
+        }
+        out
+    };
+    let item = |name: &str, accept, bytes| Vector {
+        name: name.into(),
+        ty: Ty::ChunkList,
+        accept,
+        id: None,
+        bytes,
+    };
+    // A blob of 128 chunks of zeros: every chunk is CHUNK0, the first chunk
+    // of the 4 MiB + 1 zero-byte blob above.
+    let zeros = vec![0; CHUNK_BYTES_U64 as usize];
+    assert_eq!(derive(Ty::Chunk, &zeros), chunk0);
+    let mut blob = blake3::Hasher::new_derive_key(Ty::Blob.context().unwrap());
+    for _ in 0..128 {
+        blob.update(&zeros);
+    }
+    let blob_id: [u8; 32] = blob.finalize().into();
+    let list_128 = list(&[0x80, 0x01], &[chunk0; 128]);
+    vec![
+        item("chunk-list-two", true, list(&[2], &[chunk0, chunk1])),
+        item("chunk-list-empty", true, list(&[0], &[])),
+        item("chunk-list-128", true, list_128.clone()),
+        item(
+            "chunk-list-nonminimal-count",
+            false,
+            list(&[0x82, 0x00], &[chunk0, chunk1]),
+        ),
+        item(
+            "chunk-list-trailing-id",
+            false,
+            list(&[1], &[chunk0, chunk1]),
+        ),
+        item(
+            "chunk-list-truncated",
+            false,
+            list(&[2], &[chunk0, chunk1])[..64].to_vec(),
+        ),
+        item(
+            "chunk-list-count-over-input",
+            false,
+            list(&[3], &[chunk0, chunk1]),
+        ),
+        Vector {
+            name: "frame-chunk-list-128".into(),
+            ty: Ty::Frame,
+            accept: true,
+            id: Some(blob_id),
+            bytes: r::frame(4, &blob_id, 0, 128 * CHUNK_BYTES_U64, &list_128),
+        },
+    ]
 }
 
 pub(crate) fn all() -> Vec<Vector> {
@@ -357,9 +494,10 @@ pub(crate) const FILE_HEADER: &str = "\
 # Scion v1 format test vectors.
 #
 # Records are separated by blank lines; lines starting with '#' are comments.
-# Each record has, in order: name, type (blob|chunk|tree|changeset|frame),
-# expect (accept|reject), id (accepted records only), and bytes (lowercase
-# hex, possibly empty). See scion-core's crate documentation for the formats
+# Each record has, in order: name, type
+# (blob|chunk|tree|changeset|frame|chunk_list), expect (accept|reject), id
+# (accepted records other than chunk_list only), and bytes (lowercase hex,
+# possibly empty). See scion-core's crate documentation for the formats
 # and for what accepting a record means.
 ";
 
@@ -418,7 +556,8 @@ fn parse_record(rec: &[(String, String)]) -> Result<Vector, String> {
         Some("reject") => false,
         e => return Err(format!("bad expect {e:?}")),
     };
-    let want: &[&str] = if accept {
+    let ty = Ty::parse(get("type").unwrap_or_default()).ok_or("bad type")?;
+    let want: &[&str] = if accept && ty != Ty::ChunkList {
         &["name", "type", "expect", "id", "bytes"]
     } else {
         &["name", "type", "expect", "bytes"]
@@ -438,7 +577,7 @@ fn parse_record(rec: &[(String, String)]) -> Result<Vector, String> {
     };
     Ok(Vector {
         name: get("name").unwrap().to_owned(),
-        ty: Ty::parse(get("type").unwrap()).ok_or("bad type")?,
+        ty,
         accept,
         id: match get("id") {
             Some(s) => Some(hex(s)?.try_into().map_err(|_| "id is not 32 bytes")?),

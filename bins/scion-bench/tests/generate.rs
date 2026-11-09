@@ -1,24 +1,29 @@
 //! The bench generator end to end on Postgres and the object store, at a
 //! small size: the tip holds exactly the layout's files with their seeded
 //! contents, built as a chain of `files_per_changeset` changesets; the
-//! cached repo is reused, not rebuilt; and `scion-bench gen` reports it.
+//! cached repo is reused, not rebuilt; `scion-bench gen` reports it; and
+//! the cache that every bench test shares names and evicts repos correctly.
 
 use std::sync::Arc;
 
 use derived::{CacheSizes, DerivedType, Deriver, RootTree};
-use scion_bench::{BENCH, BenchParams, REPO, cached_repo, content, generate, layout};
+mod common;
+
+use common::{SMALL, SMALL_GEN, cached_repo};
+use scion_bench::{BENCH_TIP, BenchParams, REPO, content, generate, layout};
 use scion_core::{BlobId, EntryTarget, FileKind, RepoPath};
-use store::testing::{TestDatabase, base_config, object_store};
-use store::{MetaStore, ObjectBlobStore, PgMetaStore};
+use store::testing::{TestDatabase, TestPrefix, base_config};
+use store::{BlobStore, MetaStore, ObjectBlobStore, PgMetaStore};
 
-const SMALL: BenchParams = BenchParams {
-    files: 250,
-    files_per_changeset: 100,
-    ..BENCH
-};
+/// The tip of `SMALL` for `GENERATOR_VERSION` 2.
+const SMALL_TIP: &str = "eaf9830712e2343c5264065184f19e3c5c6f84383a21b80bf0fd5287ce8f612f";
 
-/// The tip of `SMALL` for `GENERATOR_VERSION` 1.
-const SMALL_TIP: &str = "ff8fee915b6292bee4cb9bbf19b1abe0562e46e1e5d1f49fda44e9e5dd4aa917";
+fn now_micros() -> i64 {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    i64::try_from(since_epoch.as_micros()).unwrap()
+}
 
 async fn template_oid(template: &str) -> u32 {
     let mut config = base_config();
@@ -49,11 +54,20 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
     );
 
     let db = TestDatabase::create_from(&repo.template).await;
-    let meta = Arc::new(PgMetaStore::new(db.config().clone(), 4).unwrap());
+    let meta = Arc::new(
+        PgMetaStore::new(
+            db.config().clone(),
+            store::PgTls::LoopbackPlaintext,
+            store::PoolLimits::new(4),
+        )
+        .unwrap(),
+    );
     let value = meta
         .get(
             REPO,
-            &[store::MetaKey::Derived(ops::case::CaseIndex.key(repo.tip))],
+            &[store::MetaKey::Derived(
+                ops::case::CaseIndex::default().key(repo.tip),
+            )],
         )
         .await
         .unwrap()
@@ -68,12 +82,10 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
         )
         .await
         .unwrap();
-    assert!(
-        rows[0].is_some(),
-        "cache was not upgraded to private index storage"
-    );
-    // Older caches may retain their v1 public nodes, but current consumers
-    // must have the new private namespace available before creating.
+    // The tip's case index is stored in its private namespace, never as a
+    // tree, which any reader could fetch.
+    assert!(rows[0].is_some(), "the case index's root node is stored");
+    assert!(rows[1].is_none(), "the case index is not stored as a tree");
     assert_eq!(
         meta.get_ref(REPO, "main").await.unwrap().unwrap().target,
         repo.tip
@@ -82,9 +94,17 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
     // Generating afresh, into empty stores, gives the same tip: the
     // generator is deterministic, and its output is pinned.
     let fresh_db = TestDatabase::create().await;
-    let fresh_meta = Arc::new(PgMetaStore::new(fresh_db.config().clone(), 8).unwrap());
+    let fresh_meta = Arc::new(
+        PgMetaStore::new(
+            fresh_db.config().clone(),
+            store::PgTls::LoopbackPlaintext,
+            store::PoolLimits::new(8),
+        )
+        .unwrap(),
+    );
     fresh_meta.migrate().await.unwrap();
-    let fresh_blobs = Arc::new(ObjectBlobStore::new(Arc::new(object_store())));
+    let fresh_prefix = TestPrefix::create();
+    let fresh_blobs = Arc::new(ObjectBlobStore::new(Arc::new(fresh_prefix.store())));
     let tip = generate(&SMALL, fresh_meta.clone(), fresh_blobs.clone()).await;
     assert_eq!(tip, repo.tip);
     assert_eq!(tip.to_string(), SMALL_TIP);
@@ -128,25 +148,85 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
     }
     assert_eq!(total, 250);
 
-    // The binary reports the same repo, and refuses unknown commands.
+    // The binary builds the same repo into the stores it is given, points
+    // `main` at the tip, and prints it.
+    let target = TestDatabase::create().await;
+    let (endpoint, bucket, env) = store::testing::s3_env();
+    let prefix = TestPrefix::create();
+    let gen_250 = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_scion-bench"))
+            .args(["gen", "--files", "250", "--pg-url", &target.url()])
+            .args([
+                "--s3-endpoint",
+                &endpoint,
+                "--s3-bucket",
+                &bucket,
+                "--s3-prefix",
+                prefix.name(),
+            ])
+            .envs(env.clone())
+            .output()
+            .unwrap()
+    };
+    let started = now_micros();
+    let out = gen_250();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let full = cached_repo(&SMALL_GEN).await;
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        full.tip.to_string()
+    );
+    let built = PgMetaStore::new(
+        target.config().clone(),
+        store::PgTls::LoopbackPlaintext,
+        store::PoolLimits::new(1),
+    )
+    .unwrap();
+    assert_eq!(
+        built.get_ref(REPO, "main").await.unwrap().unwrap().target,
+        full.tip
+    );
+    // Its ref-log row records when `main` was created.
+    let log = built.ref_log(REPO, "main", 0, 10).await.unwrap();
+    assert_eq!(log.len(), 1);
+    assert!(
+        (started..=now_micros()).contains(&log[0].time_micros),
+        "ref-log time {} is not the time of the run",
+        log[0].time_micros
+    );
+    // Run again, it finds `main` and fails, leaving the ref log as it was.
+    let again = gen_250();
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already has a `main`"));
+    assert_eq!(built.ref_log(REPO, "main", 0, 10).await.unwrap(), log);
+    let given = Arc::new(ObjectBlobStore::new(Arc::new(prefix.store())));
+    let built = Deriver::new(Arc::new(built), given.clone(), CacheSizes::default());
+    let root = RootTree::decode(&built.get(REPO, &RootTree, full.tip).await.unwrap()).unwrap();
+    assert!(
+        given
+            .contains(REPO, store::ObjectKey::tree(root))
+            .await
+            .unwrap(),
+        "the root tree's frame is in the given bucket and prefix"
+    );
+    // A plaintext connection to a remote database is refused.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_scion-bench"))
-        .args(["gen", "250"])
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let full = cached_repo(&BenchParams {
-        files: 250,
-        ..BENCH
-    })
-    .await;
-    let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.contains(&full.template), "{text}");
-    assert!(text.contains(&full.tip.to_string()), "{text}");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_scion-bench"))
-        .arg("bogus")
+        .args([
+            "gen",
+            "--files",
+            "1",
+            "--pg-url",
+            "postgres://scion.example.com/x",
+        ])
+        .args(["--s3-endpoint", &endpoint, "--s3-bucket", &bucket])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("loopback"));
 }
 
 /// The generator uploads at most `UPLOADS_AHEAD` (6) changesets' blobs
@@ -161,15 +241,23 @@ async fn uploads_run_a_bounded_distance_ahead_of_creates() {
     let p = BenchParams {
         files: 600,
         files_per_changeset: 4,
-        ..BENCH
+        ..BENCH_TIP
     };
     let db = TestDatabase::create().await;
-    let pg = Arc::new(PgMetaStore::new(db.config().clone(), 16).unwrap());
+    let pg = Arc::new(
+        PgMetaStore::new(
+            db.config().clone(),
+            store::PgTls::LoopbackPlaintext,
+            store::PoolLimits::new(16),
+        )
+        .unwrap(),
+    );
     pg.migrate().await.unwrap();
     let faults = Faults::new();
     let meta = Arc::new(FaultMetaStore::new(pg, faults.clone()));
+    let prefix = TestPrefix::create();
     let blobs = Arc::new(FaultBlobStore::new(
-        Arc::new(ObjectBlobStore::new(Arc::new(object_store()))),
+        Arc::new(ObjectBlobStore::new(Arc::new(prefix.store()))),
         faults.clone(),
     ));
     generate(&p, meta, blobs).await;
@@ -192,4 +280,103 @@ async fn uploads_run_a_bounded_distance_ahead_of_creates() {
         }
     }
     assert_eq!(creates, 150);
+}
+
+#[test]
+fn keys_tell_parameter_sets_apart() {
+    use common::{FIXTURES, key};
+    assert_eq!(key(&BENCH_TIP), key(&BENCH_TIP));
+    let keys: std::collections::HashSet<String> = [
+        BENCH_TIP,
+        BenchParams {
+            files: 10_000,
+            ..BENCH_TIP
+        },
+        BenchParams {
+            seed: 1,
+            ..BENCH_TIP
+        },
+        BenchParams {
+            max_depth: 11,
+            ..BENCH_TIP
+        },
+        BenchParams {
+            max_size: 1,
+            ..BENCH_TIP
+        },
+    ]
+    .into_iter()
+    .chain(FIXTURES)
+    .map(|p| key(&p))
+    .collect();
+    assert_eq!(keys.len(), 5 + FIXTURES.len());
+}
+
+#[test]
+fn keys_change_with_every_format_input() {
+    use common::{format_inputs, key_for};
+    use ops::CreateOptions;
+    let inputs = format_inputs();
+    let names: std::collections::HashSet<&str> = inputs.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(names.len(), inputs.len(), "input names are distinct");
+    let eager = ops::eager_types::<PgMetaStore, ObjectBlobStore>(&CreateOptions::default());
+    assert_eq!(
+        names
+            .iter()
+            .filter(|k| k.starts_with("derived type "))
+            .count(),
+        eager.len(),
+        "every eager type is an input"
+    );
+    let base = key_for(&BENCH_TIP, &inputs);
+    for i in 0..inputs.len() {
+        let mut changed = inputs.clone();
+        changed[i].1.push('+');
+        assert_ne!(key_for(&BENCH_TIP, &changed), base, "{}", inputs[i].0);
+    }
+}
+
+#[test]
+fn keeps_the_most_recently_used_complete_repos() {
+    use common::to_remove;
+    let uses = |v: &[(&str, Option<u64>)]| {
+        v.iter()
+            .map(|(k, u)| ((*k).to_owned(), *u))
+            .collect::<Vec<_>>()
+    };
+    let mut removed = to_remove(
+        uses(&[
+            ("a", Some(1)),
+            ("b", Some(5)),
+            ("c", None),
+            ("d", Some(3)),
+            ("e", Some(4)),
+        ]),
+        2,
+    );
+    removed.sort();
+    assert_eq!(removed, ["a", "c", "d"]);
+    assert_eq!(to_remove(uses(&[("a", Some(1))]), 3), Vec::<String>::new());
+    assert_eq!(to_remove(uses(&[("a", None)]), 3), ["a"]);
+}
+
+#[test]
+fn bench_names_give_their_key() {
+    use common::key_of;
+    let key = "0123456789abcdef";
+    for name in [
+        format!("bench_{key}"),
+        format!("bench_{key}_build"),
+        format!("bench-{key}"),
+    ] {
+        assert_eq!(key_of(&name), Some(key), "{name}");
+    }
+    for name in [
+        "bench_short",
+        "t_1_2_3_4",
+        "bench-0123456789abcdeg",
+        "bench_0123456789abcdef_x",
+    ] {
+        assert_eq!(key_of(name), None, "{name}");
+    }
 }

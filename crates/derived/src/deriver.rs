@@ -4,12 +4,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
-use scion_core::{Changeset, ChangesetId, Codec, Frame, FrameKind, Tree, TreeId};
-use store::{BlobStore, DerivedKey, MetaKey, MetaStore, ObjectKey, RepoId};
-use tokio::sync::OnceCell;
+use scion_core::{Changeset, ChangesetId, Codec, Frame, FrameId, Tree, TreeId};
+use store::{BlobStore, Coalescer, DerivedKey, MetaKey, MetaStore, ObjectKey, RepoId};
+
 use tokio::task::JoinSet;
 
 use crate::DeriveError;
@@ -18,6 +21,26 @@ use crate::trees::{TreeCache, TreeWork};
 /// The zstd level of every frame the server creates. Frames are created once
 /// per id (INV-44), so the level only has to be fixed, not reproducible.
 pub const FRAME_ZSTD_LEVEL: i32 = 3;
+
+/// The most changesets or values one store read asks for while finding
+/// underived ancestors.
+pub const DERIVE_BATCH: usize = 256;
+
+/// The most changesets one request derives a type for. A value needing more
+/// is pending: the request derives the oldest ones and fails retryably, and
+/// each retry continues from where the last stopped.
+pub const MAX_DERIVE_PER_REQUEST: usize = 4096;
+
+/// The most ancestors lacking a value that one request explores; a value
+/// needing more fails with [`DeriveError::LimitExceeded`].
+pub const MAX_DERIVE_EXPLORE: usize = 1 << 16;
+
+/// One key's in-flight entry as a batch holds it: the coalesced computation
+/// of its value.
+type Entry<'a> = Pin<Box<dyn Future<Output = Result<Bytes, DeriveError>> + Send + 'a>>;
+
+/// The most frame writes one derivation has in flight.
+pub const FRAME_WRITES: usize = 32;
 
 /// How a type is derived.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,6 +61,9 @@ pub trait DerivedType: Send + Sync {
     const VERSION: u16;
     /// Whether create derives it.
     const MODE: Mode;
+    /// Whether a value reads its parents' values of this type. A type that
+    /// does not is derived for one changeset alone, with no ancestors first.
+    const READS_PARENTS: bool = true;
 
     /// The extra key component, such as an ACL config version; 0 otherwise.
     fn param(&self) -> u64 {
@@ -85,8 +111,6 @@ impl Default for CacheSizes {
     }
 }
 
-type Inflight = Mutex<HashMap<(RepoId, DerivedKey), Arc<OnceCell<Bytes>>>>;
-
 /// Derives and serves derived values for one server. Every value is written
 /// insert-if-absent under its `(type, version, param, changeset)` key, and
 /// concurrent derivations of one key on this server share one computation
@@ -98,8 +122,7 @@ pub struct Deriver<M, B> {
     case_nodes: TreeCache,
     values: moka::sync::Cache<(RepoId, DerivedKey), Bytes>,
     changesets: moka::sync::Cache<(RepoId, ChangesetId), Arc<Changeset>>,
-    inflight: Inflight,
-    frame_concurrency: usize,
+    inflight: Coalescer<(RepoId, DerivedKey), Bytes>,
 }
 
 impl<M, B> std::fmt::Debug for Deriver<M, B> {
@@ -114,7 +137,6 @@ pub struct DeriveCx<'d, M, B> {
     deriver: &'d Deriver<M, B>,
     repo: RepoId,
     values: HashMap<DerivedKey, Bytes>,
-    inputs: HashMap<DerivedKey, Bytes>,
     /// Tree nodes loaded and built by this derivation.
     pub trees: TreeWork<'d, M>,
     /// Private case-index nodes, with a separate cache and metadata namespace.
@@ -147,9 +169,22 @@ impl<'d, M: MetaStore, B: BlobStore> DeriveCx<'d, M, B> {
         self.values.insert(key, value);
     }
 
-    /// Supplies an already stored input without writing it again.
-    pub fn set_input(&mut self, key: DerivedKey, value: Bytes) {
-        self.inputs.insert(key, value);
+    /// A value of type `t` for `cs` if it is computed here or stored, without
+    /// deriving it.
+    pub async fn stored_value<T: DerivedType>(
+        &mut self,
+        t: &T,
+        cs: ChangesetId,
+    ) -> Result<Option<Bytes>, DeriveError> {
+        if let Some(v) = self.values.get(&t.key(cs)) {
+            return Ok(Some(v.clone()));
+        }
+        Ok(self
+            .deriver
+            .lookup_many(self.repo, &[t.key(cs)])
+            .await?
+            .pop()
+            .flatten())
     }
 
     /// A value of type `t` for `cs`: computed here, stored, or derived now
@@ -159,11 +194,7 @@ impl<'d, M: MetaStore, B: BlobStore> DeriveCx<'d, M, B> {
         t: &T,
         cs: ChangesetId,
     ) -> Result<Bytes, DeriveError> {
-        if let Some(v) = self
-            .values
-            .get(&t.key(cs))
-            .or_else(|| self.inputs.get(&t.key(cs)))
-        {
+        if let Some(v) = self.values.get(&t.key(cs)) {
             return Ok(v.clone());
         }
         let deriver = self.deriver;
@@ -200,8 +231,7 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
                     u32::try_from(n + 256).unwrap_or(u32::MAX)
                 })
                 .build(),
-            inflight: Mutex::new(HashMap::new()),
-            frame_concurrency: 32,
+            inflight: Coalescer::default(),
         }
     }
 
@@ -215,6 +245,12 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
         &self.blobs
     }
 
+    /// How many values this server is deriving now.
+    #[cfg(feature = "testing")]
+    pub fn in_flight(&self) -> usize {
+        self.inflight.in_flight()
+    }
+
     /// The tree cache.
     pub fn tree_cache(&self) -> &TreeCache {
         &self.trees
@@ -226,7 +262,6 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
             deriver: self,
             repo,
             values: HashMap::new(),
-            inputs: HashMap::new(),
             trees: TreeWork::new(&*self.meta, &self.trees, repo),
             case_nodes: TreeWork::private(&*self.meta, &self.case_nodes, repo),
         }
@@ -238,26 +273,10 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
         repo: RepoId,
         id: ChangesetId,
     ) -> Result<Arc<Changeset>, DeriveError> {
-        if let Some(c) = self.changesets.get(&(repo, id)) {
-            return Ok(c);
-        }
-        let bytes = self
-            .meta
-            .get(repo, &[MetaKey::Changeset(id)])
+        self.changesets(repo, &[id])
             .await?
             .pop()
-            .flatten()
-            .ok_or_else(|| DeriveError::NotFound(format!("changeset {id}")))?;
-        if ChangesetId::hash(&bytes) != id {
-            return Err(DeriveError::DataLoss(format!(
-                "stored changeset {id} does not hash to its id"
-            )));
-        }
-        let cs = Arc::new(Changeset::decode(&bytes).map_err(|e| {
-            DeriveError::DataLoss(format!("stored changeset {id} is malformed: {e}"))
-        })?);
-        self.changesets.insert((repo, id), cs.clone());
-        Ok(cs)
+            .ok_or_else(|| DeriveError::Internal("a changeset read was lost".into()))
     }
 
     /// Stored values, from the cache or one store read.
@@ -282,98 +301,352 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
     }
 
     /// The value of type `t` for the stored changeset `cs`, deriving it, and
-    /// first every underived ancestor, if needed. Ancestors are found by
-    /// walking parents from `cs`, reading each changeset's parents' values in
-    /// one batch, and derived parents first; the walk stops at derived
-    /// values.
+    /// first every ancestor that lacks it when the type reads its parents'
+    /// values, if needed.
+    ///
+    /// The ancestors lacking a value are found level by level from `cs`,
+    /// with one batched read of changesets and one of values per level, and
+    /// the search stops at ancestors that have one. They are then derived
+    /// parents first, [`DERIVE_BATCH`] at a time, the values a batch computes
+    /// written together. One call derives at most [`MAX_DERIVE_PER_REQUEST`]
+    /// changesets; a value needing more is [`DeriveError::Pending`] until the
+    /// background deriver (or a backfill) has derived the history.
     pub async fn get<T: DerivedType>(
         &self,
         repo: RepoId,
         t: &T,
         cs: ChangesetId,
     ) -> Result<Bytes, DeriveError> {
+        self.get_any(repo, t, cs).await
+    }
+
+    /// [`Deriver::get`] for a type behind [`AnyType`].
+    pub async fn get_any(
+        &self,
+        repo: RepoId,
+        t: &dyn AnyType<M, B>,
+        cs: ChangesetId,
+    ) -> Result<Bytes, DeriveError> {
         if let Some(v) = self.lookup_many(repo, &[t.key(cs)]).await?.pop().flatten() {
             return Ok(v);
         }
-        let mut stack = vec![cs];
-        while let Some(&top) = stack.last() {
-            if self.values.contains_key(&(repo, t.key(top))) {
-                stack.pop();
-                continue;
+        if t.reads_parents() {
+            let order = self.underived(repo, t, cs).await?;
+            // Oldest first, so a request that stops at the bound has made
+            // progress a retry continues from.
+            for chunk in order
+                .chunks(DERIVE_BATCH)
+                .take(MAX_DERIVE_PER_REQUEST / DERIVE_BATCH)
+            {
+                self.derive_batch(repo, t, chunk).await?;
             }
-            let changeset = self.changeset(repo, top).await?;
-            let parents = &changeset.parts().parents;
-            let keys: Vec<DerivedKey> = parents.iter().map(|p| t.key(*p)).collect();
-            let present = self.lookup_many(repo, &keys).await?;
-            let missing: Vec<ChangesetId> = parents
-                .iter()
-                .zip(&present)
-                .filter(|(_, v)| v.is_none())
-                .map(|(p, _)| *p)
-                .collect();
-            if missing.is_empty() {
-                self.derive_one(repo, t, top, &changeset).await?;
-                stack.pop();
-            } else {
-                stack.extend(missing);
+            if order.len() > MAX_DERIVE_PER_REQUEST {
+                let key = t.key(cs);
+                return Err(DeriveError::Pending(format!(
+                    "derived type {} version {} for the oldest {MAX_DERIVE_PER_REQUEST} of {} \
+                     ancestors of {cs}; retry to continue",
+                    key.kind,
+                    key.version,
+                    order.len()
+                )));
             }
+        } else {
+            let changeset = self.changeset(repo, cs).await?;
+            self.derive_one(repo, t, cs, &changeset).await?;
         }
         self.lookup_many(repo, &[t.key(cs)])
             .await?
             .pop()
             .flatten()
-            .ok_or_else(|| DeriveError::DataLoss("derived value vanished from the cache".into()))
+            .ok_or_else(|| DeriveError::Internal("a derived value vanished from the cache".into()))
+    }
+
+    /// The changesets from `cs` back to the first ancestors that have a
+    /// value of type `t`, parents before children (oldest first), or
+    /// [`DeriveError::LimitExceeded`] if there are more than
+    /// [`MAX_DERIVE_EXPLORE`].
+    async fn underived(
+        &self,
+        repo: RepoId,
+        t: &dyn AnyType<M, B>,
+        cs: ChangesetId,
+    ) -> Result<Vec<ChangesetId>, DeriveError> {
+        // Each found changeset's parents; only ids are kept, so memory is
+        // bounded by the exploration limit, not by changeset sizes.
+        let mut found: HashMap<ChangesetId, Vec<ChangesetId>> = HashMap::new();
+        let mut level = vec![cs];
+        while !level.is_empty() {
+            if found.len() + level.len() > MAX_DERIVE_EXPLORE {
+                let key = t.key(cs);
+                return Err(DeriveError::LimitExceeded(format!(
+                    "more than {MAX_DERIVE_EXPLORE} ancestors of {cs} lack derived type {} \
+                     version {}",
+                    key.kind, key.version
+                )));
+            }
+            let mut parents: Vec<ChangesetId> = Vec::new();
+            for chunk in level.chunks(DERIVE_BATCH) {
+                for (id, c) in chunk.iter().zip(self.changesets(repo, chunk).await?) {
+                    let p = c.parts().parents.clone();
+                    parents.extend(&p);
+                    found.insert(*id, p);
+                }
+            }
+            parents.sort_unstable();
+            parents.dedup();
+            parents.retain(|p| !found.contains_key(p));
+            let keys: Vec<DerivedKey> = parents.iter().map(|p| t.key(*p)).collect();
+            let mut next = Vec::new();
+            for chunk in parents.chunks(DERIVE_BATCH).zip(keys.chunks(DERIVE_BATCH)) {
+                let values = self.lookup_many(repo, chunk.1).await?;
+                next.extend(
+                    chunk
+                        .0
+                        .iter()
+                        .zip(values)
+                        .filter(|(_, v)| v.is_none())
+                        .map(|(p, _)| *p),
+                );
+            }
+            level = next;
+        }
+        // Parents first: Kahn's algorithm over the found subgraph.
+        let mut waiting: HashMap<ChangesetId, usize> = found
+            .iter()
+            .map(|(id, ps)| (*id, ps.iter().filter(|p| found.contains_key(p)).count()))
+            .collect();
+        let mut children: HashMap<ChangesetId, Vec<ChangesetId>> = HashMap::new();
+        for (id, ps) in &found {
+            for p in ps {
+                if found.contains_key(p) {
+                    children.entry(*p).or_default().push(*id);
+                }
+            }
+        }
+        let mut ready: Vec<ChangesetId> = waiting
+            .iter()
+            .filter(|(_, n)| **n == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        ready.sort_unstable();
+        let mut order = Vec::with_capacity(found.len());
+        while let Some(id) = ready.pop() {
+            for child in children.remove(&id).unwrap_or_default() {
+                let n = waiting
+                    .get_mut(&child)
+                    .ok_or_else(|| DeriveError::Internal("a child left the subgraph".into()))?;
+                *n -= 1;
+                if *n == 0 {
+                    ready.push(child);
+                }
+            }
+            order.push(id);
+        }
+        if order.len() != found.len() {
+            return Err(DeriveError::DataLoss(format!(
+                "the parents of {cs} form a cycle"
+            )));
+        }
+        Ok(order)
+    }
+
+    /// Reads stored changesets, verifying their ids: from the cache, or in
+    /// batches of at most [`DERIVE_BATCH`] per store read.
+    pub async fn changesets(
+        &self,
+        repo: RepoId,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Arc<Changeset>>, DeriveError> {
+        let mut out: Vec<Option<Arc<Changeset>>> = ids
+            .iter()
+            .map(|id| self.changesets.get(&(repo, *id)))
+            .collect();
+        let missing: Vec<usize> = (0..ids.len()).filter(|&i| out[i].is_none()).collect();
+        for chunk in missing.chunks(DERIVE_BATCH) {
+            let keys: Vec<MetaKey> = chunk.iter().map(|&i| MetaKey::Changeset(ids[i])).collect();
+            for (&i, bytes) in chunk.iter().zip(self.meta.get(repo, &keys).await?) {
+                let id = ids[i];
+                let bytes =
+                    bytes.ok_or_else(|| DeriveError::NotFound(format!("changeset {id}")))?;
+                if ChangesetId::hash(&bytes) != id {
+                    return Err(DeriveError::DataLoss(format!(
+                        "stored changeset {id} does not hash to its id"
+                    )));
+                }
+                let cs = Arc::new(Changeset::decode(&bytes).map_err(|e| {
+                    DeriveError::DataLoss(format!("stored changeset {id} is malformed: {e}"))
+                })?);
+                self.changesets.insert((repo, id), cs.clone());
+                out[i] = Some(cs);
+            }
+        }
+        out.into_iter()
+            .map(|c| c.ok_or_else(|| DeriveError::Internal("a changeset read was lost".into())))
+            .collect()
+    }
+
+    /// Derives and stores the values of `chunk`, at most [`DERIVE_BATCH`]
+    /// changesets in parents-first order whose other ancestors have their
+    /// values stored, writing the values it computes together: one
+    /// [`Deriver::write`] (tree frames, then one metadata transaction holding
+    /// every new tree node and value) per run of them. So a request that
+    /// stops between batches has stored exactly the batches it finished.
+    ///
+    /// Concurrent derivations of one key on this server are coalesced
+    /// (INV-20). The batch first registers an in-flight entry for each key
+    /// it lacks, claiming those that no other request has in flight. It
+    /// computes its claimed keys in order; at a key another request has in
+    /// flight, it first writes and publishes what it has computed, then
+    /// awaits that key's result. A request therefore waits only for keys it
+    /// needs, and never while holding a computed value another request may
+    /// need. A batch that fails or is cancelled drops its entries, and a
+    /// request waiting on one of them derives that key itself.
+    async fn derive_batch(
+        &self,
+        repo: RepoId,
+        t: &dyn AnyType<M, B>,
+        chunk: &[ChangesetId],
+    ) -> Result<(), DeriveError> {
+        let keys: Vec<DerivedKey> = chunk.iter().map(|id| t.key(*id)).collect();
+        let stored = self.lookup_many(repo, &keys).await?;
+        let todo: Vec<ChangesetId> = chunk
+            .iter()
+            .zip(stored)
+            .filter(|(_, v)| v.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        if todo.is_empty() {
+            return Ok(());
+        }
+        let changesets = self.changesets(repo, &todo).await?;
+        // While set, an entry whose computation this request runs is a key
+        // claimed for this batch, whose value the batch sends once it is
+        // stored. Afterwards, an entry this request comes to run, because
+        // the batch that had it failed, derives its key alone.
+        let claiming = AtomicBool::new(true);
+        let claimed: Vec<AtomicBool> = todo.iter().map(|_| AtomicBool::new(false)).collect();
+        let mut senders = Vec::with_capacity(todo.len());
+        let mut entries: Vec<Entry<'_>> = Vec::with_capacity(todo.len());
+        for (i, (id, cs)) in todo.iter().zip(&changesets).enumerate() {
+            let (tx, rx) = tokio::sync::oneshot::channel::<Bytes>();
+            senders.push(Some(tx));
+            let (claiming, claimed) = (&claiming, &claimed[i]);
+            entries.push(Box::pin(self.inflight.run(
+                (repo, t.key(*id)),
+                move || async move {
+                    claimed.store(true, Ordering::Relaxed);
+                    if claiming.load(Ordering::Relaxed) {
+                        rx.await.map_err(|_| {
+                            DeriveError::Internal("a batch ended without its value".into())
+                        })
+                    } else {
+                        self.derive_alone(repo, t, *id, cs).await
+                    }
+                },
+            )));
+        }
+        // Register every entry now: one poll creates it, or joins another
+        // request's, without waiting.
+        let mut ready: Vec<Poll<Result<Bytes, DeriveError>>> = entries
+            .iter_mut()
+            .map(|e| e.as_mut().poll(&mut Context::from_waker(Waker::noop())))
+            .collect();
+        claiming.store(false, Ordering::Relaxed);
+
+        let mut cx = self.cx(repo);
+        let mut computed: Vec<(usize, Bytes)> = Vec::new();
+        for i in 0..todo.len() {
+            match std::mem::replace(&mut ready[i], Poll::Pending) {
+                // Stored by another request on this server already.
+                Poll::Ready(value) => {
+                    value?;
+                }
+                Poll::Pending if claimed[i].load(Ordering::Relaxed) => {
+                    let value = t.derive_any(&mut cx, todo[i], &changesets[i]).await?;
+                    cx.set_value(t.key(todo[i]), value.clone());
+                    computed.push((i, value));
+                }
+                Poll::Pending => {
+                    self.publish(cx, &mut computed, &mut senders, &mut entries)
+                        .await?;
+                    cx = self.cx(repo);
+                    entries[i].as_mut().await?;
+                }
+            }
+        }
+        self.publish(cx, &mut computed, &mut senders, &mut entries)
+            .await
+    }
+
+    /// Writes a batch's computed values, sends each to its in-flight entry,
+    /// and completes those entries, so requests awaiting them get values
+    /// that are stored.
+    async fn publish(
+        &self,
+        cx: DeriveCx<'_, M, B>,
+        computed: &mut Vec<(usize, Bytes)>,
+        senders: &mut [Option<tokio::sync::oneshot::Sender<Bytes>>],
+        entries: &mut [Entry<'_>],
+    ) -> Result<(), DeriveError> {
+        if computed.is_empty() {
+            return Ok(());
+        }
+        self.write(cx, Vec::new()).await?;
+        for (i, value) in computed.drain(..) {
+            let sent = senders[i].take().map(|tx| tx.send(value));
+            if !matches!(sent, Some(Ok(()))) {
+                return Err(DeriveError::Internal(
+                    "a claimed entry stopped waiting for its value".into(),
+                ));
+            }
+            entries[i].as_mut().await?;
+        }
+        Ok(())
     }
 
     /// Derives and stores one value whose parents' values are stored,
     /// sharing the work with any concurrent derivation of the same key on
     /// this server.
-    async fn derive_one<T: DerivedType>(
+    async fn derive_one(
         &self,
         repo: RepoId,
-        t: &T,
+        t: &dyn AnyType<M, B>,
         id: ChangesetId,
         cs: &Changeset,
     ) -> Result<Bytes, DeriveError> {
         let key = t.key(id);
-        let cell = self
+        let value = self
             .inflight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry((repo, key))
-            .or_default()
-            .clone();
-        let result = cell
-            .get_or_try_init(|| async {
-                // Another server may have stored it since we looked.
-                if let Some(v) = self
-                    .meta
-                    .get(repo, &[MetaKey::Derived(key)])
-                    .await?
-                    .pop()
-                    .flatten()
-                {
-                    return Ok(v);
-                }
-                let mut cx = self.cx(repo);
-                let value = t.derive(&mut cx, id, cs).await?;
-                cx.set_value(key, value.clone());
-                self.write(cx, Vec::new()).await?;
-                Ok::<Bytes, DeriveError>(value)
-            })
-            .await
-            .cloned();
-        {
-            let mut map = self
-                .inflight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if map.get(&(repo, key)).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
-                map.remove(&(repo, key));
-            }
-        }
-        let value = result?;
+            .run((repo, key), || self.derive_alone(repo, t, id, cs))
+            .await?;
         self.values.insert((repo, key), value.clone());
+        Ok(value)
+    }
+
+    /// Derives and stores one value whose parents' values are stored, in a
+    /// computation of its in-flight entry.
+    async fn derive_alone(
+        &self,
+        repo: RepoId,
+        t: &dyn AnyType<M, B>,
+        id: ChangesetId,
+        cs: &Changeset,
+    ) -> Result<Bytes, DeriveError> {
+        let key = t.key(id);
+        // Another server may have stored it since we looked.
+        if let Some(v) = self
+            .meta
+            .get(repo, &[MetaKey::Derived(key)])
+            .await?
+            .pop()
+            .flatten()
+        {
+            return Ok(v);
+        }
+        let mut cx = self.cx(repo);
+        let value = t.derive_any(&mut cx, id, cs).await?;
+        cx.set_value(key, value.clone());
+        self.write(cx, Vec::new()).await?;
         Ok(value)
     }
 
@@ -428,10 +701,10 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
     ) -> Result<(), DeriveError> {
         let mut tasks = JoinSet::new();
         for (id, tree) in nodes {
-            if tasks.len() >= self.frame_concurrency
+            if tasks.len() >= FRAME_WRITES
                 && let Some(r) = tasks.join_next().await
             {
-                r.map_err(|e| DeriveError::DataLoss(format!("frame task failed: {e}")))??;
+                r.map_err(|e| DeriveError::Internal(format!("a frame write task failed: {e}")))??;
             }
             let frame = tree_frame(*id, tree)?;
             let blobs = self.blobs.clone();
@@ -442,7 +715,7 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
             });
         }
         while let Some(r) = tasks.join_next().await {
-            r.map_err(|e| DeriveError::DataLoss(format!("frame task failed: {e}")))??;
+            r.map_err(|e| DeriveError::Internal(format!("a frame write task failed: {e}")))??;
         }
         Ok(())
     }
@@ -451,20 +724,66 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
 /// Encodes an object's frame: the zstd-compressed bytes when compression
 /// shrinks them, else the raw bytes. This is the one place the server picks a
 /// frame's codec.
-pub fn encode_frame(kind: FrameKind, id: [u8; 32], raw: &[u8]) -> Result<Bytes, DeriveError> {
+pub fn encode_frame(id: FrameId, raw: &[u8]) -> Result<Bytes, DeriveError> {
     let payload = zstd::bulk::compress(raw, FRAME_ZSTD_LEVEL)
-        .map_err(|e| DeriveError::DataLoss(format!("compressing a frame: {e}")))?;
+        .map_err(|e| DeriveError::Internal(format!("compressing a frame: {e}")))?;
     let (codec, payload) = if payload.len() < raw.len() {
         (Codec::Zstd, payload.as_slice())
     } else {
         (Codec::Raw, raw)
     };
-    Frame::encode(kind, id, codec, raw.len() as u64, payload)
+    Frame::encode(id, codec, raw.len() as u64, payload)
         .map(Bytes::from)
-        .map_err(|e| DeriveError::DataLoss(format!("encoding a frame: {e}")))
+        .map_err(|e| DeriveError::Internal(format!("encoding a frame: {e}")))
 }
 
 /// The frame of a tree node.
 pub fn tree_frame(id: TreeId, tree: &Tree) -> Result<Bytes, DeriveError> {
-    encode_frame(FrameKind::Tree, *id.as_bytes(), &tree.encode())
+    encode_frame(FrameId::Tree(id), &tree.encode())
+}
+
+/// A derived type with its parameters fixed, as a trait object, so that a
+/// list of types (such as every eager type) can be derived generically.
+pub trait AnyType<M, B>: Send + Sync {
+    /// The key of this type's value for `cs`.
+    fn key(&self, cs: ChangesetId) -> DerivedKey;
+    /// Whether create derives it.
+    fn mode(&self) -> Mode;
+    /// Whether a value reads its parents' values of this type.
+    fn reads_parents(&self) -> bool;
+    /// Computes the value for `cs`, as [`DerivedType::derive`] does.
+    fn derive_any<'c, 'd>(
+        &'c self,
+        cx: &'c mut DeriveCx<'d, M, B>,
+        id: ChangesetId,
+        cs: &'c Changeset,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes, DeriveError>> + Send + 'c>>
+    where
+        'd: 'c;
+}
+
+impl<T: DerivedType, M: MetaStore, B: BlobStore> AnyType<M, B> for T {
+    fn key(&self, cs: ChangesetId) -> DerivedKey {
+        DerivedType::key(self, cs)
+    }
+
+    fn mode(&self) -> Mode {
+        T::MODE
+    }
+
+    fn reads_parents(&self) -> bool {
+        T::READS_PARENTS
+    }
+
+    fn derive_any<'c, 'd>(
+        &'c self,
+        cx: &'c mut DeriveCx<'d, M, B>,
+        id: ChangesetId,
+        cs: &'c Changeset,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Bytes, DeriveError>> + Send + 'c>>
+    where
+        'd: 'c,
+    {
+        Box::pin(self.derive(cx, id, cs))
+    }
 }

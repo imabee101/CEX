@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use derived::{AddedNames, Change, DeriveCx, DeriveError, DerivedType, Mode, TreeWork, kinds};
+use derived::{
+    AddedNames, Applied, Change, DeriveCx, DeriveError, DerivedType, Mode, TreeWork, kinds,
+};
 use scion_core::{Changeset, ChangesetId, EntryTarget, FileChange, RepoPath, TreeId};
 use store::{BlobStore, MetaStore};
 
@@ -99,11 +101,19 @@ fn index_path(path: &[u8]) -> Vec<u8> {
 /// names that conflict are adjacent and one prefix search finds them. It is
 /// derived by rewriting only the spines of the changed paths, like
 /// RootTree, which keeps the check O(changed files × path depth) however
-/// large a directory is (INV-1, INV-19). It is kept for
-/// every changeset, including imported ones and repos with the check off,
-/// so later checks can use it.
+/// large a directory is (INV-1, INV-19). It is kept for every changeset,
+/// including imported ones and repos with the check off, so later checks
+/// can use it.
+///
+/// With `check` set, deriving it also fails with
+/// [`DeriveError::CaseConflict`] when the changeset adds a name that
+/// conflicts with another name of its directory. The value and key do not
+/// depend on `check`.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct CaseIndex;
+pub struct CaseIndex {
+    /// Whether deriving rejects a changeset that adds a conflicting name.
+    pub check: bool,
+}
 
 impl CaseIndex {
     fn decode(value: &[u8]) -> Result<TreeId, DeriveError> {
@@ -114,21 +124,22 @@ impl CaseIndex {
     }
 
     /// Applies `cs`'s file changes to its first parent's index; the new
-    /// nodes are left in `cx.case_nodes`, never public tree storage. File entries carry the kind, blob, and
-    /// size; their SHA-256 is unused and zero.
-    pub async fn apply<M: MetaStore, B: BlobStore>(
+    /// nodes are left in `cx.case_nodes`, never public tree storage. File
+    /// entries carry the kind, blob, and size; their SHA-256 is unused and
+    /// zero. The added names are index names.
+    async fn apply<M: MetaStore, B: BlobStore>(
         cx: &mut DeriveCx<'_, M, B>,
         cs: &Changeset,
-    ) -> Result<TreeId, DeriveError> {
+    ) -> Result<Applied, DeriveError> {
         let parts = cs.parts();
         let parent = match parts.parents.first() {
-            Some(p) => Some(Self::decode(&cx.value(&CaseIndex, *p).await?)?),
+            Some(p) => Some(Self::decode(&cx.value(&CaseIndex::default(), *p).await?)?),
             None => None,
         };
         let mut changes = BTreeMap::new();
         for (path, change) in &parts.file_changes {
             let p = RepoPath::new(index_path(path.as_bytes()))
-                .map_err(|e| DeriveError::DataLoss(format!("index path: {e}")))?;
+                .map_err(|e| DeriveError::Internal(format!("index path: {e}")))?;
             let c = match change {
                 FileChange::Deleted => Change::Delete,
                 FileChange::File { kind, blob, size } => Change::Set(EntryTarget::File {
@@ -140,46 +151,60 @@ impl CaseIndex {
             };
             changes.insert(p, c);
         }
-        Ok(cx.case_nodes.apply(parent, &changes).await?.root)
+        cx.case_nodes.apply(parent, &changes).await
     }
 
-    /// The path of the first name in `added` (in order) that conflicts with
-    /// another name of its directory in the index `root`, with the name it
-    /// conflicts with.
-    pub async fn find_conflict<M: MetaStore>(
+    /// The path of the first added name (in order) that conflicts with
+    /// another name of its directory, with the name it conflicts with. Each
+    /// directory's new index node holds the added names next to any name
+    /// they conflict with, so one prefix search per added name finds it.
+    async fn find_conflict<M: MetaStore>(
         trees: &mut TreeWork<'_, M>,
-        root: TreeId,
         added: &[AddedNames],
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, DeriveError> {
         for a in added {
-            let dir = if a.dir.is_empty() {
-                root
-            } else {
-                let p = RepoPath::new(index_path(&a.dir))
-                    .map_err(|e| DeriveError::DataLoss(format!("index path: {e}")))?;
-                match trees.lookup_path(root, &p).await? {
-                    Some(EntryTarget::Tree(id)) => id,
-                    _ => return Err(DeriveError::DataLoss("index lacks a directory".into())),
-                }
-            };
-            for name in &a.names {
-                let own = index_name(name);
-                let key_len = own.len() - name.len();
-                // At most two names share the key prefix before one differs
-                // from `name` itself.
-                let found = trees.find_prefixed(dir, &own[..key_len], 2).await?;
-                if let Some(other) = found.into_iter().find(|n| *n != own) {
-                    let mut path = a.dir.clone();
+            for own in &a.names {
+                let key_len = key_len(own)?;
+                // At most two names share the key before one differs from
+                // `own` itself.
+                let found = trees.find_prefixed(a.node, &own[..key_len], 2).await?;
+                if let Some(other) = found.into_iter().find(|n| n != own) {
+                    let mut path = original_path(&a.dir)?;
                     if !path.is_empty() {
                         path.push(b'/');
                     }
-                    path.extend_from_slice(name);
+                    path.extend_from_slice(&own[key_len..]);
                     return Ok(Some((path, other[key_len..].to_vec())));
                 }
             }
         }
         Ok(None)
     }
+}
+
+/// The length of an index name's key: its tag, hex fold key, and `.`. Hex
+/// digits and tags hold no `.`, so the key ends at the first one.
+fn key_len(index_name: &[u8]) -> Result<usize, DeriveError> {
+    index_name
+        .iter()
+        .position(|&b| b == b'.')
+        .map(|i| i + 1)
+        .ok_or_else(|| DeriveError::DataLoss("an index name has no key".into()))
+}
+
+/// The repo path an index path stands for.
+fn original_path(index_path: &[u8]) -> Result<Vec<u8>, DeriveError> {
+    let mut out = Vec::new();
+    if index_path.is_empty() {
+        return Ok(out);
+    }
+    for (i, c) in index_path.split(|&b| b == b'/').enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(&c[key_len(c)?..]);
+    }
+    Ok(out)
 }
 
 impl DerivedType for CaseIndex {
@@ -193,8 +218,14 @@ impl DerivedType for CaseIndex {
         _id: ChangesetId,
         cs: &'c Changeset,
     ) -> Result<Bytes, DeriveError> {
-        let root = Self::apply(cx, cs).await?;
-        Ok(Bytes::copy_from_slice(root.as_bytes()))
+        let applied = Self::apply(cx, cs).await?;
+        if self.check
+            && let Some((path, other)) =
+                Self::find_conflict(&mut cx.case_nodes, &applied.added).await?
+        {
+            return Err(DeriveError::CaseConflict { path, other });
+        }
+        Ok(Bytes::copy_from_slice(applied.root.as_bytes()))
     }
 }
 

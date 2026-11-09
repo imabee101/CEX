@@ -17,12 +17,15 @@ mod deriver;
 mod error;
 mod restricted_roots;
 mod root_tree;
+#[cfg(feature = "testing")]
+pub mod testing;
 mod trees;
 
 pub use blob_record::BlobRecord;
 pub use commit_graph::{CommitGraph, GraphNode};
 pub use deriver::{
-    CacheSizes, DeriveCx, DerivedType, Deriver, FRAME_ZSTD_LEVEL, Mode, encode_frame, tree_frame,
+    AnyType, CacheSizes, DERIVE_BATCH, DeriveCx, DerivedType, Deriver, FRAME_WRITES,
+    FRAME_ZSTD_LEVEL, MAX_DERIVE_EXPLORE, MAX_DERIVE_PER_REQUEST, Mode, encode_frame, tree_frame,
 };
 pub use error::{DeriveError, InvalidKind};
 pub use restricted_roots::{AclConfig, RestrictedRoots};

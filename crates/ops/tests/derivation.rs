@@ -1,8 +1,8 @@
 //! The derived-data mechanism on Postgres and the object store (INV-20):
 //! values written by create equal values derived from scratch in a store
 //! holding only the changesets and blobs; concurrent derivations of one key
-//! on a server compute and write it once; and CommitGraph and
-//! RestrictedRoots equal naive models.
+//! on a server compute and write it once; and RestrictedRoots equals a
+//! naive model. CommitGraph's model is in `commit_graph.rs`.
 
 mod common;
 
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::*;
-use derived::{AclConfig, CommitGraph, DerivedType, GraphNode, RestrictedRoots, RootTree};
+use derived::{AclConfig, CommitGraph, DerivedType, RestrictedRoots, RootTree};
 use ops::CreateOptions;
 use ops::blob::upload_blobs;
 use ops::case::CaseIndex;
@@ -128,24 +128,7 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
     let dag = build_dag(&ops1, 120, 11, &config).await;
 
     // A second database with only the changesets and blob records.
-    let second = env().await;
-    let mut keys: Vec<MetaKey> = dag.ids.iter().map(|id| MetaKey::Changeset(*id)).collect();
-    let mut blob_keys = Vec::new();
-    for id in &dag.ids {
-        for (_, c) in dag.models[id].files.values() {
-            let k = MetaKey::Blob(scion_core::BlobId::hash(c));
-            if !blob_keys.contains(&k) {
-                blob_keys.push(k);
-            }
-        }
-    }
-    keys.extend(blob_keys);
-    let rows: Vec<(MetaKey, Bytes)> = keys
-        .iter()
-        .zip(first.meta.get(REPO, &keys).await.unwrap())
-        .map(|(k, v)| (*k, v.unwrap()))
-        .collect();
-    second.meta.put(REPO, &rows).await.unwrap();
+    let second = bare_copy(&first, &dag).await;
     let ops2 = ops(&second.meta, &first.blobs);
     let d2 = ops2.deriver();
     let restricted = RestrictedRoots::new(config.clone());
@@ -169,7 +152,7 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
     d2.get(REPO, &RootTree, tip).await.unwrap();
     d2.get(REPO, &CommitGraph, tip).await.unwrap();
     d2.get(REPO, &restricted, tip).await.unwrap();
-    d2.get(REPO, &CaseIndex, tip).await.unwrap();
+    d2.get(REPO, &CaseIndex::default(), tip).await.unwrap();
 
     async fn values<T: DerivedType>(
         meta: &store::PgMetaStore,
@@ -200,14 +183,9 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
             values(&second.meta, &CommitGraph, &ancestors).await,
         ),
         (
-            "RestrictedRoots",
-            values(&first.meta, &restricted, &ancestors).await,
-            values(&second.meta, &restricted, &ancestors).await,
-        ),
-        (
             "CaseIndex",
-            values(&first.meta, &CaseIndex, &ancestors).await,
-            values(&second.meta, &CaseIndex, &ancestors).await,
+            values(&first.meta, &CaseIndex::default(), &ancestors).await,
+            values(&second.meta, &CaseIndex::default(), &ancestors).await,
         ),
     ] {
         assert!(
@@ -216,12 +194,26 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
         );
         assert_eq!(a, b, "{name}: incremental and from-scratch values differ");
     }
-    // Every other changeset, derived from scratch too, also matches.
+    // RestrictedRoots does not read its parents' values: deriving the tip
+    // derived no ancestor's.
+    let below: Vec<ChangesetId> = ancestors.iter().copied().filter(|c| *c != tip).collect();
+    assert!(
+        values(&second.meta, &restricted, &below)
+            .await
+            .iter()
+            .all(Option::is_none)
+    );
+    // Every other changeset, derived from scratch too, also matches. Create
+    // derived RestrictedRoots from each first parent's stored value; here it
+    // is derived children first, so no parent's value is stored yet and each
+    // comes from looking its roots up directly: two independent paths.
     for id in &dag.ids {
         d2.get(REPO, &RootTree, *id).await.unwrap();
         d2.get(REPO, &CommitGraph, *id).await.unwrap();
+        d2.get(REPO, &CaseIndex::default(), *id).await.unwrap();
+    }
+    for id in dag.ids.iter().rev() {
         d2.get(REPO, &restricted, *id).await.unwrap();
-        d2.get(REPO, &CaseIndex, *id).await.unwrap();
     }
     assert_eq!(
         values(&first.meta, &RootTree, &dag.ids).await,
@@ -236,8 +228,8 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
         values(&second.meta, &restricted, &dag.ids).await
     );
     assert_eq!(
-        values(&first.meta, &CaseIndex, &dag.ids).await,
-        values(&second.meta, &CaseIndex, &dag.ids).await
+        values(&first.meta, &CaseIndex::default(), &dag.ids).await,
+        values(&second.meta, &CaseIndex::default(), &dag.ids).await
     );
     // And every root equals the reference root of the changeset's files.
     for id in &ancestors {
@@ -245,19 +237,8 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
     }
 }
 
-/// The skew-binary jump depth for a node at depth `d`.
-fn skew_depth(d: u64) -> u64 {
-    if d == 0 {
-        return 0;
-    }
-    let p = d - 1;
-    let j = skew_depth(p);
-    let jj = skew_depth(j);
-    if p - j == j - jj { jj } else { p }
-}
-
 #[tokio::test]
-async fn commit_graph_and_restricted_roots_equal_naive_models() {
+async fn restricted_roots_equal_a_naive_model() {
     let env = env().await;
     let config = acl(
         3,
@@ -266,85 +247,6 @@ async fn commit_graph_and_restricted_roots_equal_naive_models() {
     let ops = ops(&env.meta, &env.blobs);
     let dag = build_dag(&ops, 150, 5, &config).await;
     let d = ops.deriver();
-    let mut nodes: HashMap<ChangesetId, GraphNode> = HashMap::new();
-    for id in &dag.ids {
-        nodes.insert(
-            *id,
-            GraphNode::decode(&d.get(REPO, &CommitGraph, *id).await.unwrap()).unwrap(),
-        );
-    }
-    // Naive ancestor sets.
-    let mut anc: HashMap<ChangesetId, std::collections::HashSet<ChangesetId>> = HashMap::new();
-    for id in &dag.ids {
-        let mut s = std::collections::HashSet::from([*id]);
-        for p in &dag.parents[id] {
-            s.extend(anc[p].iter().copied());
-        }
-        anc.insert(*id, s);
-    }
-    let mut skip_parent: HashMap<ChangesetId, Option<ChangesetId>> = HashMap::new();
-    let skip_chain = |x: ChangesetId, sp: &HashMap<ChangesetId, Option<ChangesetId>>| {
-        let mut chain = vec![x];
-        while let Some(Some(p)) = sp.get(chain.last().unwrap()) {
-            chain.push(*p);
-        }
-        chain
-    };
-    for id in &dag.ids {
-        let n = &nodes[id];
-        let ps = &dag.parents[id];
-        assert_eq!(&n.parents, ps);
-        let generation = ps
-            .iter()
-            .map(|p| nodes[p].generation + 1)
-            .max()
-            .unwrap_or(1);
-        assert_eq!(n.generation, generation);
-        // First-parent chain.
-        let mut chain = vec![*id];
-        while let Some(p) = dag.parents[chain.last().unwrap()].first() {
-            chain.push(*p);
-        }
-        let depth = chain.len() as u64 - 1;
-        assert_eq!(n.p1_depth, depth);
-        assert_eq!(n.p1_skew, chain[(depth - skew_depth(depth)) as usize]);
-        // Skip tree: the closest common ancestor of the parents' skip chains.
-        let sp = match ps.split_first() {
-            None => None,
-            Some((first, rest)) => {
-                let mut cur = Some(*first);
-                for p in rest {
-                    let Some(c) = cur else { break };
-                    let other: std::collections::HashSet<_> =
-                        skip_chain(*p, &skip_parent).into_iter().collect();
-                    cur = skip_chain(c, &skip_parent)
-                        .into_iter()
-                        .find(|x| other.contains(x));
-                }
-                cur
-            }
-        };
-        assert_eq!(n.skip_parent, sp, "skip parent of {id}");
-        if let Some(sp) = sp {
-            // The skip parent is a common ancestor of every parent.
-            assert!(ps.iter().all(|p| anc[p].contains(&sp)));
-        }
-        skip_parent.insert(*id, sp);
-        let chain = skip_chain(*id, &skip_parent);
-        let depth = chain.len() as u64 - 1;
-        assert_eq!(n.skip_depth, depth);
-        assert_eq!(n.skip_skew, chain[(depth - skew_depth(depth)) as usize]);
-    }
-    assert!(
-        dag.parents.values().any(|p| p.len() == 2),
-        "the DAG has merges"
-    );
-    assert!(
-        dag.parents.values().filter(|p| p.is_empty()).count() > 1,
-        "the DAG has several roots"
-    );
-    assert!(skip_parent.values().any(Option::is_none) && skip_parent.len() > 1);
-
     // RestrictedRoots: the tree of each restricted prefix that is a
     // directory, from the reference builder.
     let restricted = RestrictedRoots::new(config.clone());
@@ -416,10 +318,10 @@ async fn concurrent_derivations_of_one_key_write_it_once() {
         .iter()
         .filter(|(k, _)| matches!(k, MetaKey::Derived(_)))
         .collect();
-    assert!(derived.len() > 1, "the tip and its ancestors were derived");
-    for (k, n) in &derived {
-        assert_eq!(**n, 1, "{k:?} was written {n} times");
-    }
+    // RestrictedRoots does not read its parents' values, so only the tip's
+    // value is derived, once.
+    assert_eq!(derived.len(), 1, "{derived:?}");
+    assert_eq!(*derived[0].1, 1, "written more than once");
     let stored = env
         .meta
         .get(REPO, &[MetaKey::Derived(fresh.key(tip))])
@@ -496,4 +398,79 @@ async fn restricted_roots_follow_changes_next_to_sorting_siblings() {
         assert_eq!(got.get(&path("a/b")), Some(&sub.root()), "round {i}");
         parent = vec![id];
     }
+}
+
+/// Concurrent derivations of a type that reads its parents' values, on a
+/// database holding only changesets and blob records: every ancestor's value
+/// is derived, and each is written exactly once (INV-20).
+#[tokio::test]
+async fn concurrent_derivations_of_a_history_write_each_value_once() {
+    let first = env().await;
+    let config = acl(1, &["sec"]);
+    let dag = build_dag(&ops(&first.meta, &first.blobs), 120, 11, &config).await;
+    let ancestors = |tip: ChangesetId| {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![tip];
+        while let Some(c) = stack.pop() {
+            if seen.insert(c) {
+                stack.extend(dag.parents[&c].iter().copied());
+            }
+        }
+        seen.len()
+    };
+    let tip = *dag.ids.iter().max_by_key(|id| ancestors(**id)).unwrap();
+    let bare = bare_copy(&first, &dag).await;
+    let faults = Faults::new();
+    let meta = Arc::new(FaultMetaStore::new(bare.meta.clone(), faults.clone()));
+    let blobs = Arc::new(FaultBlobStore::new(first.blobs.clone(), faults.clone()));
+    let server = Arc::new(ops(&meta, &blobs));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..32 {
+        let server = server.clone();
+        tasks.spawn(async move { server.deriver().get(REPO, &CommitGraph, tip).await.unwrap() });
+    }
+    while let Some(r) = tasks.join_next().await {
+        r.unwrap();
+    }
+    let mut writes: HashMap<MetaKey, usize> = HashMap::new();
+    for w in faults.writes() {
+        if let Write::Meta(keys) = w {
+            for k in keys {
+                *writes.entry(k).or_default() += 1;
+            }
+        }
+    }
+    let graph_writes: Vec<_> = writes
+        .iter()
+        .filter(|(k, _)| matches!(k, MetaKey::Derived(d) if d.kind == CommitGraph.key(tip).kind))
+        .collect();
+    assert!(
+        graph_writes.len() > 10,
+        "the tip's ancestors were derived: {}",
+        graph_writes.len()
+    );
+    for (k, n) in &graph_writes {
+        assert_eq!(**n, 1, "{k:?} was written {n} times");
+    }
+}
+
+/// A second database holding only `dag`'s changesets and blob records.
+async fn bare_copy(first: &Env, dag: &Dag) -> Env {
+    let second = env().await;
+    let mut keys: Vec<MetaKey> = dag.ids.iter().map(|id| MetaKey::Changeset(*id)).collect();
+    for id in &dag.ids {
+        for (_, c) in dag.models[id].files.values() {
+            let k = MetaKey::Blob(scion_core::BlobId::hash(c));
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+    }
+    let rows: Vec<(MetaKey, Bytes)> = keys
+        .iter()
+        .zip(first.meta.get(REPO, &keys).await.unwrap())
+        .map(|(k, v)| (*k, v.unwrap()))
+        .collect();
+    second.meta.put(REPO, &rows).await.unwrap();
+    second
 }
