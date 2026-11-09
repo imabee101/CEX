@@ -640,16 +640,31 @@ async fn every_limit_is_waived_for_imports() {
     }
 }
 
-async fn upload(ops: &PgOps, content: &[u8]) {
-    let d = ops.deriver();
-    ops::blob::upload_blobs(
-        &**d.meta(),
-        d.blobs(),
-        REPO,
-        &[bytes::Bytes::copy_from_slice(content)],
-    )
-    .await
-    .unwrap();
+/// An empty author is rejected on a new changeset and accepted on an
+/// imported one, whose author is the git commit's ident verbatim.
+#[tokio::test]
+async fn an_empty_author_is_refused_unless_imported() {
+    let env = env().await;
+    let (ops, base) = base(&env).await;
+    let mut parts = changeset(&[base], "anonymous", vec![]).into_parts();
+    parts.author = Vec::new();
+    let err = ops
+        .create_changeset(
+            REPO,
+            scion_core::Changeset::new(parts.clone()).unwrap(),
+            &CreateOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Code::InvalidArgument, "{err}");
+    parts.git_headers = Some(b"author  0 +0000\n\nanonymous".to_vec());
+    let imported = CreateOptions {
+        imported: true,
+        ..CreateOptions::default()
+    };
+    ops.create_changeset(REPO, scion_core::Changeset::new(parts).unwrap(), &imported)
+        .await
+        .unwrap();
 }
 
 /// A case conflict reports the added path exactly, at every depth, with

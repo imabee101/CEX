@@ -113,18 +113,6 @@ async fn an_acl_change_costs_create_the_same_however_long_the_history() {
     );
 }
 
-async fn upload<M: MetaStore, B: store::BlobStore>(o: &ops::Ops<M, B>, content: &[u8]) {
-    let d = o.deriver();
-    ops::blob::upload_blobs(
-        &**d.meta(),
-        d.blobs(),
-        REPO,
-        &[Bytes::copy_from_slice(content)],
-    )
-    .await
-    .unwrap();
-}
-
 #[tokio::test]
 async fn creates_under_two_acl_versions_each_get_their_own_value() {
     let e = env().await;

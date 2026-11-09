@@ -9,36 +9,9 @@
 //! A history is abstract (commit indices and their parents), so any test
 //! can turn it into changesets, and memory is linear in its length.
 
-/// A small deterministic PRNG (SplitMix64) for randomized tests; a failing
-/// case prints its seed.
-#[derive(Clone, Debug)]
-pub struct Rng(pub u64);
-
-impl Rng {
-    /// The next 64 random bits.
-    pub fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    /// A number below `n` (which must not be 0).
-    pub fn below(&mut self, n: u64) -> u64 {
-        self.next_u64() % n
-    }
-
-    /// An index into a slice of length `n` (which must not be 0).
-    pub fn index(&mut self, n: usize) -> usize {
-        self.below(n as u64) as usize
-    }
-
-    /// True with probability `1 / n`.
-    pub fn one_in(&mut self, n: u64) -> bool {
-        self.below(n) == 0
-    }
-}
+/// The workspace's seeded PRNG for randomized tests; a failing case prints
+/// its seed.
+pub use store::conformance::SplitMix64 as Rng;
 
 /// A shape of commit history.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

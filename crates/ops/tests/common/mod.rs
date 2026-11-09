@@ -137,6 +137,19 @@ impl Model {
 }
 
 /// Uploads contents and creates a changeset.
+/// Uploads one file's contents.
+pub async fn upload<M: MetaStore, B: BlobStore>(ops: &Ops<M, B>, content: &[u8]) {
+    let d = ops.deriver();
+    upload_blobs(
+        &**d.meta(),
+        d.blobs(),
+        REPO,
+        &[Bytes::copy_from_slice(content)],
+    )
+    .await
+    .unwrap();
+}
+
 pub async fn commit<M: MetaStore, B: BlobStore>(
     ops: &Ops<M, B>,
     parents: &[ChangesetId],
