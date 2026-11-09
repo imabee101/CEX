@@ -1,14 +1,18 @@
 //! Create cost does not grow with repo size (INV-1): on Postgres and the
 //! object store, creating a changeset on the 3,000,000-file bench repo costs
 //! within 1.5× of the same change on a 10,000-file repo from the same
-//! generator, by every store-call measure. INV-1 bounds cost by changed files ×
-//! path depth, so each run makes the same changes in both repos: per picked
-//! file (one per top-level directory, all at one depth), it modifies the file,
-//! adds a name beside it and a file in a new directory beside it, and deletes
-//! the previous run's two additions. Each run uses a fresh server, so every
-//! tree read reaches the store. Wall time is reported but not asserted: it
-//! depends on the machine's load.
+//! generator, by wall time and by every store-call measure.
+//!
+//! INV-1 bounds cost by changed files × path depth, so each run makes the
+//! same changes in both repos. The picked files are one per top-level
+//! directory, all at one depth, and paired across the repos so that every
+//! directory below the root on the big repo's path is no wider than the small
+//! repo's. Per picked file, a run
+//! modifies it, adds a name beside it and a file in a new directory beside
+//! it, and deletes the previous run's two additions. Each run uses a fresh
+//! server, so every tree read reaches the store.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,27 +44,74 @@ struct Cost {
     counts: Counts,
 }
 
-/// `CHANGED` files of depth `DEPTH`, each in a different top-level
-/// directory.
-fn pick(files: &[FileSpec]) -> Vec<FileSpec> {
-    let mut seen = std::collections::HashSet::new();
-    let picked: Vec<FileSpec> = files
-        .iter()
-        .filter(|f| f.depth() == DEPTH && seen.insert(f.path.split('/').next().unwrap().to_owned()))
-        .take(CHANGED)
-        .cloned()
-        .collect();
-    assert_eq!(
-        picked.len(),
-        CHANGED,
-        "not enough top-level directories with files at depth {DEPTH}"
-    );
-    picked
+/// The number of entries in each directory of a layout, by directory path
+/// (the root is "").
+fn dir_sizes(files: &[FileSpec]) -> HashMap<String, usize> {
+    let mut entries: HashMap<String, HashSet<String>> = HashMap::new();
+    for f in files {
+        let comps: Vec<&str> = f.path.split('/').collect();
+        for i in 0..comps.len() {
+            entries
+                .entry(comps[..i].join("/"))
+                .or_default()
+                .insert(comps[i].to_owned());
+        }
+    }
+    entries.into_iter().map(|(d, e)| (d, e.len())).collect()
 }
 
-async fn measure(p: &BenchParams) -> Vec<Cost> {
+/// The sizes of every directory on `f`'s path, from the root down: the
+/// shape of the tree nodes a change to `f` reads and rewrites.
+fn shape(f: &FileSpec, sizes: &HashMap<String, usize>) -> Vec<usize> {
+    let comps: Vec<&str> = f.path.split('/').collect();
+    (0..comps.len())
+        .map(|i| sizes[&comps[..i].join("/")])
+        .collect()
+}
+
+/// `CHANGED` files of depth `DEPTH` in each layout, each in a different
+/// top-level directory, paired so that at every level below the root the
+/// big repo's directory is no wider than the small repo's, and as wide as
+/// possible. The same change then reads tree nodes no larger in the big repo,
+/// so any extra cost there comes from the repo's size alone, not from the
+/// generator making a big repo's directories fuller.
+fn pick(small: &[FileSpec], big: &[FileSpec]) -> (Vec<FileSpec>, Vec<FileSpec>) {
+    let (ss, bs) = (dir_sizes(small), dir_sizes(big));
+    let top = |f: &FileSpec| f.path.split('/').next().unwrap().to_owned();
+    let mut big_shapes: Vec<(Vec<usize>, &FileSpec)> = big
+        .iter()
+        .filter(|f| f.depth() == DEPTH)
+        .map(|f| (shape(f, &bs), f))
+        .collect();
+    // Widest first, so the first fit is the closest.
+    big_shapes.sort_by_key(|(s, _)| std::cmp::Reverse(s.iter().sum::<usize>()));
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    let (mut used_a, mut used_b) = (HashSet::new(), HashSet::new());
+    for f in small.iter().filter(|f| f.depth() == DEPTH) {
+        if a.len() == CHANGED || used_a.contains(&top(f)) {
+            continue;
+        }
+        let want = shape(f, &ss);
+        let fit = big_shapes
+            .iter()
+            .find(|(s, g)| !used_b.contains(&top(g)) && s.iter().zip(&want).all(|(b, w)| b <= w));
+        if let Some((_, g)) = fit {
+            used_a.insert(top(f));
+            used_b.insert(top(g));
+            a.push(f.clone());
+            b.push((*g).clone());
+        }
+    }
+    assert_eq!(
+        a.len(),
+        CHANGED,
+        "not enough pairs of depth-{DEPTH} files whose big-repo directories are no wider"
+    );
+    (a, b)
+}
+
+async fn measure(p: &BenchParams, files: &[FileSpec]) -> Vec<Cost> {
     let repo = cached_repo(p).await;
-    let files = pick(&layout(p));
     let db = TestDatabase::create_from(&repo.template).await;
     let meta = Arc::new(
         PgMetaStore::new(
@@ -87,7 +138,7 @@ async fn measure(p: &BenchParams) -> Vec<Cost> {
         let dir = |f: &FileSpec| f.path.rsplit_once('/').unwrap().0.to_owned();
         let mut writes: Vec<String> = Vec::new();
         let mut deletes: Vec<String> = Vec::new();
-        for f in &files {
+        for f in files {
             writes.push(f.path.clone());
             writes.push(format!("{}/added{run}", dir(f)));
             writes.push(format!("{}/newdir{run}/file", dir(f)));
@@ -126,7 +177,7 @@ async fn measure(p: &BenchParams) -> Vec<Cost> {
             )
             .collect();
         let cs = Changeset::new(parts).unwrap();
-        let parent = cs.id();
+        let created = cs.id();
         // A fresh server, with cold caches, counting its store calls.
         let faults = Faults::new();
         let fm = Arc::new(FaultMetaStore::new(meta.clone(), faults.clone()));
@@ -136,7 +187,7 @@ async fn measure(p: &BenchParams) -> Vec<Cost> {
         ops.create_changeset(REPO, cs, &CreateOptions::default())
             .await
             .unwrap();
-        tip = parent;
+        tip = created;
         let time = started.elapsed();
         // The first run warms the database's own caches and is not counted.
         if run > 0 {
@@ -163,24 +214,11 @@ async fn slow_create_cost_is_independent_of_repo_size() {
         files: 10_000,
         ..BENCH_TIP
     };
-    let small = measure(&small_params).await;
-    let big = measure(&BENCH_TIP).await;
-    // Wall time is reported, not asserted: it depends on the machine's
-    // load. The store calls are the deterministic measure of cost.
-    let time = |costs: &[Cost]| {
-        median(
-            costs
-                .iter()
-                .map(|c| c.time.as_secs_f64() * 1000.0)
-                .collect(),
-        )
-    };
-    eprintln!(
-        "wall time (ms): 10k-file repo {:.2}, 3M-file repo {:.2}",
-        time(&small),
-        time(&big)
-    );
-    let metrics: [Metric; 5] = [
+    let (small_files, big_files) = pick(&layout(&small_params), &layout(&BENCH_TIP));
+    let small = measure(&small_params, &small_files).await;
+    let big = measure(&BENCH_TIP, &big_files).await;
+    let metrics: [Metric; 6] = [
+        ("wall time (ms)", |c| c.time.as_secs_f64() * 1000.0),
         ("metadata reads", |c| c.counts.meta_gets as f64),
         ("metadata keys read", |c| c.counts.meta_get_keys as f64),
         ("metadata bytes read", |c| c.counts.meta_get_bytes as f64),
