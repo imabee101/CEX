@@ -246,6 +246,7 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
     }
 
     /// How many values this server is deriving now.
+    #[cfg(feature = "testing")]
     pub fn in_flight(&self) -> usize {
         self.inflight.in_flight()
     }

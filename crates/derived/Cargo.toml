@@ -16,8 +16,9 @@ tokio = { workspace = true, features = ["rt", "sync"] }
 zstd = { workspace = true }
 
 [features]
-# Test support: a seeded PRNG and random commit histories.
-testing = []
+# Test support: a seeded PRNG, random commit histories, and in-flight
+# counts. Enabled only by dev-dependencies.
+testing = ["store/testing"]
 
 [dev-dependencies]
 derived = { path = ".", features = ["testing"] }

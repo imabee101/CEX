@@ -84,8 +84,8 @@ impl<K: Eq + Hash + Clone, V: Clone> Coalescer<K, V> {
     }
 
     /// How many keys are in flight.
-    #[cfg(test)]
-    pub(crate) fn in_flight(&self) -> usize {
+    #[cfg(any(test, feature = "testing"))]
+    pub fn in_flight(&self) -> usize {
         self.cells
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

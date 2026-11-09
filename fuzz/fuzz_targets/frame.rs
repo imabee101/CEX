@@ -1,4 +1,6 @@
 //! Fuzzes the frame decoder; see the crate docs for what is checked.
 #![no_main]
 
-libfuzzer_sys::fuzz_target!(|data: &[u8]| fuzz::check_frame(data));
+libfuzzer_sys::fuzz_target!(|data: &[u8]| {
+    let _ = fuzz::check_frame(data);
+});

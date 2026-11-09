@@ -17,6 +17,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use derived::{CacheSizes, Deriver};
@@ -26,7 +27,7 @@ use ops::{CreateOptions, Ops};
 use scion_core::{
     BlobId, Changeset, ChangesetId, ChangesetParts, FileChange, FileKind, RepoPath, Timestamp,
 };
-use store::{BlobStore, MetaStore, RepoId};
+use store::{BlobStore, CasOutcome, MetaStore, RefLogReason, RefUpdate, RepoId, StoreError};
 
 /// Bumped whenever the generator's output changes, so old caches are not
 /// reused.
@@ -279,14 +280,26 @@ pub fn content(p: &BenchParams, f: &FileSpec) -> Vec<u8> {
 /// How many changesets' blobs are uploaded ahead of the create chain.
 const UPLOADS_AHEAD: usize = 6;
 
-/// Builds the tip into the given stores: uploads every file and creates a
-/// chain of changesets adding them; returns the last changeset.
+/// Builds the tip of [`layout`]`(p)` into the given stores; returns it.
 pub async fn generate<M: MetaStore + 'static, B: BlobStore + 'static>(
     p: &BenchParams,
     meta: Arc<M>,
     blobs: Arc<B>,
 ) -> ChangesetId {
-    let files = Arc::new(layout(p));
+    build(p, Arc::new(layout(p)), meta, blobs).await
+}
+
+/// Builds a tip holding `files`, with the contents `p` gives them, into the
+/// given stores: uploads every file and creates a chain of changesets of at
+/// most `p.files_per_changeset` files adding them in order; returns the last
+/// changeset. `files` must be non-empty, with distinct paths, none a prefix
+/// directory of another.
+pub async fn build<M: MetaStore + 'static, B: BlobStore + 'static>(
+    p: &BenchParams,
+    files: Arc<Vec<FileSpec>>,
+    meta: Arc<M>,
+    blobs: Arc<B>,
+) -> ChangesetId {
     let ops = Ops::new(Arc::new(Deriver::new(
         meta.clone(),
         blobs.clone(),
@@ -348,6 +361,31 @@ pub async fn generate<M: MetaStore + 'static, B: BlobStore + 'static>(
         );
     }
     parent.expect("the bench repo has files")
+}
+
+/// Creates the ref `main` pointing at `tip`, recording the current time in
+/// its ref-log row. The CAS expects no `main`, so it fails with
+/// [`CasOutcome::Mismatch`] when one exists.
+pub async fn create_main<M: MetaStore>(
+    meta: &M,
+    tip: ChangesetId,
+) -> Result<CasOutcome, StoreError> {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after 1970");
+    let time_micros = i64::try_from(since_epoch.as_micros()).expect("the clock is before 294,000");
+    meta.update_ref(
+        REPO,
+        &RefUpdate {
+            name: "main",
+            expected: None,
+            new: tip,
+            actor: "scion-bench",
+            time_micros,
+            reason: RefLogReason::Manual,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

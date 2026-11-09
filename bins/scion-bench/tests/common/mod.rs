@@ -3,10 +3,10 @@
 //! [`cached_repo`] builds a repo with [`generate`] once per key: the result
 //! is kept as a Postgres template database and an object-store key prefix,
 //! both named by [`key`], and later calls (from any process) reuse them. The
-//! key covers every input that determines the stored bytes: the generator
-//! version, the parameters, and the version of every storage and derived
-//! format. A format change therefore regenerates the repo; nothing is ever
-//! migrated in place.
+//! key covers every input that determines the stored bytes: the parameters
+//! and every entry of [`format_inputs`], among them the version of every
+//! eager derived type, listed by create itself. A change to any of them
+//! names a new repo, which is generated afresh; nothing is ever migrated.
 //!
 //! Besides the repos processes are using, the dev environment keeps at most
 //! [`MAX_CACHED`]: each use records its time, and the first use in each
@@ -19,40 +19,101 @@
 
 use std::sync::Arc;
 
-use derived::{BlobRecord, CommitGraph, DerivedType, RestrictedRoots, RootTree};
+use derived::{BlobRecord, FRAME_ZSTD_LEVEL};
 use object_store::{ObjectStoreExt, PutPayload};
-use scion_bench::{BenchParams, GENERATOR_VERSION, REPO, generate};
-use scion_core::{CHANGESET_FORMAT_VERSION, ChangesetId, TREE_FORMAT_VERSION};
+use ops::CreateOptions;
+use scion_bench::{BENCH_TIP, BenchParams, GENERATOR_VERSION, generate};
+use scion_core::{
+    CHANGESET_FORMAT_VERSION, CHUNK_BYTES, ChangesetId, FRAME_MAGIC, MAX_TREE_ENTRIES,
+    TREE_FORMAT_VERSION,
+};
 use store::testing::{TEMPLATE_DATABASE, base_config, named_object_store};
-use store::{MetaStore, ObjectBlobStore, PgMetaStore, PgTls, PoolLimits, RefLogReason, RefUpdate};
+use store::{CasOutcome, ObjectBlobStore, PgMetaStore, PgTls, PoolLimits};
 
-/// A short name for the repo `p` builds with this code's formats.
-pub(crate) fn key(p: &BenchParams) -> String {
-    let desc = format!(
-        "generator={GENERATOR_VERSION} seed={} files={} depth={} fanout={} median={:?} sigma={:?} \
-         max={} per={} schema={} changeset={CHANGESET_FORMAT_VERSION} tree={TREE_FORMAT_VERSION} \
-         blob_record={} root_tree={} commit_graph={} restricted_roots={} case_index={}",
-        p.seed,
-        p.files,
-        p.max_depth,
-        p.max_fanout,
-        p.median_size,
-        p.sigma,
-        p.max_size,
-        p.files_per_changeset,
-        store::SCHEMA_VERSION,
-        BlobRecord::VERSION,
-        RootTree::VERSION,
-        CommitGraph::VERSION,
-        RestrictedRoots::VERSION,
-        ops::case::CaseIndex::VERSION,
-    );
+/// The 3M-file repo: the bench tip's layout, with file sizes log-normal
+/// around 64 bytes and at most 4 KiB. Create reads no unchanged file's
+/// content, which the create-cost test asserts, so small contents keep the
+/// fixture within a CI runner's disk without changing what it measures.
+pub(crate) const BIG: BenchParams = BenchParams {
+    median_size: 64.0,
+    sigma: 1.0,
+    max_size: 4096,
+    ..BENCH_TIP
+};
+
+/// A 250-file repo built in changesets of 100 files.
+pub(crate) const SMALL: BenchParams = BenchParams {
+    files: 250,
+    files_per_changeset: 100,
+    ..BENCH_TIP
+};
+
+/// A 250-file repo in one changeset, as `scion-bench gen --files 250` builds.
+pub(crate) const SMALL_GEN: BenchParams = BenchParams {
+    files: 250,
+    ..BENCH_TIP
+};
+
+/// Every repo the tests cache.
+pub(crate) const FIXTURES: [BenchParams; 3] = [BIG, SMALL, SMALL_GEN];
+
+/// Every input besides the parameters that determines the bytes a repo is
+/// stored as: the generator, the storage schema, every format of a stored
+/// record or object, the constants that shape them, and every eager derived
+/// type create writes, as listed by create itself.
+pub(crate) fn format_inputs() -> Vec<(String, String)> {
+    let mut inputs: Vec<(String, String)> = [
+        ("generator", GENERATOR_VERSION.to_string()),
+        ("schema", store::SCHEMA_VERSION.to_string()),
+        ("changeset", CHANGESET_FORMAT_VERSION.to_string()),
+        ("tree", TREE_FORMAT_VERSION.to_string()),
+        ("frame magic", format!("{FRAME_MAGIC:?}")),
+        ("frame zstd level", FRAME_ZSTD_LEVEL.to_string()),
+        ("zstd", zstd::zstd_safe::version_number().to_string()),
+        ("chunk bytes", CHUNK_BYTES.to_string()),
+        ("max tree entries", MAX_TREE_ENTRIES.to_string()),
+        ("max text bytes", ops::blob::MAX_TEXT_BYTES.to_string()),
+        ("text sniff bytes", ops::blob::TEXT_SNIFF_BYTES.to_string()),
+        ("blob record", BlobRecord::VERSION.to_string()),
+        ("unicode", ops::case::UNICODE_VERSION.to_owned()),
+        ("create options", format!("{:?}", CreateOptions::default())),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    let any = ChangesetId::from_bytes([0; 32]);
+    for t in ops::eager_types::<PgMetaStore, ObjectBlobStore>(&CreateOptions::default()) {
+        let k = t.key(any);
+        inputs.push((
+            format!("derived type {}", k.kind),
+            format!("version {} param {}", k.version, k.param),
+        ));
+    }
+    inputs
+}
+
+/// A short name for the repo `p` builds with the format inputs `inputs`.
+pub(crate) fn key_for(p: &BenchParams, inputs: &[(String, String)]) -> String {
+    let mut desc = format!("{p:?}");
+    for (k, v) in inputs {
+        desc.push_str(&format!("\n{k}={v}"));
+    }
     blake3::hash(desc.as_bytes()).to_hex()[..16].to_owned()
 }
 
-/// The most generated repos the dev environment keeps. Three 3M-file repos
-/// and a test database copied from one fit in its Postgres tmpfs.
-pub(crate) const MAX_CACHED: usize = 3;
+/// A short name for the repo `p` builds with this code's formats.
+pub(crate) fn key(p: &BenchParams) -> String {
+    key_for(p, &format_inputs())
+}
+
+/// The most generated repos the dev environment keeps besides those in use:
+/// one per fixture the tests use, so a run of the tests never evicts its own
+/// fixtures, and one more for a branch with other formats. The Postgres
+/// tmpfs in compose.yaml (12 GB) holds them with room for the tests' copies:
+/// a 3M-file repo's database is about 1.6 GB, so even if every cached repo
+/// were one, four take 6.4 GB, leaving 5.6 GB for three concurrent test
+/// copies of one (4.8 GB) and the small databases.
+pub(crate) const MAX_CACHED: usize = FIXTURES.len() + 1;
 
 /// The class of the shared advisory locks that mark a repo in use (the
 /// two-key form, which never collides with the one-key build locks).
@@ -154,19 +215,10 @@ pub(crate) async fn cached_repo(p: &BenchParams) -> CachedRepo {
             let blobs = Arc::new(ObjectBlobStore::new(Arc::new(named_object_store(&prefix))));
             let started = std::time::Instant::now();
             let tip = generate(p, meta.clone(), blobs).await;
-            meta.update_ref(
-                REPO,
-                &RefUpdate {
-                    name: "main",
-                    expected: None,
-                    new: tip,
-                    actor: "scion-bench",
-                    time_micros: 0,
-                    reason: RefLogReason::Manual,
-                },
-            )
-            .await
-            .expect("set main");
+            assert!(matches!(
+                scion_bench::create_main(&*meta, tip).await,
+                Ok(CasOutcome::Updated { .. })
+            ));
             drop(meta);
             eprintln!(
                 "generated bench repo {key} ({} files) in {:?}",
@@ -221,7 +273,7 @@ pub(crate) async fn cached_repo(p: &BenchParams) -> CachedRepo {
 
 /// The key a bench database or key prefix is named by: `bench_<key>`,
 /// `bench_<key>_build`, or `bench-<key>`.
-fn key_of(name: &str) -> Option<&str> {
+pub(crate) fn key_of(name: &str) -> Option<&str> {
     let key = name
         .strip_prefix("bench_")
         .map(|k| k.strip_suffix("_build").unwrap_or(k))
@@ -232,7 +284,7 @@ fn key_of(name: &str) -> Option<&str> {
 /// Which repos to remove: every key but the `keep` most recently used of
 /// those with a complete database, given each key's last use (`None` for a
 /// key with no complete database, such as a build's leftovers).
-fn to_remove(mut uses: Vec<(String, Option<u64>)>, keep: usize) -> Vec<String> {
+pub(crate) fn to_remove(mut uses: Vec<(String, Option<u64>)>, keep: usize) -> Vec<String> {
     uses.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let complete = uses.iter().filter(|(_, used)| used.is_some()).count();
     let mut kept = 0;
@@ -341,77 +393,5 @@ async fn remove_least_recently_used(admin: &tokio_postgres::Client, current: &st
             )
             .await
             .expect("release the repo's locks");
-    }
-}
-
-#[test]
-fn keys_tell_parameter_sets_apart() {
-    use scion_bench::BENCH_TIP;
-    assert_eq!(key(&BENCH_TIP), key(&BENCH_TIP));
-    let keys: std::collections::HashSet<String> = [
-        BENCH_TIP,
-        BenchParams {
-            files: 10_000,
-            ..BENCH_TIP
-        },
-        BenchParams {
-            seed: 1,
-            ..BENCH_TIP
-        },
-        BenchParams {
-            max_depth: 11,
-            ..BENCH_TIP
-        },
-        BenchParams {
-            max_size: 1,
-            ..BENCH_TIP
-        },
-    ]
-    .iter()
-    .map(key)
-    .collect();
-    assert_eq!(keys.len(), 5);
-}
-
-#[test]
-fn keeps_the_most_recently_used_complete_repos() {
-    let uses = |v: &[(&str, Option<u64>)]| {
-        v.iter()
-            .map(|(k, u)| ((*k).to_owned(), *u))
-            .collect::<Vec<_>>()
-    };
-    let mut removed = to_remove(
-        uses(&[
-            ("a", Some(1)),
-            ("b", Some(5)),
-            ("c", None),
-            ("d", Some(3)),
-            ("e", Some(4)),
-        ]),
-        2,
-    );
-    removed.sort();
-    assert_eq!(removed, ["a", "c", "d"]);
-    assert_eq!(to_remove(uses(&[("a", Some(1))]), 3), Vec::<String>::new());
-    assert_eq!(to_remove(uses(&[("a", None)]), 3), ["a"]);
-}
-
-#[test]
-fn bench_names_give_their_key() {
-    let key = "0123456789abcdef";
-    for name in [
-        format!("bench_{key}"),
-        format!("bench_{key}_build"),
-        format!("bench-{key}"),
-    ] {
-        assert_eq!(key_of(&name), Some(key), "{name}");
-    }
-    for name in [
-        "bench_short",
-        "t_1_2_3_4",
-        "bench-0123456789abcdeg",
-        "bench_0123456789abcdef_x",
-    ] {
-        assert_eq!(key_of(name), None, "{name}");
     }
 }

@@ -9,8 +9,8 @@
 //! Postgres or CockroachDB is reached at `--pg-url`, over TLS trusting the
 //! PEM certificates in `--pg-ca`; without `--pg-ca` only a loopback address
 //! is accepted, in plaintext. S3 credentials come from the standard `AWS_*`
-//! environment variables. The tip changeset becomes the ref `main`, and is
-//! printed.
+//! environment variables. The tip changeset becomes the ref `main`, which
+//! must not exist yet, and is printed.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::prefix::PrefixStore;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
-use store::{MetaStore, ObjectBlobStore, PgMetaStore, PgTls, PoolLimits, RefLogReason, RefUpdate};
+use store::{CasOutcome, ObjectBlobStore, PgMetaStore, PgTls, PoolLimits};
 
 #[derive(Parser)]
 #[command(about = "Generates the Scion bench repo")]
@@ -100,18 +100,9 @@ async fn generate(args: Gen) -> Result {
         args.s3_prefix.as_str(),
     ))));
     let tip = scion_bench::generate(&params, meta.clone(), blobs).await;
-    meta.update_ref(
-        scion_bench::REPO,
-        &RefUpdate {
-            name: "main",
-            expected: None,
-            new: tip,
-            actor: "scion-bench",
-            time_micros: 0,
-            reason: RefLogReason::Manual,
-        },
-    )
-    .await?;
+    if let CasOutcome::Mismatch { .. } = scion_bench::create_main(&*meta, tip).await? {
+        return Err("the repo already has a `main` ref".into());
+    }
     println!("{tip}");
     Ok(())
 }
