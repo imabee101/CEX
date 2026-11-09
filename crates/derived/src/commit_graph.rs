@@ -4,10 +4,11 @@
 //! parents in the skip tree. Ancestry queries over these cost O(log n) jumps.
 
 use bytes::Bytes;
+use scion_core::wire::put_uvarint;
 use scion_core::{Changeset, ChangesetId};
 use store::{BlobStore, MetaStore};
 
-use crate::codec::{Reader, put_uvarint};
+use crate::codec::decode;
 use crate::{DeriveCx, DeriveError, DerivedType, Mode, kinds};
 
 /// The CommitGraph type.
@@ -61,31 +62,30 @@ impl GraphNode {
 
     /// Decodes stored bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, DeriveError> {
-        let mut r = Reader::new(bytes, "CommitGraph value");
-        let n = r.count(32)?;
-        let mut parents = Vec::with_capacity(n);
-        for _ in 0..n {
-            parents.push(ChangesetId::from_bytes(r.array32()?));
-        }
-        let generation = r.uvarint()?;
-        let p1_depth = r.uvarint()?;
-        let p1_skew = ChangesetId::from_bytes(r.array32()?);
-        let skip_depth = r.uvarint()?;
-        let skip_parent = match r.u8()? {
-            0 => None,
-            1 => Some(ChangesetId::from_bytes(r.array32()?)),
-            _ => return Err(DeriveError::DataLoss("bad CommitGraph option tag".into())),
-        };
-        let skip_skew = ChangesetId::from_bytes(r.array32()?);
-        r.finish()?;
-        Ok(Self {
-            parents,
-            generation,
-            p1_depth,
-            p1_skew,
-            skip_depth,
-            skip_parent,
-            skip_skew,
+        decode("CommitGraph value", bytes, |r| {
+            let n = r.count(32)?;
+            let mut parents = Vec::with_capacity(n);
+            for _ in 0..n {
+                parents.push(ChangesetId::from_bytes(r.array32()?));
+            }
+            let generation = r.uvarint()?;
+            let p1_depth = r.uvarint()?;
+            let p1_skew = ChangesetId::from_bytes(r.array32()?);
+            let skip_depth = r.uvarint()?;
+            let skip_parent = match r.opt_tag()? {
+                false => None,
+                true => Some(ChangesetId::from_bytes(r.array32()?)),
+            };
+            let skip_skew = ChangesetId::from_bytes(r.array32()?);
+            Ok(Self {
+                parents,
+                generation,
+                p1_depth,
+                p1_skew,
+                skip_depth,
+                skip_parent,
+                skip_skew,
+            })
         })
     }
 }

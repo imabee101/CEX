@@ -9,65 +9,51 @@ use bytes::Bytes;
 use common::*;
 use scion_core::{FileKind, MAX_TREE_ENTRIES};
 
-const PATHS: &[&str] = &[
-    "a", "b", "a.txt", "d/a", "d/b", "d/e/f", "d/e/g", "d/e/h/i", "x/y/z/w", "x/y/q", "Q", "d/e",
-    "x/y", "x", "d/e/h",
-];
-
-/// Random histories over paths that turn files into directories and back;
-/// after each changeset the derived root equals the reference root.
-#[tokio::test]
-async fn random_histories_match_the_reference_builder() {
+/// Random histories, with merges, over random paths at random depths whose
+/// files become directories and back, and a directory whose size crosses
+/// `MAX_TREE_ENTRIES` both ways; after each changeset the derived root
+/// equals the reference root of its files.
+async fn random_histories_match(seeds: std::ops::Range<u64>, wide: u64) {
     let env = env().await;
     let ops = ops(&env.meta, &env.blobs);
-    for seed in 0..6u64 {
-        let mut rng = Rng(seed);
-        let mut model = Model::default();
-        let mut parent = None;
-        let mut done = 0;
-        while done < 12 {
-            let mut changes: Vec<OwnedSpec> = Vec::new();
-            let mut next = model.clone();
-            for _ in 0..1 + rng.below(4) {
-                let p = PATHS[rng.below(PATHS.len() as u64) as usize];
-                if changes.iter().any(|(q, _)| q == p) {
-                    continue;
-                }
-                let c = if next.files.contains_key(p.as_bytes()) && rng.below(2) == 0 {
-                    None
-                } else {
-                    let kind = [FileKind::Regular, FileKind::Executable, FileKind::Symlink]
-                        [rng.below(3) as usize];
-                    Some((kind, format!("{seed}-{}", rng.below(3)).into_bytes()))
-                };
-                changes.push((p.to_owned(), c));
-            }
-            let spec: Vec<Spec<'_>> = changes
-                .iter()
-                .map(|(p, c)| (p.as_str(), c.as_ref().map(|(k, b)| (*k, b.as_slice()))))
-                .collect();
-            let (fc, contents) = next.apply(&spec);
-            let parents: Vec<_> = parent.into_iter().collect();
-            match commit(&ops, &parents, &format!("{seed}/{done}"), fc, &contents).await {
-                Ok(id) => {
-                    assert_eq!(
-                        root_of(&ops, id).await,
-                        next.root(),
-                        "seed {seed} step {done}"
-                    );
-                    model = next;
-                    parent = Some(id);
-                    done += 1;
-                }
-                // Invalid random change sets (no-ops, file/dir conflicts)
-                // are rejected; the model is left as it was.
-                Err(e) => assert!(
-                    matches!(e.code, ops::Code::NoOpChange | ops::Code::PathConflict),
-                    "seed {seed}: {e}"
-                ),
+    let max = MAX_TREE_ENTRIES;
+    // (size in the first parent, size in the child) of the wide directory.
+    let mut steps = std::collections::BTreeSet::new();
+    for seed in seeds {
+        let mut rng = Rng(0x7eee_0000 + seed);
+        let label = format!("seed {seed}");
+        let h = random_history(&ops, &mut rng, 40, (6, wide), &label).await;
+        let size = |m: &Model| {
+            m.files
+                .keys()
+                .filter(|p| p.starts_with(format!("{WIDE_DIR}/").as_bytes()))
+                .count()
+        };
+        for (i, (id, model)) in h.steps.iter().enumerate() {
+            assert_eq!(root_of(&ops, *id).await, model.root(), "{label} step {i}");
+            if let Some(p) = h.first_parents[i] {
+                steps.insert((size(&h.steps[p].1), size(model)));
             }
         }
     }
+    if wide > 0 {
+        // The directory splits, and collapses back to a flat node.
+        assert!(
+            steps.iter().any(|&(a, b)| a <= max && b > max)
+                && steps.iter().any(|&(a, b)| a > max && b <= max),
+            "the wide directory did not cross the split both ways: {steps:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn random_histories_match_the_reference_builder() {
+    random_histories_match(0..8, 0).await;
+}
+
+#[tokio::test]
+async fn random_histories_across_the_split_match_the_reference_builder() {
+    random_histories_match(0..3, MAX_TREE_ENTRIES as u64 + 4).await;
 }
 
 /// Two different histories that end with the same files end with the same
@@ -140,6 +126,10 @@ async fn sharded_directories_match_the_reference_builder() {
             .concat()[..max as usize * 2 - 3990]
                 .to_vec(),
         ),
+        // One past the maximum again, then back to exactly the maximum: the
+        // node splits, then collapses to one flat node of the most names.
+        (names(20_000..20_095, "x"), vec![]),
+        (vec![], names(20_000..20_001, "x")),
     ];
     for (i, (writes, deletes)) in steps.into_iter().enumerate() {
         let content = format!("v{i}");
@@ -162,7 +152,7 @@ async fn sharded_directories_match_the_reference_builder() {
         .keys()
         .filter(|k| k.starts_with(b"big/"))
         .count();
-    assert!(big <= MAX_TREE_ENTRIES && big > 0, "{big}");
+    assert_eq!(big, MAX_TREE_ENTRIES);
 }
 
 /// A deleted file can come back unchanged and the tree returns to its old id.

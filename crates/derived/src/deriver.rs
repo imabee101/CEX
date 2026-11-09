@@ -4,7 +4,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
 use scion_core::{Changeset, ChangesetId, Codec, Frame, FrameId, Tree, TreeId};
@@ -31,6 +34,10 @@ pub const MAX_DERIVE_PER_REQUEST: usize = 4096;
 /// The most ancestors lacking a value that one request explores; a value
 /// needing more fails with [`DeriveError::LimitExceeded`].
 pub const MAX_DERIVE_EXPLORE: usize = 1 << 16;
+
+/// One key's in-flight entry as a batch holds it: the coalesced computation
+/// of its value.
+type Entry<'a> = Pin<Box<dyn Future<Output = Result<Bytes, DeriveError>> + Send + 'a>>;
 
 /// The most frame writes one derivation has in flight.
 pub const FRAME_WRITES: usize = 32;
@@ -238,6 +245,11 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
         &self.blobs
     }
 
+    /// How many values this server is deriving now.
+    pub fn in_flight(&self) -> usize {
+        self.inflight.in_flight()
+    }
+
     /// The tree cache.
     pub fn tree_cache(&self) -> &TreeCache {
         &self.trees
@@ -294,7 +306,8 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
     /// The ancestors lacking a value are found level by level from `cs`,
     /// with one batched read of changesets and one of values per level, and
     /// the search stops at ancestors that have one. They are then derived
-    /// parents first. One call derives at most [`MAX_DERIVE_PER_REQUEST`]
+    /// parents first, [`DERIVE_BATCH`] at a time, the values a batch computes
+    /// written together. One call derives at most [`MAX_DERIVE_PER_REQUEST`]
     /// changesets; a value needing more is [`DeriveError::Pending`] until the
     /// background deriver (or a backfill) has derived the history.
     pub async fn get<T: DerivedType>(
@@ -324,9 +337,7 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
                 .chunks(DERIVE_BATCH)
                 .take(MAX_DERIVE_PER_REQUEST / DERIVE_BATCH)
             {
-                for (id, changeset) in chunk.iter().zip(self.changesets(repo, chunk).await?) {
-                    self.derive_one(repo, t, *id, &changeset).await?;
-                }
+                self.derive_batch(repo, t, chunk).await?;
             }
             if order.len() > MAX_DERIVE_PER_REQUEST {
                 let key = t.key(cs);
@@ -473,6 +484,125 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
             .collect()
     }
 
+    /// Derives and stores the values of `chunk`, at most [`DERIVE_BATCH`]
+    /// changesets in parents-first order whose other ancestors have their
+    /// values stored, writing the values it computes together: one
+    /// [`Deriver::write`] (tree frames, then one metadata transaction holding
+    /// every new tree node and value) per run of them. So a request that
+    /// stops between batches has stored exactly the batches it finished.
+    ///
+    /// Concurrent derivations of one key on this server are coalesced
+    /// (INV-20). The batch first registers an in-flight entry for each key
+    /// it lacks, claiming those that no other request has in flight. It
+    /// computes its claimed keys in order; at a key another request has in
+    /// flight, it first writes and publishes what it has computed, then
+    /// awaits that key's result. A request therefore waits only for keys it
+    /// needs, and never while holding a computed value another request may
+    /// need. A batch that fails or is cancelled drops its entries, and a
+    /// request waiting on one of them derives that key itself.
+    async fn derive_batch(
+        &self,
+        repo: RepoId,
+        t: &dyn AnyType<M, B>,
+        chunk: &[ChangesetId],
+    ) -> Result<(), DeriveError> {
+        let keys: Vec<DerivedKey> = chunk.iter().map(|id| t.key(*id)).collect();
+        let stored = self.lookup_many(repo, &keys).await?;
+        let todo: Vec<ChangesetId> = chunk
+            .iter()
+            .zip(stored)
+            .filter(|(_, v)| v.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        if todo.is_empty() {
+            return Ok(());
+        }
+        let changesets = self.changesets(repo, &todo).await?;
+        // While set, an entry whose computation this request runs is a key
+        // claimed for this batch, whose value the batch sends once it is
+        // stored. Afterwards, an entry this request comes to run, because
+        // the batch that had it failed, derives its key alone.
+        let claiming = AtomicBool::new(true);
+        let claimed: Vec<AtomicBool> = todo.iter().map(|_| AtomicBool::new(false)).collect();
+        let mut senders = Vec::with_capacity(todo.len());
+        let mut entries: Vec<Entry<'_>> = Vec::with_capacity(todo.len());
+        for (i, (id, cs)) in todo.iter().zip(&changesets).enumerate() {
+            let (tx, rx) = tokio::sync::oneshot::channel::<Bytes>();
+            senders.push(Some(tx));
+            let (claiming, claimed) = (&claiming, &claimed[i]);
+            entries.push(Box::pin(self.inflight.run(
+                (repo, t.key(*id)),
+                move || async move {
+                    claimed.store(true, Ordering::Relaxed);
+                    if claiming.load(Ordering::Relaxed) {
+                        rx.await.map_err(|_| {
+                            DeriveError::Internal("a batch ended without its value".into())
+                        })
+                    } else {
+                        self.derive_alone(repo, t, *id, cs).await
+                    }
+                },
+            )));
+        }
+        // Register every entry now: one poll creates it, or joins another
+        // request's, without waiting.
+        let mut ready: Vec<Poll<Result<Bytes, DeriveError>>> = entries
+            .iter_mut()
+            .map(|e| e.as_mut().poll(&mut Context::from_waker(Waker::noop())))
+            .collect();
+        claiming.store(false, Ordering::Relaxed);
+
+        let mut cx = self.cx(repo);
+        let mut computed: Vec<(usize, Bytes)> = Vec::new();
+        for i in 0..todo.len() {
+            match std::mem::replace(&mut ready[i], Poll::Pending) {
+                // Stored by another request on this server already.
+                Poll::Ready(value) => {
+                    value?;
+                }
+                Poll::Pending if claimed[i].load(Ordering::Relaxed) => {
+                    let value = t.derive_any(&mut cx, todo[i], &changesets[i]).await?;
+                    cx.set_value(t.key(todo[i]), value.clone());
+                    computed.push((i, value));
+                }
+                Poll::Pending => {
+                    self.publish(cx, &mut computed, &mut senders, &mut entries)
+                        .await?;
+                    cx = self.cx(repo);
+                    entries[i].as_mut().await?;
+                }
+            }
+        }
+        self.publish(cx, &mut computed, &mut senders, &mut entries)
+            .await
+    }
+
+    /// Writes a batch's computed values, sends each to its in-flight entry,
+    /// and completes those entries, so requests awaiting them get values
+    /// that are stored.
+    async fn publish(
+        &self,
+        cx: DeriveCx<'_, M, B>,
+        computed: &mut Vec<(usize, Bytes)>,
+        senders: &mut [Option<tokio::sync::oneshot::Sender<Bytes>>],
+        entries: &mut [Entry<'_>],
+    ) -> Result<(), DeriveError> {
+        if computed.is_empty() {
+            return Ok(());
+        }
+        self.write(cx, Vec::new()).await?;
+        for (i, value) in computed.drain(..) {
+            let sent = senders[i].take().map(|tx| tx.send(value));
+            if !matches!(sent, Some(Ok(()))) {
+                return Err(DeriveError::Internal(
+                    "a claimed entry stopped waiting for its value".into(),
+                ));
+            }
+            entries[i].as_mut().await?;
+        }
+        Ok(())
+    }
+
     /// Derives and stores one value whose parents' values are stored,
     /// sharing the work with any concurrent derivation of the same key on
     /// this server.
@@ -486,25 +616,36 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
         let key = t.key(id);
         let value = self
             .inflight
-            .run((repo, key), || async {
-                // Another server may have stored it since we looked.
-                if let Some(v) = self
-                    .meta
-                    .get(repo, &[MetaKey::Derived(key)])
-                    .await?
-                    .pop()
-                    .flatten()
-                {
-                    return Ok(v);
-                }
-                let mut cx = self.cx(repo);
-                let value = t.derive_any(&mut cx, id, cs).await?;
-                cx.set_value(key, value.clone());
-                self.write(cx, Vec::new()).await?;
-                Ok::<Bytes, DeriveError>(value)
-            })
+            .run((repo, key), || self.derive_alone(repo, t, id, cs))
             .await?;
         self.values.insert((repo, key), value.clone());
+        Ok(value)
+    }
+
+    /// Derives and stores one value whose parents' values are stored, in a
+    /// computation of its in-flight entry.
+    async fn derive_alone(
+        &self,
+        repo: RepoId,
+        t: &dyn AnyType<M, B>,
+        id: ChangesetId,
+        cs: &Changeset,
+    ) -> Result<Bytes, DeriveError> {
+        let key = t.key(id);
+        // Another server may have stored it since we looked.
+        if let Some(v) = self
+            .meta
+            .get(repo, &[MetaKey::Derived(key)])
+            .await?
+            .pop()
+            .flatten()
+        {
+            return Ok(v);
+        }
+        let mut cx = self.cx(repo);
+        let value = t.derive_any(&mut cx, id, cs).await?;
+        cx.set_value(key, value.clone());
+        self.write(cx, Vec::new()).await?;
         Ok(value)
     }
 

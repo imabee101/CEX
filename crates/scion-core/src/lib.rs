@@ -178,7 +178,7 @@ mod frame;
 mod id;
 mod path;
 mod tree;
-mod wire;
+pub mod wire;
 
 pub use changeset::{
     Changeset, ChangesetParts, Committer, FileChange, FileKind, Timestamp, UTC_OFFSET_LIMIT_SECONDS,

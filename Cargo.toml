@@ -90,3 +90,9 @@ debug = "line-tables-only"
 
 [profile.test.package."*"]
 opt-level = 2
+
+# The tree and changeset codecs run millions of times in the encoding and
+# model tests; optimized, they keep those tests fast. Debug assertions and
+# overflow checks stay on.
+[profile.test.package.scion-core]
+opt-level = 2
