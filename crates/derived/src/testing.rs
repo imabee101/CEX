@@ -195,7 +195,7 @@ fn overlapping_features(h: &mut History, n: usize, rng: &mut Rng) {
 
 fn long_lived(h: &mut History, n: usize, rng: &mut Rng) {
     let root = h.add(vec![]);
-    let mut tips = vec![root; 16];
+    let mut tips = [root; 16];
     while h.len() < n {
         let b = rng.index(tips.len());
         let c = rng.index(tips.len());
