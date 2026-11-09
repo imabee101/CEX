@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS blobs (
     bytes BYTEA NOT NULL,
     PRIMARY KEY (repo, id)
 );
+CREATE TABLE IF NOT EXISTS case_nodes (
+    repo INT8 NOT NULL,
+    id BYTEA NOT NULL CHECK (length(id) = 32),
+    bytes BYTEA NOT NULL,
+    PRIMARY KEY (repo, id)
+);
 CREATE TABLE IF NOT EXISTS derived (
     repo INT8 NOT NULL,
     kind INT4 NOT NULL,
@@ -512,12 +518,13 @@ type IdColumns<'a> = (Vec<&'a [u8]>, Vec<&'a [u8]>);
 type IdToKey = fn([u8; 32]) -> MetaKey;
 
 /// The tables keyed by `(repo, id)`, with the key each row id makes.
-const ID_TABLES: [(&str, IdToKey); 3] = [
+const ID_TABLES: [(&str, IdToKey); 4] = [
     ("blobs", |id| MetaKey::Blob(BlobId::from_bytes(id))),
     ("changesets", |id| {
         MetaKey::Changeset(ChangesetId::from_bytes(id))
     }),
     ("trees", |id| MetaKey::Tree(TreeId::from_bytes(id))),
+    ("case_nodes", |id| MetaKey::CaseNode(TreeId::from_bytes(id))),
 ];
 
 /// The index into [`ID_TABLES`] and the id bytes of a key, or `None` for
@@ -527,6 +534,7 @@ fn id_key(key: &MetaKey) -> Option<(usize, &[u8])> {
         MetaKey::Blob(id) => Some((0, id.as_bytes())),
         MetaKey::Changeset(id) => Some((1, id.as_bytes())),
         MetaKey::Tree(id) => Some((2, id.as_bytes())),
+        MetaKey::CaseNode(id) => Some((3, id.as_bytes())),
         MetaKey::Derived(_) => None,
     }
 }

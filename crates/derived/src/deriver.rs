@@ -67,7 +67,7 @@ pub trait DerivedType: Send + Sync {
 /// Sizes of a [`Deriver`]'s RAM caches, in bytes.
 #[derive(Clone, Copy, Debug)]
 pub struct CacheSizes {
-    /// Decoded tree nodes.
+    /// Decoded tree and private index nodes, split evenly between their caches.
     pub trees: u64,
     /// Derived values.
     pub values: u64,
@@ -95,6 +95,7 @@ pub struct Deriver<M, B> {
     meta: Arc<M>,
     blobs: Arc<B>,
     trees: TreeCache,
+    case_nodes: TreeCache,
     values: moka::sync::Cache<(RepoId, DerivedKey), Bytes>,
     changesets: moka::sync::Cache<(RepoId, ChangesetId), Arc<Changeset>>,
     inflight: Inflight,
@@ -113,8 +114,12 @@ pub struct DeriveCx<'d, M, B> {
     deriver: &'d Deriver<M, B>,
     repo: RepoId,
     values: HashMap<DerivedKey, Bytes>,
+    inputs: HashMap<DerivedKey, Bytes>,
     /// Tree nodes loaded and built by this derivation.
     pub trees: TreeWork<'d, M>,
+    /// Private case-index nodes, with a separate cache and metadata namespace.
+    /// These never produce object frames.
+    pub case_nodes: TreeWork<'d, M>,
 }
 
 impl<M, B> std::fmt::Debug for DeriveCx<'_, M, B> {
@@ -142,6 +147,11 @@ impl<'d, M: MetaStore, B: BlobStore> DeriveCx<'d, M, B> {
         self.values.insert(key, value);
     }
 
+    /// Supplies an already stored input without writing it again.
+    pub fn set_input(&mut self, key: DerivedKey, value: Bytes) {
+        self.inputs.insert(key, value);
+    }
+
     /// A value of type `t` for `cs`: computed here, stored, or derived now
     /// (with its underived ancestors first).
     pub async fn value<T: DerivedType>(
@@ -149,7 +159,11 @@ impl<'d, M: MetaStore, B: BlobStore> DeriveCx<'d, M, B> {
         t: &T,
         cs: ChangesetId,
     ) -> Result<Bytes, DeriveError> {
-        if let Some(v) = self.values.get(&t.key(cs)) {
+        if let Some(v) = self
+            .values
+            .get(&t.key(cs))
+            .or_else(|| self.inputs.get(&t.key(cs)))
+        {
             return Ok(v.clone());
         }
         let deriver = self.deriver;
@@ -167,7 +181,8 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
         Self {
             meta,
             blobs,
-            trees: TreeCache::new(sizes.trees),
+            trees: TreeCache::new(sizes.trees / 2 + sizes.trees % 2),
+            case_nodes: TreeCache::new(sizes.trees / 2),
             values: moka::sync::Cache::builder()
                 .max_capacity(sizes.values)
                 .weigher(|_, v: &Bytes| u32::try_from(v.len() + 64).unwrap_or(u32::MAX))
@@ -211,7 +226,9 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
             deriver: self,
             repo,
             values: HashMap::new(),
+            inputs: HashMap::new(),
             trees: TreeWork::new(&*self.meta, &self.trees, repo),
+            case_nodes: TreeWork::private(&*self.meta, &self.case_nodes, repo),
         }
     }
 
@@ -371,12 +388,18 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
     ) -> Result<(), DeriveError> {
         let repo = cx.repo;
         let new = cx.trees.take_new();
+        let case_nodes = cx.case_nodes.take_new();
         self.write_tree_frames(repo, &new).await?;
         let mut rows: Vec<(MetaKey, Bytes)> = new
             .iter()
             .map(|(id, t)| (MetaKey::Tree(*id), Bytes::from(t.encode())))
             .collect();
         rows.extend(extra);
+        rows.extend(
+            case_nodes
+                .iter()
+                .map(|(id, t)| (MetaKey::CaseNode(*id), Bytes::from(t.encode()))),
+        );
         let values: BTreeMap<DerivedKey, Bytes> = cx.values.drain().collect();
         rows.extend(
             values
@@ -386,6 +409,9 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
         self.meta.put(repo, &rows).await?;
         for (id, t) in new {
             self.trees.insert(repo, id, t);
+        }
+        for (id, t) in case_nodes {
+            self.case_nodes.insert(repo, id, t);
         }
         for (k, v) in values {
             self.values.insert((repo, k), v);

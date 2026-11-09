@@ -24,12 +24,14 @@ pub enum Code {
     DataLoss,
     /// `UNAVAILABLE`.
     Unavailable,
+    /// `ACL_PENDING`: the requested ACL version has not been backfilled.
+    AclPending,
 }
 
 impl Code {
     /// Whether a retry of the same request may succeed.
     pub fn retryable(self) -> bool {
-        matches!(self, Self::Unavailable)
+        matches!(self, Self::Unavailable | Self::AclPending)
     }
 }
 
@@ -106,11 +108,11 @@ impl From<DeriveError> for OpError {
 mod tests {
     use super::*;
 
-    /// Of the codes ops returns, only `UNAVAILABLE` is retryable (CLAUDE.md
+    /// Of the codes ops returns, `UNAVAILABLE` and `ACL_PENDING` are retryable (AGENTS.md
     /// lists `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `LAND_RETRIES_EXHAUSTED`,
     /// and `ACL_PENDING`).
     #[test]
-    fn only_unavailable_is_retryable() {
+    fn only_unavailable_and_acl_pending_are_retryable() {
         use Code::*;
         for c in [
             InvalidArgument,
@@ -125,6 +127,7 @@ mod tests {
             assert!(!c.retryable(), "{c:?}");
         }
         assert!(Unavailable.retryable());
+        assert!(AclPending.retryable());
     }
 
     #[test]

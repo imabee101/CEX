@@ -377,7 +377,22 @@ pub async fn cached_repo(p: &BenchParams) -> CachedRepo {
         .expect("query")
         .is_empty();
     let tip = match (exists, marker(&prefix).await) {
-        (true, Some(tip)) => tip,
+        (true, Some(tip)) => {
+            // Reuse the generated history, upgrading storage and backfilling
+            // versioned indexes before handing the snapshot to timed creates.
+            // This is setup work, never part of CreateChangeset's cost.
+            let mut config = base_config();
+            config.dbname(&template);
+            let meta = Arc::new(PgMetaStore::new(config, 32).expect("store"));
+            meta.migrate().await.expect("migrate cached repo");
+            let blobs = Arc::new(ObjectBlobStore::new(Arc::new(named_object_store(&prefix))));
+            let deriver = Deriver::new(meta, blobs, CacheSizes::default());
+            deriver
+                .get(REPO, &ops::case::CaseIndex, tip)
+                .await
+                .expect("backfill cached case index");
+            tip
+        }
         (exists, _) => {
             if exists {
                 admin

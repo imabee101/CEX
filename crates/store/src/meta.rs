@@ -38,13 +38,16 @@ pub struct DerivedKey {
 /// The key of an immutable metadata record.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum MetaKey {
-    /// A blob's record: its size, SHA-256, and, when imported, git SHA-1.
+    /// A blob's record: its size, SHA-256, text classification, and, when
+    /// imported, git SHA-1.
     /// Written only after the blob's frames are in blob storage.
     Blob(BlobId),
     /// A changeset's canonical bytes.
     Changeset(ChangesetId),
     /// A tree node's canonical bytes.
     Tree(TreeId),
+    /// A private case-index node. Never exposed as a tree or object frame.
+    CaseNode(TreeId),
     /// A derived value.
     Derived(DerivedKey),
 }

@@ -6,11 +6,13 @@ use std::time::Duration;
 use store::testing::TestDatabase;
 use store::{MetaStore, PgMetaStore, RepoId};
 
-/// Backend pids connected to `db`, other than the observing connection.
+/// Client backend pids connected to `db`, other than the observer. Server
+/// workers (for example autovacuum) are not connections in the tested pool.
 async fn backends(observer: &tokio_postgres::Client, db: &TestDatabase) -> Vec<i32> {
     let mut pids: Vec<i32> = observer
         .query(
-            "SELECT pid FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+            "SELECT pid FROM pg_stat_activity WHERE datname = $1 \
+             AND backend_type = 'client backend' AND pid <> pg_backend_pid()",
             &[&db.name()],
         )
         .await
@@ -53,7 +55,11 @@ async fn calls_succeed_after_the_server_closes_pooled_connections() {
         .unwrap()
         .get(0);
     assert!(terminated, "backend not terminated");
-    assert!(backends(&observer, &db).await.is_empty());
+    let remaining = backends(&observer, &db).await;
+    assert!(
+        remaining.is_empty(),
+        "client backends remain: {remaining:?}"
+    );
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(store.get_ref(RepoId(1), "main").await.unwrap(), None);
     let new = backends(&observer, &db).await;
