@@ -198,10 +198,15 @@ fn hand_root(m: &Model) -> ([u8; 32], Vec<Vec<u8>>) {
     (id, seen)
 }
 
-/// Checks the decoder: each node decodes and re-encodes to itself, and a
-/// sample of one-byte changes never decodes to the same canonical bytes.
-fn check_canonical(nodes: &[Vec<u8>]) {
+/// Checks the decoder on the first 64 nodes: each decodes and re-encodes to
+/// itself, and a sample of one-byte changes never decodes to the same
+/// canonical bytes. A node whose bytes are in `checked` (by hash) passed
+/// these checks already, and checking the same bytes again cannot fail.
+fn check_canonical(nodes: &[Vec<u8>], checked: &mut std::collections::HashSet<[u8; 32]>) {
     for b in nodes.iter().take(64) {
+        if !checked.insert(*blake3::hash(b).as_bytes()) {
+            continue;
+        }
         let t = Tree::decode(b).expect("hand-encoded node must decode");
         assert_eq!(&t.encode(), b, "decoder accepted, re-encoding differs");
         assert_eq!(*t.id().as_bytes(), blake3::derive_key("scion v1 tree", b));
@@ -230,6 +235,8 @@ struct Repo {
     ops: ops::Ops<store::PgMetaStore, store::ObjectBlobStore>,
     model: Model,
     tip: Option<ChangesetId>,
+    /// The node bytes [`check_canonical`] has checked, by hash.
+    checked: std::collections::HashSet<[u8; 32]>,
     _env: common::Env,
 }
 
@@ -240,6 +247,7 @@ impl Repo {
             ops: ops(&e.meta, &e.blobs),
             model: Model::default(),
             tip: None,
+            checked: Default::default(),
             _env: e,
         }
     }
@@ -263,7 +271,7 @@ impl Repo {
             want,
             "{label}: root id differs from hand derivation"
         );
-        check_canonical(&nodes);
+        check_canonical(&nodes, &mut self.checked);
         got
     }
 }
@@ -403,7 +411,7 @@ fn hand_vectors_are_fixed() {
         &mut seen,
     );
     let nested = node_id(&[(b"d".to_vec(), E::Dir(one))], &mut seen);
-    check_canonical(&seen);
+    check_canonical(&seen, &mut Default::default());
     // Each equals derive_key("scion v1 tree", bytes) over the bytes below.
     assert_eq!(seen[0], [0x01, 0x00]);
     assert_eq!(seen[1][..5], [0x01, 0x01, 0x01, b'a', 0x02]);
