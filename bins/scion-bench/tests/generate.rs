@@ -23,6 +23,13 @@ const SMALL: BenchParams = BenchParams {
 /// The tip of `SMALL` for `GENERATOR_VERSION` 2.
 const SMALL_TIP: &str = "eaf9830712e2343c5264065184f19e3c5c6f84383a21b80bf0fd5287ce8f612f";
 
+fn now_micros() -> i64 {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    i64::try_from(since_epoch.as_micros()).unwrap()
+}
+
 async fn template_oid(template: &str) -> u32 {
     let mut config = base_config();
     config.dbname("postgres");
@@ -152,19 +159,23 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
     let target = TestDatabase::create().await;
     let (endpoint, bucket, env) = store::testing::s3_env();
     let prefix = store::testing::unique_name();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_scion-bench"))
-        .args(["gen", "--files", "250", "--pg-url", &target.url()])
-        .args([
-            "--s3-endpoint",
-            &endpoint,
-            "--s3-bucket",
-            &bucket,
-            "--s3-prefix",
-            &prefix,
-        ])
-        .envs(env)
-        .output()
-        .unwrap();
+    let gen_250 = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_scion-bench"))
+            .args(["gen", "--files", "250", "--pg-url", &target.url()])
+            .args([
+                "--s3-endpoint",
+                &endpoint,
+                "--s3-bucket",
+                &bucket,
+                "--s3-prefix",
+                &prefix,
+            ])
+            .envs(env.clone())
+            .output()
+            .unwrap()
+    };
+    let started = now_micros();
+    let out = gen_250();
     assert!(
         out.status.success(),
         "{}",
@@ -189,6 +200,19 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
         built.get_ref(REPO, "main").await.unwrap().unwrap().target,
         full.tip
     );
+    // Its ref-log row records when `main` was created.
+    let log = built.ref_log(REPO, "main", 0, 10).await.unwrap();
+    assert_eq!(log.len(), 1);
+    assert!(
+        (started..=now_micros()).contains(&log[0].time_micros),
+        "ref-log time {} is not the time of the run",
+        log[0].time_micros
+    );
+    // Run again, it finds `main` and fails, leaving the ref log as it was.
+    let again = gen_250();
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already has a `main`"));
+    assert_eq!(built.ref_log(REPO, "main", 0, 10).await.unwrap(), log);
     let given = Arc::new(ObjectBlobStore::new(Arc::new(
         store::testing::named_object_store(&prefix),
     )));

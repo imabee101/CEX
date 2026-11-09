@@ -17,6 +17,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use derived::{CacheSizes, Deriver};
@@ -26,7 +27,7 @@ use ops::{CreateOptions, Ops};
 use scion_core::{
     BlobId, Changeset, ChangesetId, ChangesetParts, FileChange, FileKind, RepoPath, Timestamp,
 };
-use store::{BlobStore, MetaStore, RepoId};
+use store::{BlobStore, CasOutcome, MetaStore, RefLogReason, RefUpdate, RepoId, StoreError};
 
 /// Bumped whenever the generator's output changes, so old caches are not
 /// reused.
@@ -348,6 +349,31 @@ pub async fn generate<M: MetaStore + 'static, B: BlobStore + 'static>(
         );
     }
     parent.expect("the bench repo has files")
+}
+
+/// Creates the ref `main` pointing at `tip`, recording the current time in
+/// its ref-log row. The CAS expects no `main`, so it fails with
+/// [`CasOutcome::Mismatch`] when one exists.
+pub async fn create_main<M: MetaStore>(
+    meta: &M,
+    tip: ChangesetId,
+) -> Result<CasOutcome, StoreError> {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after 1970");
+    let time_micros = i64::try_from(since_epoch.as_micros()).expect("the clock is before 294,000");
+    meta.update_ref(
+        REPO,
+        &RefUpdate {
+            name: "main",
+            expected: None,
+            new: tip,
+            actor: "scion-bench",
+            time_micros,
+            reason: RefLogReason::Manual,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

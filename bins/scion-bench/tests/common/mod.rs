@@ -21,10 +21,10 @@ use std::sync::Arc;
 
 use derived::{BlobRecord, CommitGraph, DerivedType, RestrictedRoots, RootTree};
 use object_store::{ObjectStoreExt, PutPayload};
-use scion_bench::{BenchParams, GENERATOR_VERSION, REPO, generate};
+use scion_bench::{BenchParams, GENERATOR_VERSION, generate};
 use scion_core::{CHANGESET_FORMAT_VERSION, ChangesetId, TREE_FORMAT_VERSION};
 use store::testing::{TEMPLATE_DATABASE, base_config, named_object_store};
-use store::{MetaStore, ObjectBlobStore, PgMetaStore, PgTls, PoolLimits, RefLogReason, RefUpdate};
+use store::{CasOutcome, ObjectBlobStore, PgMetaStore, PgTls, PoolLimits};
 
 /// A short name for the repo `p` builds with this code's formats.
 pub(crate) fn key(p: &BenchParams) -> String {
@@ -154,19 +154,10 @@ pub(crate) async fn cached_repo(p: &BenchParams) -> CachedRepo {
             let blobs = Arc::new(ObjectBlobStore::new(Arc::new(named_object_store(&prefix))));
             let started = std::time::Instant::now();
             let tip = generate(p, meta.clone(), blobs).await;
-            meta.update_ref(
-                REPO,
-                &RefUpdate {
-                    name: "main",
-                    expected: None,
-                    new: tip,
-                    actor: "scion-bench",
-                    time_micros: 0,
-                    reason: RefLogReason::Manual,
-                },
-            )
-            .await
-            .expect("set main");
+            assert!(matches!(
+                scion_bench::create_main(&*meta, tip).await,
+                Ok(CasOutcome::Updated { .. })
+            ));
             drop(meta);
             eprintln!(
                 "generated bench repo {key} ({} files) in {:?}",
