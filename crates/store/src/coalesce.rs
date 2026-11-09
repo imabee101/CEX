@@ -1,4 +1,6 @@
-//! Coalescing of identical concurrent computations on one server.
+//! Coalescing of identical concurrent operations in one process: concurrent
+//! callers with one key share one in-flight operation and its result, rather
+//! than waiting for each other in turn (INV-20, INV-29).
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -82,7 +84,8 @@ impl<K: Eq + Hash + Clone, V: Clone> Coalescer<K, V> {
     }
 
     /// How many keys are in flight.
-    pub fn in_flight(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
         self.cells
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

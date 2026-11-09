@@ -31,7 +31,7 @@ use common::cached_repo;
 use scion_bench::{BENCH_TIP, BenchParams, FileSpec, REPO, layout};
 use scion_core::{BlobId, Changeset, ChangesetParts, FileChange, FileKind, RepoPath, Timestamp};
 use store::fault::{Counts, FaultBlobStore, FaultMetaStore, Faults};
-use store::testing::{OverlayBlobStore, TestDatabase, named_object_store, object_store};
+use store::testing::{OverlayBlobStore, TestDatabase, TestPrefix, named_object_store};
 use store::{MetaStore, ObjectBlobStore, PgMetaStore};
 
 /// Files changed per changeset.
@@ -135,9 +135,10 @@ async fn measure(p: &BenchParams, files: &[FileSpec]) -> Vec<Cost> {
         )
         .unwrap(),
     );
+    let top = TestPrefix::create();
     let blobs = Arc::new(OverlayBlobStore::new(
         ObjectBlobStore::new(Arc::new(named_object_store(&repo.prefix))),
-        ObjectBlobStore::new(Arc::new(object_store())),
+        ObjectBlobStore::new(Arc::new(top.store())),
     ));
     assert_eq!(
         meta.get_ref(REPO, "main").await.unwrap().unwrap().target,

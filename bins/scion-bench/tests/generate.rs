@@ -11,7 +11,7 @@ mod common;
 use common::cached_repo;
 use scion_bench::{BENCH_TIP, BenchParams, REPO, content, generate, layout};
 use scion_core::{BlobId, EntryTarget, FileKind, RepoPath};
-use store::testing::{TestDatabase, base_config, object_store};
+use store::testing::{TestDatabase, TestPrefix, base_config};
 use store::{BlobStore, MetaStore, ObjectBlobStore, PgMetaStore};
 
 const SMALL: BenchParams = BenchParams {
@@ -103,7 +103,8 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
         .unwrap(),
     );
     fresh_meta.migrate().await.unwrap();
-    let fresh_blobs = Arc::new(ObjectBlobStore::new(Arc::new(object_store())));
+    let fresh_prefix = TestPrefix::create();
+    let fresh_blobs = Arc::new(ObjectBlobStore::new(Arc::new(fresh_prefix.store())));
     let tip = generate(&SMALL, fresh_meta.clone(), fresh_blobs.clone()).await;
     assert_eq!(tip, repo.tip);
     assert_eq!(tip.to_string(), SMALL_TIP);
@@ -151,7 +152,7 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
     // `main` at the tip, and prints it.
     let target = TestDatabase::create().await;
     let (endpoint, bucket, env) = store::testing::s3_env();
-    let prefix = store::testing::unique_name();
+    let prefix = TestPrefix::create();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_scion-bench"))
         .args(["gen", "--files", "250", "--pg-url", &target.url()])
         .args([
@@ -160,7 +161,7 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
             "--s3-bucket",
             &bucket,
             "--s3-prefix",
-            &prefix,
+            prefix.name(),
         ])
         .envs(env)
         .output()
@@ -189,9 +190,7 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
         built.get_ref(REPO, "main").await.unwrap().unwrap().target,
         full.tip
     );
-    let given = Arc::new(ObjectBlobStore::new(Arc::new(
-        store::testing::named_object_store(&prefix),
-    )));
+    let given = Arc::new(ObjectBlobStore::new(Arc::new(prefix.store())));
     let built = Deriver::new(Arc::new(built), given.clone(), CacheSizes::default());
     let root = RootTree::decode(&built.get(REPO, &RootTree, full.tip).await.unwrap()).unwrap();
     assert!(
@@ -243,8 +242,9 @@ async fn uploads_run_a_bounded_distance_ahead_of_creates() {
     pg.migrate().await.unwrap();
     let faults = Faults::new();
     let meta = Arc::new(FaultMetaStore::new(pg, faults.clone()));
+    let prefix = TestPrefix::create();
     let blobs = Arc::new(FaultBlobStore::new(
-        Arc::new(ObjectBlobStore::new(Arc::new(object_store()))),
+        Arc::new(ObjectBlobStore::new(Arc::new(prefix.store()))),
         faults.clone(),
     ));
     generate(&p, meta, blobs).await;

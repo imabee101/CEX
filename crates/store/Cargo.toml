@@ -11,7 +11,7 @@ bytes = { workspace = true, features = ["std"] }
 object_store = { workspace = true, features = ["aws", "fs"] }
 scion-core = { workspace = true }
 thiserror = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 rustls = { workspace = true, features = ["ring", "std"] }
 tokio-postgres = { workspace = true, features = ["runtime"] }
 tokio-postgres-rustls = { workspace = true, features = ["ring"] }
@@ -26,7 +26,7 @@ testing = []
 store = { path = ".", features = ["testing"] }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

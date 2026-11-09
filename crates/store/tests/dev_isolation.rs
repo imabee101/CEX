@@ -1,7 +1,7 @@
 //! Checks the per-test isolation helpers against the dev environment.
 
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
-use store::testing::{TestDatabase, object_store};
+use store::testing::{Owner, Sweeper, Swept, TestDatabase, TestPrefix};
 
 #[tokio::test]
 async fn each_test_database_is_separate_and_dropped() {
@@ -42,20 +42,32 @@ async fn each_test_database_is_separate_and_dropped() {
 }
 
 #[tokio::test]
-async fn each_test_object_prefix_is_separate() {
-    let a = object_store();
-    let b = object_store();
+async fn each_test_object_prefix_is_separate_and_deleted() {
+    let a = TestPrefix::create();
+    let b = TestPrefix::create();
+    assert_ne!(a.name(), b.name());
     let key = "k".into();
-    a.put(&key, b"in a".to_vec().into()).await.unwrap();
+    a.store().put(&key, b"in a".to_vec().into()).await.unwrap();
     assert!(matches!(
-        b.get(&key).await,
+        b.store().get(&key).await,
         Err(object_store::Error::NotFound { .. })
     ));
+    let name = a.name().to_owned();
+    drop(a);
+    let left = store::testing::named_object_store(&name)
+        .list_with_delimiter(None)
+        .await
+        .unwrap();
+    assert!(
+        left.objects.is_empty() && left.common_prefixes.is_empty(),
+        "a dropped test prefix still holds {left:?}"
+    );
 }
 
 #[tokio::test]
 async fn object_store_supports_put_if_absent() {
-    let store = object_store();
+    let prefix = TestPrefix::create();
+    let store = prefix.store();
     let key = "k".into();
     let create = || PutOptions::from(PutMode::Create);
     store
@@ -72,13 +84,15 @@ async fn object_store_supports_put_if_absent() {
     assert_eq!(&stored[..], b"first");
 }
 
+/// A database and a key prefix whose owner's session has ended, as when its
+/// process is killed, are swept; those of a live owner are kept. The test
+/// holds the sweep lock from before the owner ends until its sweep is done,
+/// so no other process's sweep can take the leftovers first.
 #[tokio::test]
-async fn sweeping_removes_only_what_exited_test_processes_left() {
-    use object_store::ObjectStoreExt;
-    // Names a test helper would make for a process that has exited (Linux
-    // pids stay below 2^22) and for this running process.
-    let dead = store::testing::name_for(u32::MAX, 1, u64::from(std::process::id()));
-    let live = store::testing::name_for(std::process::id(), 1, 999_999);
+async fn sweeping_removes_only_what_ended_owners_left() {
+    let gone = Owner::register();
+    let dead = gone.name(0);
+    let live = store::testing::unique_name();
     let mut admin = store::testing::base_config();
     admin.dbname("postgres");
     let (client, connection) = admin.connect(tokio_postgres::NoTls).await.unwrap();
@@ -94,14 +108,18 @@ async fn sweeping_removes_only_what_exited_test_processes_left() {
             .unwrap();
     }
 
+    let sweeper = Sweeper::lock().await;
+    gone.end().await;
     // Only these two names are considered, so the test does not depend on
     // whatever else the dev environment holds.
-    let swept = store::testing::sweep_orphans_among(|n| n == dead || n == live)
+    let swept = sweeper
+        .sweep_among(|n| n == dead || n == live)
         .await
         .unwrap();
+    drop(sweeper);
     assert_eq!(
         swept,
-        store::testing::Swept {
+        Swept {
             databases: 1,
             prefixes: 1,
             objects: 1

@@ -1,7 +1,9 @@
 //! The Postgres store's connection pool reuses its connections and recovers
 //! when the server closes them.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use store::testing::TestDatabase;
@@ -126,6 +128,15 @@ async fn a_statement_past_its_timeout_fails_retryably() {
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
+/// Polls `call` once, as the caller first runs it.
+async fn poll_once<T>(call: &mut Pin<Box<impl Future<Output = T>>>) -> Poll<T> {
+    std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await
+}
+
+/// With the only connection held and two callers waiting for it, further
+/// callers are refused before they ever wait: on their first poll. The two
+/// waiting are refused once the acquire timeout passes, and the holder
+/// finishes once the database lets it.
 #[tokio::test]
 async fn callers_beyond_the_limits_are_refused_not_queued() {
     let db = TestDatabase::create().await;
@@ -136,44 +147,37 @@ async fn callers_beyond_the_limits_are_refused_not_queued() {
         Arc::new(PgMetaStore::new(db.config().clone(), PgTls::LoopbackPlaintext, l).unwrap());
     store.migrate().await.unwrap();
     let locker = lock_refs(&db).await;
-    // Six callers at once: one gets the only connection and blocks on the
-    // lock, two wait for it, and three are refused at once.
-    let started = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
-    for _ in 0..6 {
+    let call = || {
         let store = store.clone();
-        tasks.spawn(async move {
-            let r = store.get_ref(RepoId(1), "main").await;
-            (r, started.elapsed())
-        });
-    }
-    let mut refused_at_once = 0;
-    let mut refused_after_waiting = 0;
-    let mut holder = None;
-    // In completion order: the holder can finish only after the lock is
-    // released, once the other five are done.
-    while let Some(done) = tasks.join_next().await {
-        match done.unwrap() {
-            (Err(StoreError::Overloaded { retry_after }), elapsed) => {
-                assert_eq!(retry_after, Duration::from_millis(300));
-                if elapsed < Duration::from_millis(250) {
-                    refused_at_once += 1;
-                } else {
-                    refused_after_waiting += 1;
-                }
-            }
-            (Ok(None), _) => holder = Some(()),
-            other => panic!("unexpected {other:?}"),
+        Box::pin(async move { store.get_ref(RepoId(1), "main").await })
+    };
+    let overloaded = |r: Result<Option<store::RefState>, StoreError>| match r {
+        Err(StoreError::Overloaded { retry_after }) => {
+            assert_eq!(retry_after, Duration::from_millis(300))
         }
-        if refused_at_once + refused_after_waiting == 5 && holder.is_none() {
-            // Only the holder is left; let it finish.
-            locker.batch_execute("ROLLBACK").await.unwrap();
+        other => panic!("expected an overload refusal, got {other:?}"),
+    };
+    // Its first poll takes the only connection and sends the read, which
+    // blocks on the lock.
+    let mut holder = call();
+    assert!(poll_once(&mut holder).await.is_pending());
+    let mut waiters = [call(), call()];
+    for w in &mut waiters {
+        assert!(poll_once(w).await.is_pending(), "a waiter was not queued");
+    }
+    for _ in 0..3 {
+        match poll_once(&mut call()).await {
+            Poll::Ready(r) => overloaded(r),
+            Poll::Pending => panic!("a caller beyond the waiter limit was queued"),
         }
     }
-    assert_eq!(
-        (refused_at_once, refused_after_waiting, holder),
-        (3, 2, Some(()))
-    );
+    let waited = Instant::now();
+    for w in waiters {
+        overloaded(w.await);
+    }
+    assert!(waited.elapsed() >= Duration::from_millis(300));
+    locker.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(holder.await.unwrap(), None);
 }
 
 #[tokio::test]

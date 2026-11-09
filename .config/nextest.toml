@@ -6,10 +6,10 @@
 #
 # Tests that use the dev environment run in parallel: each has its own database
 # and key prefix. Their Postgres connections must stay below max_connections
-# (1,000) in compose.yaml. A test opens at most 17 (a 16-connection pool and
-# one admin connection), except the `wide` group, which opens about 65 each.
-# With at most 32 tests at once and at most 4 of them wide, the worst case is
-# 4 × 65 + 28 × 17 = 736 connections.
+# (1,000) in compose.yaml. A test opens at most 18 (a 16-connection pool, one
+# admin connection, and its process's owner session), except the `wide` group,
+# which opens about 66 each. With at most 32 tests at once and at most 4 of
+# them wide, the worst case is 4 × 66 + 28 × 18 = 768 connections.
 
 [test-groups]
 # Slow tests build large fixtures (up to a 3M-file repo); four at once
