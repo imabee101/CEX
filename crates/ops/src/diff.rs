@@ -794,7 +794,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn content_bytes_count_both_sides_of_files_that_may_be_text() {
         let s = |n: u8, size: u64| {

@@ -514,7 +514,11 @@ async fn a_page_compares_at_most_its_byte_bound_of_contents() {
     ];
     let names = ["f1", "f2", "f3"];
     let make = |files: &[Vec<u8>; 3]| {
-        let changes: Vec<_> = names.iter().zip(files).map(|(n, c)| (path(n), write(c))).collect();
+        let changes: Vec<_> = names
+            .iter()
+            .zip(files)
+            .map(|(n, c)| (path(n), write(c)))
+            .collect();
         let contents: Vec<Bytes> = files.iter().map(|c| Bytes::from(c.clone())).collect();
         (changes, contents)
     };

@@ -241,7 +241,15 @@ async fn check_pair(
         "{label}"
     );
     let full_patch = if mode == DiffMode::Stat {
-        pages(o, (a, b), DiffMode::Patch, &filters, None, ops::MAX_DIFF_PAGE).await
+        pages(
+            o,
+            (a, b),
+            DiffMode::Patch,
+            &filters,
+            None,
+            ops::MAX_DIFF_PAGE,
+        )
+        .await
     } else {
         Vec::new()
     };
@@ -323,15 +331,17 @@ async fn check_pair(
                     let f = f.as_bytes();
                     f.len() > dir.len() && f.starts_with(&dir) && f[dir.len()] == b'/'
                 });
-                if dir.is_empty() || kept(&dir, &filters) || leads_to_filter
-                {
+                if dir.is_empty() || kept(&dir, &filters) || leads_to_filter {
                     allowed.extend(ids);
                 }
             }
         }
         let read = reads.take();
         for t in read {
-            assert!(allowed.contains(&t), "{label}: read a tree outside the filters");
+            assert!(
+                allowed.contains(&t),
+                "{label}: read a tree outside the filters"
+            );
         }
     }
 }

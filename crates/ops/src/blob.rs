@@ -51,7 +51,11 @@ async fn store_blob<B: BlobStore>(blobs: &B, repo: RepoId, content: &[u8]) -> Re
     let id = BlobId::hash(content);
     if content.len() <= CHUNK_BYTES {
         blobs
-            .put_if_absent(repo, ObjectKey::blob(id), frame(FrameId::Blob(id), content)?)
+            .put_if_absent(
+                repo,
+                ObjectKey::blob(id),
+                frame(FrameId::Blob(id), content)?,
+            )
             .await?;
         return Ok(());
     }
@@ -60,7 +64,11 @@ async fn store_blob<B: BlobStore>(blobs: &B, repo: RepoId, content: &[u8]) -> Re
         let cid = ChunkId::hash(piece);
         chunks.push(cid);
         blobs
-            .put_if_absent(repo, ObjectKey::chunk(cid), frame(FrameId::Chunk(cid), piece)?)
+            .put_if_absent(
+                repo,
+                ObjectKey::chunk(cid),
+                frame(FrameId::Chunk(cid), piece)?,
+            )
             .await?;
     }
     let list = chunk_list_frame(id, content.len() as u64, chunks)?;
@@ -319,7 +327,6 @@ mod tests {
             Code::NotFound
         );
     }
-
 
     /// A blob store whose writes panic, and which counts its reads.
     #[derive(Default)]

@@ -11,9 +11,13 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::*;
-use derived::{AclConfig, DerivedType, MAX_DERIVE_PER_REQUEST, RestrictedRoots, RootTree};
+use derived::MAX_DERIVE_EXPLORE;
+use derived::{
+    AclConfig, CommitGraph, DerivedType, MAX_DERIVE_PER_REQUEST, RestrictedRoots, RootTree,
+};
+use ops::case::CaseIndex;
 use ops::{Code, CreateOptions};
-use scion_core::{ChangesetId, EntryTarget};
+use scion_core::{Changeset, ChangesetId, EntryTarget};
 use store::fault::{FaultBlobStore, FaultMetaStore, Faults};
 use store::{MetaKey, MetaStore};
 
@@ -168,26 +172,54 @@ async fn creates_under_two_acl_versions_each_get_their_own_value() {
 }
 
 /// Writes a chain of `n` empty changesets onto `base` as bare changeset
-/// rows, with no derived values, and returns its tip.
-async fn bare_chain(e: &Env, base: ChangesetId, n: usize) -> ChangesetId {
-    let mut tip = base;
+/// rows, with no derived values, and returns them, oldest first.
+async fn bare_chain(e: &Env, base: ChangesetId, n: usize) -> Vec<ChangesetId> {
+    let mut chain: Vec<ChangesetId> = Vec::with_capacity(n);
     let mut rows = Vec::new();
     for i in 0..n {
-        let cs = changeset(&[tip], &format!("bare {i}"), vec![]);
-        tip = cs.id();
-        rows.push((MetaKey::Changeset(tip), Bytes::from(cs.encode())));
+        let cs = changeset(
+            &[chain.last().copied().unwrap_or(base)],
+            &format!("bare {i}"),
+            vec![],
+        );
+        chain.push(cs.id());
+        rows.push((MetaKey::Changeset(cs.id()), Bytes::from(cs.encode())));
         if rows.len() == 1000 {
             e.meta.put(REPO, &rows).await.unwrap();
             rows.clear();
         }
     }
     e.meta.put(REPO, &rows).await.unwrap();
-    tip
+    chain
 }
 
-#[tokio::test]
-async fn parents_lacking_eager_values_are_derived_within_the_bound() {
-    let e = env().await;
+/// Which of `ids` have a stored value of type `t`.
+async fn stored<T: DerivedType>(e: &Env, t: &T, ids: &[ChangesetId]) -> Vec<bool> {
+    let mut out = Vec::new();
+    for chunk in ids.chunks(1000) {
+        let keys: Vec<MetaKey> = chunk
+            .iter()
+            .map(|id| MetaKey::Derived(t.key(*id)))
+            .collect();
+        out.extend(
+            e.meta
+                .get(REPO, &keys)
+                .await
+                .unwrap()
+                .iter()
+                .map(Option::is_some),
+        );
+    }
+    out
+}
+
+async fn base_and_chain(
+    e: &Env,
+    n: usize,
+) -> (
+    ops::Ops<store::PgMetaStore, store::ObjectBlobStore>,
+    Vec<ChangesetId>,
+) {
     let plain = ops(&e.meta, &e.blobs);
     let base = plain
         .create_changeset(
@@ -197,7 +229,15 @@ async fn parents_lacking_eager_values_are_derived_within_the_bound() {
         )
         .await
         .unwrap();
-    let tip = bare_chain(&e, base, 300).await;
+    let chain = bare_chain(e, base, n).await;
+    (plain, chain)
+}
+
+#[tokio::test]
+async fn parents_lacking_eager_values_are_derived_within_the_bound() {
+    let e = env().await;
+    let (plain, chain) = base_and_chain(&e, 300).await;
+    let tip = *chain.last().unwrap();
     let child = plain
         .create_changeset(
             REPO,
@@ -208,37 +248,39 @@ async fn parents_lacking_eager_values_are_derived_within_the_bound() {
         .unwrap();
     // Every ancestor got its values, equal to a from-scratch derivation's.
     let fresh = ops(&e.meta, &e.blobs);
-    assert_eq!(root_of(&fresh, child).await, root_of(&fresh, base).await);
-    let stored = e
-        .meta
-        .get(REPO, &[MetaKey::Derived(RootTree.key(tip))])
+    assert_eq!(
+        root_of(&fresh, child).await,
+        root_of(&fresh, chain[0]).await
+    );
+    assert!(stored(&e, &RootTree, &chain).await.iter().all(|s| *s));
+}
+
+#[tokio::test]
+async fn slow_a_parent_chain_at_the_bound_is_derived_in_one_request() {
+    let e = env().await;
+    let (plain, chain) = base_and_chain(&e, MAX_DERIVE_PER_REQUEST).await;
+    let child = changeset(&[*chain.last().unwrap()], "child", vec![]);
+    plain
+        .create_changeset(REPO, child, &CreateOptions::default())
         .await
         .unwrap();
-    assert!(stored[0].is_some());
+    assert!(stored(&e, &CommitGraph, &chain).await.iter().all(|s| *s));
 }
 
 #[tokio::test]
 async fn slow_a_parent_chain_past_the_bound_is_finished_by_retries() {
     let e = env().await;
-    let plain = ops(&e.meta, &e.blobs);
-    let base = plain
-        .create_changeset(
-            REPO,
-            changeset(&[], "base", vec![]),
-            &CreateOptions::default(),
-        )
-        .await
-        .unwrap();
-    let tip = bare_chain(&e, base, MAX_DERIVE_PER_REQUEST + 1).await;
-    let child = changeset(&[tip], "child", vec![]);
+    let (plain, chain) = base_and_chain(&e, MAX_DERIVE_PER_REQUEST + 1).await;
+    let child = changeset(&[*chain.last().unwrap()], "child", vec![]);
     let err = plain
         .create_changeset(REPO, child.clone(), &CreateOptions::default())
         .await
         .unwrap_err();
     assert_eq!(err.code, Code::Unavailable, "{err}");
     assert!(err.code.retryable());
-    // Nothing was written for the child, but the first request derived the
-    // oldest ancestors of every type, so one retry finishes.
+    // Nothing was written for the child, and the first request derived
+    // exactly the oldest MAX_DERIVE_PER_REQUEST ancestors of every type that
+    // reads its parents' values, so one retry finishes.
     assert_eq!(
         e.meta
             .get(REPO, &[MetaKey::Changeset(child.id())])
@@ -246,60 +288,88 @@ async fn slow_a_parent_chain_past_the_bound_is_finished_by_retries() {
             .unwrap(),
         vec![None]
     );
+    let oldest =
+        |s: Vec<bool>| s[..MAX_DERIVE_PER_REQUEST].iter().all(|s| *s) && !s[MAX_DERIVE_PER_REQUEST];
+    assert!(oldest(stored(&e, &RootTree, &chain).await), "RootTree");
+    assert!(
+        oldest(stored(&e, &CommitGraph, &chain).await),
+        "CommitGraph"
+    );
+    assert!(
+        oldest(stored(&e, &CaseIndex::default(), &chain).await),
+        "CaseIndex"
+    );
     plain
         .create_changeset(REPO, child, &CreateOptions::default())
         .await
         .unwrap();
 }
 
-#[tokio::test]
-async fn an_underived_ancestry_past_the_exploration_limit_is_refused_for_good() {
-    use derived::MAX_DERIVE_EXPLORE;
-    let e = env().await;
-    let plain = ops(&e.meta, &e.blobs);
-    // A wide bare history: 64 × 1,025 roots under 1,025 merges under one
-    // tip, more underived ancestors than one request may explore.
+/// Writes exactly `n` bare changesets (no derived values) that are all
+/// ancestors of the returned top, in few levels: 64,000 roots under 1,000
+/// merges under 16 tips under one changeset, then a chain up to `n`.
+async fn wide_bare_history(e: &Env, n: usize) -> ChangesetId {
     let mut rows = Vec::new();
+    let mut put = |cs: Changeset| {
+        let id = cs.id();
+        rows.push((MetaKey::Changeset(id), Bytes::from(cs.encode())));
+        id
+    };
     let mut merges = Vec::new();
-    for m in 0..(MAX_DERIVE_EXPLORE / 64 + 1) {
+    for m in 0..1000 {
         let roots: Vec<ChangesetId> = (0..64)
-            .map(|r| {
-                let cs = changeset(&[], &format!("root {m} {r}"), vec![]);
-                rows.push((MetaKey::Changeset(cs.id()), Bytes::from(cs.encode())));
-                cs.id()
-            })
+            .map(|r| put(changeset(&[], &format!("root {m} {r}"), vec![])))
             .collect();
-        let merge = changeset(&roots, &format!("merge {m}"), vec![]);
-        rows.push((MetaKey::Changeset(merge.id()), Bytes::from(merge.encode())));
-        merges.push(merge.id());
+        merges.push(put(changeset(&roots, &format!("merge {m}"), vec![])));
     }
-    let mut tips = Vec::new();
-    for chunk in merges.chunks(64) {
-        let cs = changeset(chunk, &format!("tip {}", tips.len()), vec![]);
-        rows.push((MetaKey::Changeset(cs.id()), Bytes::from(cs.encode())));
-        tips.push(cs.id());
+    let tips: Vec<ChangesetId> = merges
+        .chunks(64)
+        .enumerate()
+        .map(|(i, c)| put(changeset(c, &format!("tip {i}"), vec![])))
+        .collect();
+    let mut top = put(changeset(&tips, "top", vec![]));
+    let wide = 64_000 + 1000 + 16 + 1;
+    for i in wide..n {
+        top = put(changeset(&[top], &format!("chain {i}"), vec![]));
     }
+    assert_eq!(rows.len(), n);
     for batch in rows.chunks(1000) {
         e.meta.put(REPO, batch).await.unwrap();
     }
-    let top = changeset(&tips, "top", vec![]);
-    e.meta
-        .put(
-            REPO,
-            &[(MetaKey::Changeset(top.id()), Bytes::from(top.encode()))],
-        )
-        .await
-        .unwrap();
+    top
+}
+
+#[tokio::test]
+async fn an_underived_ancestry_past_the_exploration_limit_is_refused_for_good() {
+    let e = env().await;
+    let plain = ops(&e.meta, &e.blobs);
+    let top = wide_bare_history(&e, MAX_DERIVE_EXPLORE + 1).await;
     let err = plain
         .create_changeset(
             REPO,
-            changeset(&[top.id()], "child", vec![]),
+            changeset(&[top], "child", vec![]),
             &CreateOptions::default(),
         )
         .await
         .unwrap_err();
     assert_eq!(err.code, Code::LimitExceeded, "{err}");
     assert!(!err.code.retryable());
+}
+
+#[tokio::test]
+async fn slow_an_underived_ancestry_at_the_exploration_limit_is_pending_not_refused() {
+    let e = env().await;
+    let plain = ops(&e.meta, &e.blobs);
+    let top = wide_bare_history(&e, MAX_DERIVE_EXPLORE).await;
+    let err = plain
+        .create_changeset(
+            REPO,
+            changeset(&[top], "child", vec![]),
+            &CreateOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Code::Unavailable, "{err}");
 }
 
 #[tokio::test]

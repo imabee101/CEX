@@ -302,7 +302,11 @@ mod tests {
             for seed in 0..4 {
                 let n = 5000;
                 let h = history(shape, n, &mut Rng(seed));
-                assert!((n..n + MAX_STEP).contains(&h.len()), "{shape:?}: {}", h.len());
+                assert!(
+                    (n..n + MAX_STEP).contains(&h.len()),
+                    "{shape:?}: {}",
+                    h.len()
+                );
                 for (i, ps) in h.parents.iter().enumerate() {
                     assert!(ps.iter().all(|&p| (p as usize) < i), "{shape:?}");
                     let mut sorted = ps.clone();
@@ -331,7 +335,10 @@ mod tests {
         let h = history(Shape::OverlappingFeatures, n, &mut Rng(1));
         // Merges land only on the main line, so the main line is the
         // first-parent chain of the last merge.
-        let last_merge = (0..h.len()).rev().find(|&i| h.parents[i].len() > 1).unwrap();
+        let last_merge = (0..h.len())
+            .rev()
+            .find(|&i| h.parents[i].len() > 1)
+            .unwrap();
         let mut main = vec![last_merge];
         while let Some(&p) = h.parents[*main.last().unwrap()].first() {
             main.push(p as usize);
