@@ -26,7 +26,7 @@ testing = []
 store = { path = ".", features = ["testing"] }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
