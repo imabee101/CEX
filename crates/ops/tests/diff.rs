@@ -61,58 +61,6 @@ fn apply_patch(old: &[u8], patch: &[u8]) -> Vec<u8> {
     }
     out
 }
-/// A random history of `n` changesets on one repo, and how many are merges:
-/// new roots, linear steps, and merges taking files from their other
-/// parent, with random writes, deletes, kind changes, files that become
-/// directories and back, and (when `wide` passes `MAX_TREE_ENTRIES`) a
-/// sharded directory.
-/// and (when `wide` passes `MAX_TREE_ENTRIES`) a sharded directory.
-async fn random_history<M: MetaStore, B: BlobStore>(
-    o: &ops::Ops<M, B>,
-    rng: &mut Rng,
-    n: usize,
-    wide: u64,
-    label: &str,
-) -> (Vec<(ChangesetId, Model)>, usize) {
-    let mut merges = 0;
-    let mut out: Vec<(ChangesetId, Model)> = Vec::new();
-    while out.len() < n {
-        let i = out.len();
-        let (parents, mut changes) = if i == 0 || rng.one_in(12) {
-            (Vec::new(), Changes::new(&Model::default()))
-        } else {
-            let p1 = i - 1 - rng.index(i.min(4));
-            let mut changes = Changes::new(&out[p1].1);
-            let mut parents = vec![out[p1].0];
-            let p2 = rng.index(i);
-            if p2 != p1 && rng.one_in(4) {
-                merges += 1;
-                parents.push(out[p2].0);
-                let theirs: Vec<_> = out[p2].1.files.iter().collect();
-                for _ in 0..3.min(theirs.len()) {
-                    let (p, (k, c)) = theirs[rng.index(theirs.len())];
-                    changes.write(p, *k, c);
-                }
-            }
-            (parents, changes)
-        };
-        if i == 0 {
-            fill_wide(&mut changes, wide);
-        }
-        let n_ops = 1 + rng.below(6);
-        changes.random(rng, n_ops, 4, wide);
-        if changes.specs.is_empty() && parents.len() < 2 {
-            continue;
-        }
-        let (fc, contents) = changes.file_changes();
-        let id = commit(o, &parents, &format!("{label}/{i}"), fc, &contents)
-            .await
-            .unwrap_or_else(|e| panic!("{label}: changeset {i}: {e}"));
-        out.push((id, changes.next));
-    }
-    (out, merges)
-}
-
 /// A random cursor: any bytes from the names' alphabet, valid or not.
 fn random_cursor(rng: &mut Rng) -> Vec<u8> {
     const ALPHABET: &[u8] = b"a-.x0/bcwn1\0";
@@ -357,7 +305,8 @@ async fn naive_comparison(seeds: &[u64], wide: u64) {
     for &seed in seeds {
         let mut rng = Rng(0xd1ff_0000 + seed);
         let label = format!("seed {seed}");
-        let (history, m) = random_history(&o, &mut rng, 16, wide, &label).await;
+        let h = random_history(&o, &mut rng, 16, (4, wide), &label).await;
+        let (history, m) = (h.steps, h.merges);
         merges += m;
         // Paths that are a file in one changeset and a directory in another.
         let files: BTreeSet<&Vec<u8>> = history.iter().flat_map(|(_, m)| m.files.keys()).collect();

@@ -5,7 +5,7 @@
 
 #![allow(dead_code, unreachable_pub, unused_imports)] // Each test binary uses a different subset.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -278,14 +278,22 @@ fn reference_node_into(entries: Vec<TreeEntry>, ids: &mut Vec<TreeId>) -> TreeId
 /// `a/`, `a0` after it) and never conflict by case.
 pub const NAMES: &[&str] = &["a", "a-", "a.x", "a0", "b", "c"];
 
-/// The directory [`random_path`] fills past `MAX_TREE_ENTRIES` names.
+/// The directory where [`random_path`] picks among many names, so it can
+/// pass `MAX_TREE_ENTRIES`.
 pub const WIDE_DIR: &str = "w";
 
-/// A random path: up to `max_depth` components from [`NAMES`], or now and
-/// then a name among `wide` names in [`WIDE_DIR`].
+/// A random path: up to `max_depth` components from [`NAMES`], or, when
+/// `wide` is not 0, a third of the time one of `wide` names in [`WIDE_DIR`].
 pub fn random_path(rng: &mut Rng, max_depth: u64, wide: u64) -> Vec<u8> {
-    if wide > 0 && rng.one_in(8) {
-        return format!("{WIDE_DIR}/n{:05}", rng.below(wide)).into_bytes();
+    if wide > 0 && rng.one_in(3) {
+        // Half of them among the last names, which the first changeset
+        // leaves out, so the directory grows as well as shrinks.
+        let n = if rng.one_in(2) {
+            rng.below(wide)
+        } else {
+            wide - 1 - rng.below(wide.min(8))
+        };
+        return format!("{WIDE_DIR}/n{n:05}").into_bytes();
     }
     let depth = 1 + rng.below(max_depth);
     let comps: Vec<&str> = (0..depth).map(|_| NAMES[rng.index(NAMES.len())]).collect();
@@ -401,10 +409,13 @@ impl Changes {
                     self.delete(&f);
                 }
                 2 if !files.is_empty() => {
-                    let f = &files[rng.index(files.len())];
-                    if let Some(i) = f.iter().rposition(|&b| b == b'/') {
-                        let dir = f[..i].to_vec();
-                        for g in files.iter().filter(|g| is_under(g, &dir)) {
+                    // A directory picked uniformly, however many files it holds.
+                    let dirs: BTreeSet<&[u8]> = files
+                        .iter()
+                        .filter_map(|f| f.iter().rposition(|&b| b == b'/').map(|i| &f[..i]))
+                        .collect();
+                    if let Some(&dir) = dirs.iter().nth(rng.index(dirs.len().max(1))) {
+                        for g in files.iter().filter(|g| is_under(g, dir)) {
                             self.delete(g);
                         }
                     }
@@ -451,6 +462,72 @@ pub fn fill_wide(changes: &mut Changes, wide: u64) {
         let p = format!("{WIDE_DIR}/n{i:05}");
         changes.write(p.as_bytes(), FileKind::Regular, b"same\n");
     }
+}
+
+/// A random history made by [`random_history`].
+pub struct RandomHistory {
+    /// Each changeset and its files, parents first.
+    pub steps: Vec<(ChangesetId, Model)>,
+    /// Each changeset's first parent, as an index into `steps`.
+    pub first_parents: Vec<Option<usize>>,
+    /// How many changesets are merges.
+    pub merges: usize,
+}
+
+/// A random history of `n` changesets on one repo: new roots, linear
+/// steps, and merges taking files from their other parent, with random
+/// writes, deletes, and kind changes at paths up to `max_depth` deep, files
+/// that become directories and back, and, when `wide` is not 0, a directory
+/// of `wide - 4` files in the first changeset that random changes grow and
+/// shrink among `wide` names.
+pub async fn random_history<M: MetaStore, B: BlobStore>(
+    o: &Ops<M, B>,
+    rng: &mut Rng,
+    n: usize,
+    (max_depth, wide): (u64, u64),
+    label: &str,
+) -> RandomHistory {
+    let mut h = RandomHistory {
+        steps: Vec::new(),
+        first_parents: Vec::new(),
+        merges: 0,
+    };
+    while h.steps.len() < n {
+        let i = h.steps.len();
+        let (first, parents, mut changes) = if i == 0 || rng.one_in(12) {
+            (None, Vec::new(), Changes::new(&Model::default()))
+        } else {
+            let p1 = i - 1 - rng.index(i.min(4));
+            let mut changes = Changes::new(&h.steps[p1].1);
+            let mut parents = vec![h.steps[p1].0];
+            let p2 = rng.index(i);
+            if p2 != p1 && rng.one_in(4) {
+                parents.push(h.steps[p2].0);
+                let theirs: Vec<_> = h.steps[p2].1.files.iter().collect();
+                for _ in 0..3.min(theirs.len()) {
+                    let (p, (k, c)) = theirs[rng.index(theirs.len())];
+                    changes.write(p, *k, c);
+                }
+            }
+            (Some(p1), parents, changes)
+        };
+        if i == 0 {
+            fill_wide(&mut changes, wide.saturating_sub(4));
+        }
+        let ops = 1 + rng.below(6);
+        changes.random(rng, ops, max_depth, wide);
+        if changes.specs.is_empty() && parents.len() < 2 {
+            continue;
+        }
+        let (fc, contents) = changes.file_changes();
+        let id = commit(o, &parents, &format!("{label}/{i}"), fc, &contents)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: changeset {i}: {e}"));
+        h.merges += usize::from(parents.len() > 1);
+        h.steps.push((id, changes.next));
+        h.first_parents.push(first);
+    }
+    h
 }
 
 // ---- Recording reads ----
