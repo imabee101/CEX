@@ -250,3 +250,45 @@ async fn a_parent_chain_past_the_bound_is_refused_retryably() {
         vec![None]
     );
 }
+
+#[tokio::test]
+async fn filling_in_an_existing_changeset_never_case_checks_its_history() {
+    let e = env().await;
+    let plain = ops(&e.meta, &e.blobs);
+    upload(&plain, b"r\n").await;
+    // An imported changeset with names that conflict by case (exempt), and a
+    // child, stored with no derived values, as after a CaseIndex version bump.
+    let mut parts = changeset(
+        &[],
+        "imported",
+        vec![
+            (path("README"), write(b"r\n")),
+            (path("readme"), write(b"r\n")),
+        ],
+    )
+    .into_parts();
+    parts.git_headers = Some(b"author x 0 +0000\n\nimported".to_vec());
+    let imported = scion_core::Changeset::new(parts).unwrap();
+    let child = changeset(&[imported.id()], "child", vec![]);
+    e.meta
+        .put(
+            REPO,
+            &[
+                (
+                    MetaKey::Changeset(imported.id()),
+                    Bytes::from(imported.encode()),
+                ),
+                (MetaKey::Changeset(child.id()), Bytes::from(child.encode())),
+            ],
+        )
+        .await
+        .unwrap();
+    // Creating the child again, with the case check on, fills in every
+    // eager value of it and its parent without checking either.
+    plain
+        .create_changeset(REPO, child, &CreateOptions::default())
+        .await
+        .unwrap();
+    let index = ops::case::CaseIndex::default().key(imported.id());
+    assert!(e.meta.get(REPO, &[MetaKey::Derived(index)]).await.unwrap()[0].is_some());
+}

@@ -194,15 +194,19 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         opts: &CreateOptions,
     ) -> Result<(), OpError> {
         let parts = cs.parts();
-        let eager = eager_types::<M, B>(opts);
         let mut keys = vec![MetaKey::Changeset(id)];
         keys.extend(parts.parents.iter().map(|p| MetaKey::Changeset(*p)));
         let found = self.deriver.meta().get(repo, &keys).await?;
         if found[0].is_some() {
             // Created before, perhaps under another ACL config version: make
-            // sure every eager value these options name exists. Each is one
-            // changeset's derivation, from values its parents already have.
-            for t in &eager {
+            // sure every eager value these options name exists. The case
+            // check applies only to a changeset being created, never to one
+            // that exists or to its ancestors, which may be exempt imports.
+            let unchecked = CreateOptions {
+                case_check: false,
+                ..opts.clone()
+            };
+            for t in &eager_types::<M, B>(&unchecked) {
                 self.deriver.get_any(repo, &**t, id).await?;
             }
             return Ok(());
@@ -219,7 +223,7 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
             ));
         }
         let mut cx = self.deriver.cx(repo);
-        for t in &eager {
+        for t in &eager_types::<M, B>(opts) {
             let value = t.derive_any(&mut cx, id, cs).await?;
             cx.set_value(t.key(id), value);
         }
