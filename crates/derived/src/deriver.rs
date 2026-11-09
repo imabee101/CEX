@@ -12,6 +12,7 @@ use store::{BlobStore, DerivedKey, MetaKey, MetaStore, ObjectKey, RepoId};
 
 use tokio::task::JoinSet;
 
+use crate::serial::Serial;
 use crate::trees::{TreeCache, TreeWork};
 use crate::{Coalescer, DeriveError};
 
@@ -116,6 +117,9 @@ pub struct Deriver<M, B> {
     values: moka::sync::Cache<(RepoId, DerivedKey), Bytes>,
     changesets: moka::sync::Cache<(RepoId, ChangesetId), Arc<Changeset>>,
     inflight: Coalescer<(RepoId, DerivedKey), Bytes>,
+    /// Batches of one key space (type, version, and param) in a repo being
+    /// derived on this server, one at a time.
+    batches: Serial<(RepoId, u16, u16, u64)>,
 }
 
 impl<M, B> std::fmt::Debug for Deriver<M, B> {
@@ -225,6 +229,7 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
                 })
                 .build(),
             inflight: Coalescer::default(),
+            batches: Serial::default(),
         }
     }
 
@@ -294,7 +299,8 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
     /// The ancestors lacking a value are found level by level from `cs`,
     /// with one batched read of changesets and one of values per level, and
     /// the search stops at ancestors that have one. They are then derived
-    /// parents first. One call derives at most [`MAX_DERIVE_PER_REQUEST`]
+    /// parents first, [`DERIVE_BATCH`] at a time, each batch written in one
+    /// metadata transaction. One call derives at most [`MAX_DERIVE_PER_REQUEST`]
     /// changesets; a value needing more is [`DeriveError::Pending`] until the
     /// background deriver (or a backfill) has derived the history.
     pub async fn get<T: DerivedType>(
@@ -324,9 +330,7 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
                 .chunks(DERIVE_BATCH)
                 .take(MAX_DERIVE_PER_REQUEST / DERIVE_BATCH)
             {
-                for (id, changeset) in chunk.iter().zip(self.changesets(repo, chunk).await?) {
-                    self.derive_one(repo, t, *id, &changeset).await?;
-                }
+                self.derive_batch(repo, t, chunk).await?;
             }
             if order.len() > MAX_DERIVE_PER_REQUEST {
                 let key = t.key(cs);
@@ -471,6 +475,48 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
         out.into_iter()
             .map(|c| c.ok_or_else(|| DeriveError::Internal("a changeset read was lost".into())))
             .collect()
+    }
+
+    /// Derives and stores the values of `chunk`, at most [`DERIVE_BATCH`]
+    /// changesets in parents-first order whose other ancestors have their
+    /// values stored: one read of which values are stored already, then the
+    /// rest computed together, then one [`Deriver::write`] (tree frames, then
+    /// one metadata transaction holding every new tree node and value). So a
+    /// request that stops between batches has stored exactly the batches it
+    /// finished.
+    ///
+    /// Batches of one key space in a repo are derived one at a time on this
+    /// server, and each skips the values stored before it starts, so
+    /// concurrent derivations of one key compute and write it once (INV-20).
+    async fn derive_batch(
+        &self,
+        repo: RepoId,
+        t: &dyn AnyType<M, B>,
+        chunk: &[ChangesetId],
+    ) -> Result<(), DeriveError> {
+        let space = t.key(chunk[0]);
+        let space = (repo, space.kind, space.version, space.param);
+        self.batches
+            .run(space, async {
+                let keys: Vec<DerivedKey> = chunk.iter().map(|id| t.key(*id)).collect();
+                let stored = self.lookup_many(repo, &keys).await?;
+                let todo: Vec<ChangesetId> = chunk
+                    .iter()
+                    .zip(stored)
+                    .filter(|(_, v)| v.is_none())
+                    .map(|(id, _)| *id)
+                    .collect();
+                if todo.is_empty() {
+                    return Ok(());
+                }
+                let mut cx = self.cx(repo);
+                for (id, cs) in todo.iter().zip(self.changesets(repo, &todo).await?) {
+                    let value = t.derive_any(&mut cx, *id, &cs).await?;
+                    cx.set_value(t.key(*id), value);
+                }
+                self.write(cx, Vec::new()).await
+            })
+            .await
     }
 
     /// Derives and stores one value whose parents' values are stored,

@@ -1,7 +1,8 @@
 //! A crash at every write step of uploading blobs and creating a changeset,
-//! with one parent or as a merge, leaves no broken reference (INV-22), on
-//! Postgres and the object store: after the crash every stored record's
-//! references are stored, and rerunning the same work completes it.
+//! with one parent, as a merge, or on parents whose values it derives in a
+//! batch, leaves no broken reference (INV-22), on Postgres and the object
+//! store: after the crash every stored record's references are stored, and
+//! rerunning the same work completes it.
 
 mod common;
 
@@ -213,38 +214,115 @@ fn written(faults: &Faults) -> BTreeSet<Key> {
     out
 }
 
-/// The parents of the flow: `base` alone, or a merge of `base` and a side
-/// branch that adds `side/s` and changes `dir/a`.
-async fn parents(env: &Env, merge: bool) -> Vec<ChangesetId> {
-    let plain = ops(&env.meta, &env.blobs);
-    let mut m = Model::default();
-    let (c, b) = m.apply(&[
-        ("dir/a", Some((FileKind::Regular, b"a"))),
-        ("dir/old", Some((FileKind::Regular, b"o"))),
-    ]);
-    let base = commit(&plain, &[], "base", c, &b).await.unwrap();
-    if !merge {
-        return vec![base];
+/// What the flow's changeset is created on.
+#[derive(Clone, Copy, Debug)]
+enum On {
+    /// One parent.
+    Base,
+    /// A merge of the base and a side branch that adds `side/s` and changes
+    /// `dir/a`.
+    Merge,
+    /// A fresh chain of changesets on the base, stored with no derived
+    /// values, which create derives first as one batch per type.
+    Underived,
+}
+
+/// The repo the flow runs in.
+struct Fixture {
+    env: Env,
+    on: On,
+    base: ChangesetId,
+    side: Option<ChangesetId>,
+}
+
+impl Fixture {
+    async fn new(on: On) -> Self {
+        let env = env().await;
+        let plain = ops(&env.meta, &env.blobs);
+        let mut m = Model::default();
+        let (c, b) = m.apply(&[
+            ("dir/a", Some((FileKind::Regular, b"a"))),
+            ("dir/old", Some((FileKind::Regular, b"o"))),
+        ]);
+        let base = commit(&plain, &[], "base", c, &b).await.unwrap();
+        let side = match on {
+            On::Merge => {
+                let (c, b) = m.apply(&[
+                    ("dir/a", Some((FileKind::Regular, b"side a"))),
+                    ("side/s", Some((FileKind::Regular, SIDE))),
+                ]);
+                Some(commit(&plain, &[base], "side", c, &b).await.unwrap())
+            }
+            On::Base | On::Underived => None,
+        };
+        Self {
+            env,
+            on,
+            base,
+            side,
+        }
     }
-    let (c, b) = m.apply(&[
-        ("dir/a", Some((FileKind::Regular, b"side a"))),
-        ("side/s", Some((FileKind::Regular, SIDE))),
-    ]);
-    let side = commit(&plain, &[base], "side", c, &b).await.unwrap();
-    vec![base, side]
+
+    /// The parents for one run of the flow; an underived chain is new for
+    /// each `variant`.
+    async fn parents(&self, variant: u32) -> Vec<ChangesetId> {
+        match (self.on, self.side) {
+            (On::Merge, Some(side)) => vec![self.base, side],
+            (On::Underived, _) => {
+                let mut tip = self.base;
+                let mut rows = Vec::new();
+                let mut contents = Vec::new();
+                for k in 0..2 {
+                    let content = Bytes::from(format!("chain {variant}.{k}\n"));
+                    let cs = changeset(
+                        &[tip],
+                        &format!("chain {variant}.{k}"),
+                        vec![(path(&format!("chain/f{k}")), write(&content))],
+                    );
+                    contents.push(content);
+                    tip = cs.id();
+                    rows.push((MetaKey::Changeset(tip), Bytes::from(cs.encode())));
+                }
+                upload_blobs(&*self.env.meta, &self.env.blobs, REPO, &contents)
+                    .await
+                    .unwrap();
+                self.env.meta.put(REPO, &rows).await.unwrap();
+                vec![tip]
+            }
+            _ => vec![self.base],
+        }
+    }
 }
 
 /// A crash before or after every write step of the flow leaves no broken
 /// reference, and the client's retry after a restart completes it.
-async fn crash_at_every_write_step(merge: bool) {
-    let env = env().await;
-    let parents = parents(&env, merge).await;
+async fn crash_at_every_write_step(on: On) {
+    let f = Fixture::new(on).await;
+    let env = &f.env;
 
     // Count the write steps of one complete run.
     let faults = Faults::new();
     let meta = Arc::new(FaultMetaStore::new(env.meta.clone(), faults.clone()));
     let blobs = Arc::new(FaultBlobStore::new(env.blobs.clone(), faults.clone()));
-    flow(&meta, &blobs, &parents, 0).await.unwrap();
+    flow(&meta, &blobs, &f.parents(0).await, 0).await.unwrap();
+    if let On::Underived = on {
+        // The chain's values of each type are written in one transaction.
+        let batched = faults.writes().into_iter().any(|w| match w {
+            Write::Meta(keys) => {
+                keys.iter()
+                    .filter(
+                        |k| matches!(k, MetaKey::Derived(d) if d.kind == RootTree.key(f.base).kind),
+                    )
+                    .count()
+                    == 2
+            }
+            _ => false,
+        });
+        assert!(
+            batched,
+            "the chain's RootTree values were not written together"
+        );
+    }
     assert!(
         !faults.crashed(),
         "a run with no crash point reports a crash"
@@ -256,6 +334,7 @@ async fn crash_at_every_write_step(merge: bool) {
     for step in 0..steps {
         for point in [CrashPoint::BeforeWrite, CrashPoint::AfterWrite] {
             variant += 1;
+            let parents = f.parents(variant).await;
             let faults = Faults::new();
             faults.crash_at(step, point);
             let meta = Arc::new(FaultMetaStore::new(env.meta.clone(), faults.clone()));
@@ -286,27 +365,35 @@ async fn crash_at_every_write_step(merge: bool) {
 
 #[tokio::test]
 async fn a_crash_at_every_write_step_leaves_no_broken_reference() {
-    crash_at_every_write_step(false).await;
+    crash_at_every_write_step(On::Base).await;
 }
 
 #[tokio::test]
 async fn a_crash_at_every_write_step_of_a_merge_leaves_no_broken_reference() {
-    crash_at_every_write_step(true).await;
+    crash_at_every_write_step(On::Merge).await;
+}
+
+#[tokio::test]
+async fn a_crash_at_every_write_step_of_a_batch_of_parents_leaves_no_broken_reference() {
+    crash_at_every_write_step(On::Underived).await;
 }
 
 /// A transient store failure at any write step fails the create retryably,
 /// without crashing the server, and leaves no broken reference; the retry
 /// on the same server succeeds.
-async fn transient_failure_at_every_write_step(merge: bool) {
-    let env = env().await;
-    let parents = parents(&env, merge).await;
+async fn transient_failure_at_every_write_step(on: On) {
+    let f = Fixture::new(on).await;
+    let env = &f.env;
     let faults = Faults::new();
     let meta = Arc::new(FaultMetaStore::new(env.meta.clone(), faults.clone()));
     let blobs = Arc::new(FaultBlobStore::new(env.blobs.clone(), faults.clone()));
-    flow(&meta, &blobs, &parents, 1000).await.unwrap();
+    flow(&meta, &blobs, &f.parents(1000).await, 1000)
+        .await
+        .unwrap();
     let steps = faults.writes().len() as u64;
     for step in 0..steps {
         let variant = 1001 + step as u32;
+        let parents = f.parents(variant).await;
         let faults = Faults::new();
         faults.fail_transiently_at(step);
         let meta = Arc::new(FaultMetaStore::new(env.meta.clone(), faults.clone()));
@@ -325,10 +412,15 @@ async fn transient_failure_at_every_write_step(merge: bool) {
 
 #[tokio::test]
 async fn a_transient_failure_at_every_write_step_is_retryable() {
-    transient_failure_at_every_write_step(false).await;
+    transient_failure_at_every_write_step(On::Base).await;
 }
 
 #[tokio::test]
 async fn a_transient_failure_at_every_write_step_of_a_merge_is_retryable() {
-    transient_failure_at_every_write_step(true).await;
+    transient_failure_at_every_write_step(On::Merge).await;
+}
+
+#[tokio::test]
+async fn a_transient_failure_at_every_write_step_of_a_batch_of_parents_is_retryable() {
+    transient_failure_at_every_write_step(On::Underived).await;
 }

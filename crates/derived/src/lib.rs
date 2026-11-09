@@ -18,6 +18,7 @@ mod deriver;
 mod error;
 mod restricted_roots;
 mod root_tree;
+mod serial;
 #[cfg(feature = "testing")]
 pub mod testing;
 mod trees;
