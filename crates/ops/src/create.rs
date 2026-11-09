@@ -50,7 +50,7 @@ impl Default for CreateOptions {
 }
 
 type CreateKey = (RepoId, ChangesetId, u64, bool, bool);
-type Creating = derived::Coalescer<CreateKey, ()>;
+type Creating = store::Coalescer<CreateKey, ()>;
 
 /// Server-side operations over one pair of stores.
 pub struct Ops<M, B> {
@@ -127,7 +127,7 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
     pub fn new(deriver: Arc<Deriver<M, B>>) -> Self {
         Self {
             deriver,
-            creating: derived::Coalescer::default(),
+            creating: store::Coalescer::default(),
         }
     }
 

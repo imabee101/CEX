@@ -19,6 +19,7 @@
 //! the same transaction.
 
 mod blob;
+mod coalesce;
 #[cfg(feature = "testing")]
 pub mod conformance;
 mod error;
@@ -31,6 +32,7 @@ pub mod testing;
 #[cfg(feature = "testing")]
 pub use blob::MemoryBlobStore;
 pub use blob::{BlobStore, ObjectBlobStore, ObjectKey, ObjectKind};
+pub use coalesce::Coalescer;
 pub use error::StoreError;
 #[cfg(feature = "testing")]
 pub use meta::MemoryMetaStore;

@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use scion_core::{Changeset, ChangesetId, Codec, Frame, FrameId, Tree, TreeId};
-use store::{BlobStore, DerivedKey, MetaKey, MetaStore, ObjectKey, RepoId};
+use store::{BlobStore, Coalescer, DerivedKey, MetaKey, MetaStore, ObjectKey, RepoId};
 
 use tokio::task::JoinSet;
 
+use crate::DeriveError;
 use crate::trees::{TreeCache, TreeWork};
-use crate::{Coalescer, DeriveError};
 
 /// The zstd level of every frame the server creates. Frames are created once
 /// per id (INV-44), so the level only has to be fixed, not reproducible.
