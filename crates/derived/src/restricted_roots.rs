@@ -76,6 +76,12 @@ impl RestrictedRoots {
         for _ in 0..n {
             let p = RepoPath::new(r.bytes()?)
                 .map_err(|e| DeriveError::DataLoss(format!("RestrictedRoots path: {e}")))?;
+            // Paths are strictly increasing, so each value has one encoding.
+            if out.last_key_value().is_some_and(|(last, _)| *last >= p) {
+                return Err(DeriveError::DataLoss(
+                    "RestrictedRoots paths are not strictly increasing".into(),
+                ));
+            }
             out.insert(p, TreeId::from_bytes(r.array32()?));
         }
         r.finish()?;
@@ -191,6 +197,22 @@ mod tests {
             assert!(!touches(&changes, &root), "{siblings:?}");
             changes.insert(p("a/b/c"), FileChange::Deleted);
             assert!(touches(&changes, &root), "{siblings:?} with a/b/c");
+        }
+    }
+
+    #[test]
+    fn unsorted_or_duplicate_paths_are_rejected() {
+        let entry = |p: &str, b: u8| {
+            let mut out = Vec::new();
+            put_bytes(&mut out, p.as_bytes());
+            out.extend_from_slice(&[b; 32]);
+            out
+        };
+        for pair in [("b", "a"), ("a", "a")] {
+            let mut bytes = vec![2];
+            bytes.extend(entry(pair.0, 1));
+            bytes.extend(entry(pair.1, 2));
+            assert!(RestrictedRoots::decode(&bytes).is_err(), "{pair:?}");
         }
     }
 

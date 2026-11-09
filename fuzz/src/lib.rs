@@ -88,3 +88,32 @@ pub fn check_id_hex(data: &[u8]) {
         assert_eq!(BlobId::from_bytes(bytes).to_string(), s);
     }
 }
+
+/// Checks the blob-record decoder on `data`.
+pub fn check_blob_record(data: &[u8]) {
+    if let Ok(r) = derived::BlobRecord::decode(data) {
+        assert_eq!(r.encode(), data, "accepted a non-canonical blob record");
+    }
+}
+
+/// Checks the CommitGraph value decoder on `data`.
+pub fn check_graph_node(data: &[u8]) {
+    if let Ok(n) = derived::GraphNode::decode(data) {
+        assert_eq!(
+            n.encode(),
+            data,
+            "accepted a non-canonical CommitGraph value"
+        );
+    }
+}
+
+/// Checks the RestrictedRoots value decoder on `data`.
+pub fn check_restricted_roots(data: &[u8]) {
+    if let Ok(roots) = derived::RestrictedRoots::decode(data) {
+        assert_eq!(
+            derived::RestrictedRoots::encode(&roots),
+            data,
+            "accepted a non-canonical RestrictedRoots value"
+        );
+    }
+}

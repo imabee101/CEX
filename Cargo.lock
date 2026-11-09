@@ -611,6 +611,7 @@ name = "fuzz"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "derived",
  "libfuzzer-sys",
  "scion-core",
 ]

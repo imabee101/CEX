@@ -11,6 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 blake3 = { workspace = true }
+derived = { workspace = true }
 libfuzzer-sys = { workspace = true }
 scion-core = { workspace = true }
 
@@ -45,6 +46,27 @@ bench = false
 [[bin]]
 name = "id_hex"
 path = "fuzz_targets/id_hex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blob_record"
+path = "fuzz_targets/blob_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "graph_node"
+path = "fuzz_targets/graph_node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "restricted_roots"
+path = "fuzz_targets/restricted_roots.rs"
 test = false
 doc = false
 bench = false
