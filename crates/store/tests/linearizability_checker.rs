@@ -403,7 +403,8 @@ fn budget_is_a_strict_step_limit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_runs_scripts_of_different_lengths_all_in_flight_at_the_start() {
-    // Instant operations: only the start barrier makes them overlap.
+    // Instant operations: each first response is taken only once every
+    // client has issued its first request.
     let exec: Exec = Arc::new(|_| Box::pin(async { Ret::Read(None) }));
     let scripts = vec![vec![Op::Read], vec![Op::Read; 3], vec![Op::Read; 2]];
     let history = tokio::time::timeout(std::time::Duration::from_secs(10), record(scripts, exec))
@@ -452,4 +453,33 @@ fn a_one_step_search_fits_a_budget_of_one() {
     let h = [ev(0, Op::Read, Ret::Read(None), 0, 1)];
     assert_eq!(check(&h, None, 1), Ok(()));
     assert_eq!(check(&h, None, 0), Err(Violation::BudgetExceeded));
+}
+
+/// Each call is stamped as its request is issued, with no wait in between:
+/// on one thread, ordering the history by call stamp orders it by the
+/// moment the store received each request.
+#[tokio::test(flavor = "current_thread")]
+async fn record_stamps_each_call_as_its_request_is_issued() {
+    let issued = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let exec: Exec = {
+        let issued = issued.clone();
+        Arc::new(move |_| {
+            let issued = issued.clone();
+            Box::pin(async move {
+                let n = issued.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ret::Read(Some((0, n)))
+            })
+        })
+    };
+    let mut history = record(random_scripts(3, 8, 5, 3), exec).await;
+    history.sort_by_key(|e| e.call);
+    let order: Vec<u64> = history
+        .iter()
+        .map(|e| match e.ret {
+            Ret::Read(Some((_, n))) => n,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(order, (0..40).collect::<Vec<_>>());
+    assert_eq!(max_overlap(&history), 8);
 }
