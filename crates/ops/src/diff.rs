@@ -12,7 +12,7 @@ use store::{BlobStore, MetaStore, RepoId};
 
 use tokio::task::JoinSet;
 
-use crate::blob::{classify_blobs, is_text, read_blob};
+use crate::blob::{MAX_TEXT_BYTES, classify_blobs, is_text, read_blob};
 use crate::{Code, OpError, Ops};
 
 /// Lines of context around each patch hunk.
@@ -84,15 +84,6 @@ fn under(path: &[u8], prefix: &[u8]) -> bool {
 /// Whether a file at `path` passes the filters.
 fn keep_file(path: &[u8], filters: &[RepoPath]) -> bool {
     filters.is_empty() || filters.iter().any(|f| under(path, f.as_bytes()))
-}
-
-/// Whether the directory at `path` can hold a file that passes the filters.
-fn enter_dir(path: &[u8], filters: &[RepoPath]) -> bool {
-    path.is_empty()
-        || filters.is_empty()
-        || filters
-            .iter()
-            .any(|f| under(path, f.as_bytes()) || under(f.as_bytes(), path))
 }
 
 fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
@@ -365,6 +356,28 @@ fn unified(old: &[u8], new: &[u8], out: &mut Vec<u8>) -> (u64, u64) {
 /// The most files one diff page holds.
 pub const MAX_DIFF_PAGE: usize = 1000;
 
+/// The most content bytes one Stat or Patch page compares: the sizes of
+/// both sides of each file whose blobs differ and may both be text (each at
+/// most [`MAX_TEXT_BYTES`]). It is twice [`MAX_TEXT_BYTES`], so the
+/// largest pair of texts fits a page alone. A page's blob reads are part of
+/// it, and its patches are at most a constant factor larger, so a page's
+/// memory is bounded by this and [`MAX_DIFF_PAGE`] whatever the file sizes.
+pub const MAX_DIFF_PAGE_BYTES: u64 = 2 * MAX_TEXT_BYTES as u64;
+
+/// The bytes a Stat or Patch page reads to compare one file's contents: both
+/// sides' sizes when the blobs differ and both may be text, else nothing (a
+/// side over [`MAX_TEXT_BYTES`] is binary, and binary files are compared by
+/// id).
+fn content_bytes(old: Option<FileState>, new: Option<FileState>) -> u64 {
+    let sides = [old, new].into_iter().flatten();
+    if old.map(|s| s.blob) == new.map(|s| s.blob)
+        || sides.clone().any(|s| s.size > MAX_TEXT_BYTES as u64)
+    {
+        return 0;
+    }
+    sides.map(|s| s.size).sum()
+}
+
 /// The most blobs a diff page reads at once.
 const BLOB_READS: usize = 16;
 
@@ -549,7 +562,10 @@ impl Dir {
                 }));
             }
             let (da, db) = (dir(ea), dir(eb));
-            if (da.is_some() || db.is_some()) && enter_dir(&p, paths) {
+            // Every directory pair reached here can hold filtered files: a
+            // covered directory's entries are covered, and an uncovered one
+            // yields only the names on the way to a filter (`Pairs::only`).
+            if da.is_some() || db.is_some() {
                 let mut key = p.clone();
                 key.push(b'/');
                 self.held.push(std::cmp::Reverse(Item {
@@ -596,15 +612,17 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         let ra = RootTree::decode(&d.get(repo, &RootTree, a).await?)?;
         let rb = RootTree::decode(&d.get(repo, &RootTree, b).await?)?;
         let mut cx = d.cx(repo);
-        let mut files = Vec::new();
+        let mut files: Vec<FileDiff> = Vec::new();
+        let mut content = 0u64;
+        let mut next = None;
         // One frame per directory being walked.
         let mut stack: Vec<Dir> = Vec::new();
         if ra != rb {
             stack
                 .push(Dir::new(&mut cx.trees, Vec::new(), Some(ra), Some(rb), after, paths).await?);
         }
-        // Walk until one file past the page, which proves there is a next
-        // page.
+        // Walk until the first file that does not fit the page, which proves
+        // there is a next page; it starts after the page's last file.
         'walk: while let Some(frame) = stack.last_mut() {
             let Some(item) = frame.next(&mut cx.trees, paths).await? else {
                 stack.pop();
@@ -614,15 +632,26 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
                 if after.is_some_and(|after| item.path.as_slice() <= after) {
                     continue;
                 }
+                let cost = match mode {
+                    DiffMode::Names => 0,
+                    DiffMode::Stat | DiffMode::Patch => content_bytes(old, new),
+                };
+                if files.len() == limit || content + cost > MAX_DIFF_PAGE_BYTES {
+                    // A file's cost is at most the page's, so the page holds
+                    // at least one file.
+                    let last = files.last().ok_or_else(|| {
+                        OpError::new(Code::Internal, "a diff page stopped before its first file")
+                    })?;
+                    next = Some(DiffCursor(last.path.clone()));
+                    break 'walk;
+                }
+                content += cost;
                 files.push(FileDiff {
                     path: item.path,
                     old,
                     new,
                     ..FileDiff::default()
                 });
-                if files.len() > limit {
-                    break 'walk;
-                }
             } else if let Some((da, db)) = item.dir
                 && da != db
             {
@@ -634,12 +663,6 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
                 stack.push(Dir::new(&mut cx.trees, item.path, da, db, within, paths).await?);
             }
         }
-        let next = if files.len() > limit {
-            files.truncate(limit);
-            files.last().map(|f| DiffCursor(f.path.clone()))
-        } else {
-            None
-        };
         if mode != DiffMode::Names {
             self.compare_contents(repo, mode, &mut files).await?;
         }
@@ -677,11 +700,11 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
                     done += 1;
                     continue;
                 }
-                let (old, new) = (f.old.map(|s| s.blob), f.new.map(|s| s.blob));
+                let (old, new) = (f.old, f.new);
                 let blobs = d.blobs().clone();
                 reads.spawn(async move {
-                    let read = async |id: Option<BlobId>| match id {
-                        Some(id) => read_blob(&*blobs, repo, id).await,
+                    let read = async |s: Option<FileState>| match s {
+                        Some(s) => read_blob(&*blobs, repo, s.blob, s.size).await,
                         None => Ok(Vec::new()),
                     };
                     Ok::<_, OpError>((i, read(old).await?, read(new).await?))
@@ -771,15 +794,31 @@ mod tests {
         }
     }
 
+
     #[test]
-    fn filters_select_files_and_the_dirs_leading_to_them() {
+    fn content_bytes_count_both_sides_of_files_that_may_be_text() {
+        let s = |n: u8, size: u64| {
+            Some(FileState {
+                kind: FileKind::Regular,
+                blob: BlobId::from_bytes([n; 32]),
+                size,
+            })
+        };
+        let max = MAX_TEXT_BYTES as u64;
+        assert_eq!(content_bytes(s(1, 5), s(2, 7)), 12);
+        assert_eq!(content_bytes(None, s(2, 7)), 7);
+        assert_eq!(content_bytes(s(1, 5), None), 5);
+        assert_eq!(content_bytes(s(1, max), s(2, max)), MAX_DIFF_PAGE_BYTES);
+        // Equal blobs (a kind change) and sides too big for text are not read.
+        assert_eq!(content_bytes(s(1, 5), s(1, 5)), 0);
+        assert_eq!(content_bytes(s(1, max + 1), s(2, 7)), 0);
+        assert_eq!(content_bytes(s(1, 5), s(2, max + 1)), 0);
+    }
+    #[test]
+    fn filters_select_the_files_under_them() {
         let f = [RepoPath::new(&b"a/b"[..]).unwrap()];
         assert!(keep_file(b"a/b", &f));
         assert!(keep_file(b"a/b/c", &f));
         assert!(!keep_file(b"a/bc", &f));
-        assert!(enter_dir(b"a", &f));
-        assert!(enter_dir(b"a/b/c", &f));
-        assert!(!enter_dir(b"x", &f));
-        assert!(!enter_dir(b"a/c", &f));
     }
 }

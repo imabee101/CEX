@@ -487,3 +487,102 @@ async fn a_large_filter_takes_reads_bounded_by_the_nodes_it_reaches() {
     let reads = faults.counts().meta_gets;
     assert!(reads <= 30, "{reads} store reads");
 }
+
+/// `len` bytes of text in 1 KiB lines, starting with `mark`.
+fn long_text(len: usize, mark: u8) -> Vec<u8> {
+    let mut t: Vec<u8> = (0..len)
+        .map(|i| if i % 1024 == 1023 { b'\n' } else { b'a' })
+        .collect();
+    t[0] = mark;
+    *t.last_mut().unwrap() = b'\n';
+    t
+}
+
+/// A Stat or Patch page holds at most `MAX_DIFF_PAGE_BYTES` of compared
+/// contents: a page whose files sum to exactly the bound holds them all,
+/// one byte more starts a new page at the file that did not fit, and Names
+/// pages read no contents and have no byte bound.
+#[tokio::test]
+async fn a_page_compares_at_most_its_byte_bound_of_contents() {
+    let e = env().await;
+    let o = ops(&e.meta, &e.blobs);
+    let side = (ops::MAX_DIFF_PAGE_BYTES / 4) as usize;
+    let base_files = [
+        long_text(side, b'0'),
+        long_text(side, b'1'),
+        b"x\n".to_vec(),
+    ];
+    let names = ["f1", "f2", "f3"];
+    let make = |files: &[Vec<u8>; 3]| {
+        let changes: Vec<_> = names.iter().zip(files).map(|(n, c)| (path(n), write(c))).collect();
+        let contents: Vec<Bytes> = files.iter().map(|c| Bytes::from(c.clone())).collect();
+        (changes, contents)
+    };
+    let (c, b) = make(&base_files);
+    let base = commit(&o, &[], "base", c, &b).await.unwrap();
+    // Contents of `side` + `side` per big file, and 4 for f3: one byte
+    // shorter makes the three files exactly the bound.
+    for (shorten, want) in [(3, vec![2, 1]), (4, vec![3])] {
+        let files = [
+            long_text(side, b'2'),
+            long_text(side - shorten, b'3'),
+            b"y\n".to_vec(),
+        ];
+        let costs: u64 = (0..3)
+            .map(|i| (base_files[i].len() + files[i].len()) as u64)
+            .sum();
+        assert_eq!(
+            costs,
+            ops::MAX_DIFF_PAGE_BYTES + 4 - shorten as u64,
+            "the fixture straddles the bound"
+        );
+        let (c, b) = make(&files);
+        let next = commit(&o, &[base], &format!("shorter by {shorten}"), c, &b)
+            .await
+            .unwrap();
+        for mode in [DiffMode::Stat, DiffMode::Patch] {
+            let mut sizes = Vec::new();
+            let mut after = None;
+            loop {
+                let page = o
+                    .diff(
+                        REPO,
+                        base,
+                        next,
+                        &ops::DiffOptions {
+                            mode,
+                            paths: &[],
+                            after: after.as_ref(),
+                            limit: ops::MAX_DIFF_PAGE,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                sizes.push(page.files.len());
+                for f in &page.files {
+                    assert!(f.added_lines > 0 && f.removed_lines > 0, "{mode:?}");
+                }
+                match page.next {
+                    Some(n) => after = Some(n),
+                    None => break,
+                }
+            }
+            assert_eq!(sizes, want, "shorter by {shorten}, {mode:?}");
+        }
+        let names_only = o
+            .diff(
+                REPO,
+                base,
+                next,
+                &ops::DiffOptions {
+                    mode: DiffMode::Names,
+                    paths: &[],
+                    after: None,
+                    limit: ops::MAX_DIFF_PAGE,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!((names_only.files.len(), names_only.next), (3, None));
+    }
+}

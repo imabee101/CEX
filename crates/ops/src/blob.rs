@@ -29,33 +29,43 @@ fn frame(id: FrameId, raw: &[u8]) -> Result<Bytes, OpError> {
     Ok(derived::encode_frame(id, raw)?)
 }
 
-/// The frames of one blob, in write order: its chunks, then the blob's own
-/// frame (a blob frame or a chunk-list frame).
-fn blob_frames(content: &[u8]) -> Result<(BlobId, Vec<(ObjectKey, Bytes)>), OpError> {
+/// The chunk-list frame of a blob of `len` bytes stored as `chunks`. The
+/// caller passes a consistent list, so a failure is a server defect.
+fn chunk_list_frame(id: BlobId, len: u64, chunks: Vec<ChunkId>) -> Result<Bytes, OpError> {
+    Frame::encode(
+        FrameId::ChunkList(id),
+        Codec::Raw,
+        len,
+        &ChunkList { chunks }.encode(),
+    )
+    .map(Bytes::from)
+    .map_err(|e| OpError::new(Code::Internal, format!("encoding a chunk list: {e}")))
+}
+
+/// Stores one blob's frames, put-if-absent: its chunks in order, then the
+/// blob's own frame (a blob frame or a chunk-list frame), so the blob's
+/// frame is stored only after its chunks. Each frame is built just before
+/// it is written, so beyond the content itself this holds at most one
+/// chunk's frame.
+async fn store_blob<B: BlobStore>(blobs: &B, repo: RepoId, content: &[u8]) -> Result<(), OpError> {
     let id = BlobId::hash(content);
     if content.len() <= CHUNK_BYTES {
-        return Ok((
-            id,
-            vec![(ObjectKey::blob(id), frame(FrameId::Blob(id), content)?)],
-        ));
+        blobs
+            .put_if_absent(repo, ObjectKey::blob(id), frame(FrameId::Blob(id), content)?)
+            .await?;
+        return Ok(());
     }
-    let mut frames = Vec::new();
     let mut chunks = Vec::new();
     for piece in content.chunks(CHUNK_BYTES) {
         let cid = ChunkId::hash(piece);
         chunks.push(cid);
-        frames.push((ObjectKey::chunk(cid), frame(FrameId::Chunk(cid), piece)?));
+        blobs
+            .put_if_absent(repo, ObjectKey::chunk(cid), frame(FrameId::Chunk(cid), piece)?)
+            .await?;
     }
-    let list = ChunkList { chunks }.encode();
-    let f = Frame::encode(
-        FrameId::ChunkList(id),
-        Codec::Raw,
-        content.len() as u64,
-        &list,
-    )
-    .map_err(|e| OpError::new(Code::DataLoss, format!("encoding a chunk list: {e}")))?;
-    frames.push((ObjectKey::blob(id), Bytes::from(f)));
-    Ok((id, frames))
+    let list = chunk_list_frame(id, content.len() as u64, chunks)?;
+    blobs.put_if_absent(repo, ObjectKey::blob(id), list).await?;
+    Ok(())
 }
 
 /// Stores blobs that are not stored yet: their frames first, then, in one
@@ -100,14 +110,7 @@ pub async fn upload_blobs<M: MetaStore, B: BlobStore>(
             join_one(&mut tasks).await?;
         }
         let blobs = blobs.clone();
-        tasks.spawn(async move {
-            let (_, frames) = blob_frames(&content)?;
-            // In order, so a blob's own frame is stored after its chunks.
-            for (key, f) in frames {
-                blobs.put_if_absent(repo, key, f).await?;
-            }
-            Ok::<(), OpError>(())
-        });
+        tasks.spawn(async move { store_blob(&*blobs, repo, &content).await });
     }
     while !tasks.is_empty() {
         join_one(&mut tasks).await?;
@@ -119,7 +122,7 @@ pub async fn upload_blobs<M: MetaStore, B: BlobStore>(
 async fn join_one(tasks: &mut JoinSet<Result<(), OpError>>) -> Result<(), OpError> {
     match tasks.join_next().await {
         Some(r) => {
-            r.map_err(|e| OpError::new(Code::DataLoss, format!("upload task failed: {e}")))?
+            r.map_err(|e| OpError::new(Code::Internal, format!("upload task failed: {e}")))?
         }
         None => Ok(()),
     }
@@ -194,24 +197,30 @@ pub(crate) async fn classify_blobs<M: MetaStore>(
     Ok(out)
 }
 
-/// Reads a blob's bytes, verifying every frame and the blob's id.
+/// Reads a blob of `size` bytes (the size its tree entry and record give),
+/// verifying every frame and the blob's id. Memory is bounded by `size`:
+/// a stored frame that declares another length is data loss before any
+/// chunk is read, and chunks are read one at a time.
 pub async fn read_blob<B: BlobStore>(
     blobs: &B,
     repo: RepoId,
     id: BlobId,
+    size: u64,
 ) -> Result<Vec<u8>, OpError> {
     let bytes = blobs
         .get(repo, ObjectKey::blob(id))
         .await?
         .ok_or_else(|| OpError::new(Code::NotFound, format!("blob {id}")))?;
-    let header = Frame::decode(&bytes)
+    let header = *Frame::decode(&bytes)
         .map_err(|e| data_loss(id, &format!("bad frame: {e}")))?
-        .header()
-        .kind();
-    let raw = if header == FrameKind::ChunkList {
+        .header();
+    if header.raw_len() != size {
+        return Err(data_loss(id, "the stored frame has another length"));
+    }
+    let raw = if header.kind() == FrameKind::ChunkList {
         let list = ChunkList::decode(&decode_payload(&bytes, FrameId::ChunkList(id))?)
             .map_err(|e| data_loss(id, &format!("bad chunk list: {e}")))?;
-        let mut raw = Vec::new();
+        let mut raw = Vec::with_capacity(size as usize);
         for c in list.chunks {
             let cb = blobs
                 .get(repo, ObjectKey::chunk(c))
@@ -220,6 +229,9 @@ pub async fn read_blob<B: BlobStore>(
             let piece = decode_payload(&cb, FrameId::Chunk(c))?;
             if ChunkId::hash(&piece) != c {
                 return Err(data_loss(id, "a chunk does not hash to its id"));
+            }
+            if (raw.len() + piece.len()) as u64 > size {
+                return Err(data_loss(id, "the chunks are longer than the blob"));
             }
             raw.extend_from_slice(&piece);
         }
@@ -258,7 +270,9 @@ mod tests {
         assert_eq!(ids[1], ids[3]);
         for (id, c) in ids.iter().zip(&contents) {
             assert_eq!(
-                read_blob(&*blobs, RepoId(1), *id).await.unwrap(),
+                read_blob(&*blobs, RepoId(1), *id, c.len() as u64)
+                    .await
+                    .unwrap(),
                 c.to_vec()
             );
             let rec = meta
@@ -294,11 +308,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            read_blob(&blobs, RepoId(1), id).await.unwrap_err().code,
+            read_blob(&blobs, RepoId(1), id, 4).await.unwrap_err().code,
             Code::DataLoss
         );
         assert_eq!(
-            read_blob(&blobs, RepoId(1), BlobId::hash(b"x"))
+            read_blob(&blobs, RepoId(1), BlobId::hash(b"x"), 1)
                 .await
                 .unwrap_err()
                 .code,
@@ -306,6 +320,115 @@ mod tests {
         );
     }
 
+
+    /// A blob store whose writes panic, and which counts its reads.
+    #[derive(Default)]
+    struct Probe {
+        inner: MemoryBlobStore,
+        panic_on_put: bool,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BlobStore for Probe {
+        async fn put_if_absent(
+            &self,
+            repo: RepoId,
+            key: ObjectKey,
+            bytes: Bytes,
+        ) -> Result<store::PutOutcome, store::StoreError> {
+            assert!(!self.panic_on_put, "the store's write panicked");
+            self.inner.put_if_absent(repo, key, bytes).await
+        }
+
+        async fn get(
+            &self,
+            repo: RepoId,
+            key: ObjectKey,
+        ) -> Result<Option<Bytes>, store::StoreError> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.get(repo, key).await
+        }
+
+        async fn contains(&self, repo: RepoId, key: ObjectKey) -> Result<bool, store::StoreError> {
+            self.inner.contains(repo, key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_upload_task_is_internal_and_records_nothing() {
+        let meta = MemoryMetaStore::new();
+        let blobs = Arc::new(Probe {
+            panic_on_put: true,
+            ..Probe::default()
+        });
+        let content = Bytes::from_static(b"x\n");
+        let err = upload_blobs(&meta, &blobs, RepoId(1), std::slice::from_ref(&content))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Code::Internal, "{err}");
+        let id = BlobId::hash(&content);
+        assert_eq!(
+            meta.get(RepoId(1), &[MetaKey::Blob(id)]).await.unwrap(),
+            vec![None]
+        );
+    }
+
+    #[test]
+    fn a_chunk_list_that_does_not_encode_is_internal() {
+        // A blob short enough for one frame has no chunk list.
+        let err = chunk_list_frame(BlobId::hash(b"x"), 1, vec![ChunkId::hash(b"x")]).unwrap_err();
+        assert_eq!(err.code, Code::Internal, "{err}");
+    }
+
+    /// A read holds at most the size it was asked for: a stored frame of
+    /// another length fails before any chunk is read, and chunks that run
+    /// past the size fail before they are kept.
+    #[tokio::test]
+    async fn reads_hold_no_more_than_the_blob_size() {
+        let meta = MemoryMetaStore::new();
+        let blobs = Arc::new(Probe::default());
+        let big: Vec<u8> = (0..CHUNK_BYTES * 3).map(|i| (i % 253) as u8).collect();
+        let id = upload_blobs(&meta, &blobs, RepoId(1), &[Bytes::from(big.clone())])
+            .await
+            .unwrap()[0];
+        let gets = || blobs.gets.load(std::sync::atomic::Ordering::SeqCst);
+        for size in [big.len() as u64 - 1, big.len() as u64 + 1, 1] {
+            let before = gets();
+            let err = read_blob(&*blobs, RepoId(1), id, size).await.unwrap_err();
+            assert_eq!(err.code, Code::DataLoss, "{size}: {err}");
+            assert_eq!(gets() - before, 1, "{size}: chunks were read");
+        }
+        assert_eq!(
+            read_blob(&*blobs, RepoId(1), id, big.len() as u64)
+                .await
+                .unwrap(),
+            big
+        );
+        // A list of two full chunks for a blob one byte past a chunk.
+        let full = vec![b'a'; CHUNK_BYTES];
+        let chunk = ChunkId::hash(&full);
+        blobs
+            .put_if_absent(
+                RepoId(1),
+                ObjectKey::chunk(chunk),
+                frame(FrameId::Chunk(chunk), &full).unwrap(),
+            )
+            .await
+            .unwrap();
+        let len = CHUNK_BYTES as u64 + 1;
+        let fake = BlobId::hash(b"claimed");
+        blobs
+            .put_if_absent(
+                RepoId(1),
+                ObjectKey::blob(fake),
+                chunk_list_frame(fake, len, vec![chunk, chunk]).unwrap(),
+            )
+            .await
+            .unwrap();
+        let err = read_blob(&*blobs, RepoId(1), fake, len).await.unwrap_err();
+        assert_eq!(err.code, Code::DataLoss);
+        assert!(err.message.contains("longer than the blob"), "{err}");
+    }
     #[test]
     fn text_classification() {
         assert!(is_text(b"abc\n"));

@@ -14,6 +14,7 @@ pub use create::{
     MAX_PATH_BYTES, MAX_SIGNATURE_BYTES, Ops, eager_types,
 };
 pub use diff::{
-    DiffCursor, DiffMode, DiffOptions, DiffPage, FileDiff, FileState, MAX_DIFF_PAGE, PATCH_CONTEXT,
+    DiffCursor, DiffMode, DiffOptions, DiffPage, FileDiff, FileState, MAX_DIFF_PAGE,
+    MAX_DIFF_PAGE_BYTES, PATCH_CONTEXT,
 };
 pub use error::{Code, OpError};

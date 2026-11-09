@@ -262,7 +262,7 @@ async fn reads_reject_frames_that_name_another_object() {
             .put_if_absent(repo, ObjectKey::blob(id), Bytes::from(frame))
             .await
             .unwrap();
-        let err = ops::blob::read_blob(&*e.blobs, repo, id)
+        let err = ops::blob::read_blob(&*e.blobs, repo, id, content.len() as u64)
             .await
             .expect_err("a frame naming another object was read");
         assert_eq!(err.code, ops::Code::DataLoss, "{kind:?}: {err}");
