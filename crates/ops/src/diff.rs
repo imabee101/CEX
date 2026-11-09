@@ -3,11 +3,11 @@
 //! subtrees are skipped by id, so the walk skips matching directory and
 //! shard ids without loading their entries.
 
-use std::collections::VecDeque;
+use std::collections::{BinaryHeap, VecDeque};
 
 use derived::{DeriveError, RootTree, TreeWork};
 use imara_diff::{Algorithm, Diff, InternedInput};
-use scion_core::{BlobId, ChangesetId, EntryTarget, FileKind, RepoPath, TreeId};
+use scion_core::{BlobId, ChangesetId, EntryTarget, FileKind, RepoPath, TreeEntry, TreeId};
 use store::{BlobStore, MetaStore, RepoId};
 
 use tokio::task::JoinSet;
@@ -104,88 +104,116 @@ fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     p
 }
 
-/// The entries that differ between two directories, by name.
-async fn pairs<M: MetaStore>(
-    work: &mut TreeWork<'_, M>,
-    a: Option<TreeId>,
-    b: Option<TreeId>,
-) -> Result<Vec<(Vec<u8>, Option<EntryTarget>, Option<EntryTarget>)>, DeriveError> {
-    let ea = match a {
-        Some(id) => work.get(id).await?.entries().to_vec(),
-        None => Vec::new(),
-    };
-    let eb = match b {
-        Some(id) => work.get(id).await?.entries().to_vec(),
-        None => Vec::new(),
-    };
-    let mut out = Vec::new();
-    let (mut ea, mut eb) = (VecDeque::from(ea), VecDeque::from(eb));
-    while !ea.is_empty() || !eb.is_empty() {
-        // Shards name disjoint prefix ranges. Merge the two ordered
-        // frontiers, expanding only the first range that is not shared.
-        // This also aligns nodes when splits/collapses change trie shape.
-        if let (Some(x), Some(y)) = (ea.front(), eb.front())
-            && x == y
-        {
-            ea.pop_front();
-            eb.pop_front();
-            continue;
-        }
-        let ord = match (ea.front(), eb.front()) {
-            (Some(x), Some(y)) => x.name.cmp(&y.name),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            _ => std::cmp::Ordering::Greater,
+/// One entry name with its target on each side.
+type Pair = (Vec<u8>, Option<EntryTarget>, Option<EntryTarget>);
+
+/// The entries that differ between two directories, in name order, read
+/// lazily: a shard is expanded only when the merge reaches it, and an entry
+/// or shard whose names all sort before `from` (and none of which is a
+/// prefix of it) is dropped unread. Memory is bounded by the nodes on the
+/// two frontiers.
+struct Pairs {
+    a: VecDeque<TreeEntry>,
+    b: VecDeque<TreeEntry>,
+    from: Option<Vec<u8>>,
+}
+
+impl Pairs {
+    async fn new<M: MetaStore>(
+        work: &mut TreeWork<'_, M>,
+        a: Option<TreeId>,
+        b: Option<TreeId>,
+        from: Option<Vec<u8>>,
+    ) -> Result<Self, DeriveError> {
+        let mut side = async |id: Option<TreeId>| -> Result<VecDeque<TreeEntry>, DeriveError> {
+            Ok(match id {
+                Some(id) => work.get(id).await?.entries().iter().cloned().collect(),
+                None => VecDeque::new(),
+            })
         };
-        let first = if ord == std::cmp::Ordering::Greater {
-            &mut eb
-        } else {
-            &mut ea
-        };
-        if let Some(scion_core::TreeEntry {
-            target: EntryTarget::Shard(id),
-            ..
-        }) = first.front()
-        {
-            let node = work.get(*id).await?;
-            first.pop_front();
-            for entry in node.entries().iter().rev() {
-                first.push_front(entry.clone());
-            }
-            continue;
-        }
-        // An equal-name shard on the other side must be expanded too.
-        if ord == std::cmp::Ordering::Equal
-            && let Some(scion_core::TreeEntry {
-                target: EntryTarget::Shard(id),
-                ..
-            }) = eb.front()
-        {
-            let node = work.get(*id).await?;
-            eb.pop_front();
-            for entry in node.entries().iter().rev() {
-                eb.push_front(entry.clone());
-            }
-            continue;
-        }
-        match ord {
-            std::cmp::Ordering::Less => {
-                let x = ea.pop_front().expect("left entry");
-                out.push((x.name, Some(x.target), None));
-            }
-            std::cmp::Ordering::Greater => {
-                let y = eb.pop_front().expect("right entry");
-                out.push((y.name, None, Some(y.target)));
-            }
-            std::cmp::Ordering::Equal => {
-                let x = ea.pop_front().expect("left entry");
-                let y = eb.pop_front().expect("right entry");
-                if x.target != y.target {
-                    out.push((x.name, Some(x.target), Some(y.target)));
+        let a = side(a).await?;
+        let b = side(b).await?;
+        Ok(Self { a, b, from })
+    }
+
+    /// Whether every name an entry stands for (for a shard, every name with
+    /// its prefix) sorts before `from` without being a prefix of it.
+    fn before_from(from: Option<&[u8]>, name: &[u8]) -> bool {
+        from.is_some_and(|c| name < c && !c.starts_with(name))
+    }
+
+    async fn next<M: MetaStore>(
+        &mut self,
+        work: &mut TreeWork<'_, M>,
+    ) -> Result<Option<Pair>, DeriveError> {
+        use std::cmp::Ordering;
+        let from = self.from.as_deref();
+        loop {
+            for side in [&mut self.a, &mut self.b] {
+                while side
+                    .front()
+                    .is_some_and(|e| Self::before_from(from, &e.name))
+                {
+                    side.pop_front();
                 }
             }
+            // Shards name disjoint prefix ranges. Merge the two ordered
+            // frontiers, expanding only the first range that is not shared.
+            // This also aligns nodes when splits or collapses change the
+            // trie's shape.
+            if let (Some(x), Some(y)) = (self.a.front(), self.b.front())
+                && x == y
+            {
+                self.a.pop_front();
+                self.b.pop_front();
+                continue;
+            }
+            let ord = match (self.a.front(), self.b.front()) {
+                (Some(x), Some(y)) => x.name.cmp(&y.name),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => return Ok(None),
+            };
+            // The side whose front comes first, and on an equal name the
+            // right side too, has its front shard expanded before comparing.
+            let expand = match ord {
+                Ordering::Greater => [false, true],
+                Ordering::Less => [true, false],
+                Ordering::Equal => [true, true],
+            };
+            let mut expanded = false;
+            for (side, go) in [&mut self.a, &mut self.b].into_iter().zip(expand) {
+                if go
+                    && let Some(TreeEntry {
+                        target: EntryTarget::Shard(id),
+                        ..
+                    }) = side.front()
+                {
+                    let node = work.get(*id).await?;
+                    side.pop_front();
+                    for entry in node.entries().iter().rev() {
+                        side.push_front(entry.clone());
+                    }
+                    expanded = true;
+                    break;
+                }
+            }
+            if expanded {
+                continue;
+            }
+            let pair = match ord {
+                Ordering::Less => self.a.pop_front().map(|x| (x.name, Some(x.target), None)),
+                Ordering::Greater => self.b.pop_front().map(|y| (y.name, None, Some(y.target))),
+                Ordering::Equal => match (self.a.pop_front(), self.b.pop_front()) {
+                    (Some(x), Some(y)) if x.target != y.target => {
+                        Some((x.name, Some(x.target), Some(y.target)))
+                    }
+                    _ => continue,
+                },
+            };
+            return Ok(pair);
         }
     }
-    Ok(out)
 }
 
 /// Appends a unified diff of two texts' lines.
@@ -310,6 +338,24 @@ struct Item {
     dir: Option<(Option<TreeId>, Option<TreeId>)>,
 }
 
+// Items order by key alone; two items of one walk never share a key.
+impl PartialEq for Item {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+impl Eq for Item {}
+impl PartialOrd for Item {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Item {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
 /// Where a directory's subtree lies relative to the resume point `after`.
 enum Resume {
     /// Every path in it comes after `after`.
@@ -331,49 +377,85 @@ fn resume(key: &[u8], after: Option<&[u8]>) -> Resume {
     }
 }
 
-/// The items of the directories `a` and `b` at `path`, sorted by key, with
-/// the subdirectories a walk will enter prefetched in one batch.
-async fn items<M: MetaStore>(
-    work: &mut TreeWork<'_, M>,
-    path: &[u8],
-    a: Option<TreeId>,
-    b: Option<TreeId>,
-    paths: &[RepoPath],
-    after: Option<&[u8]>,
-) -> Result<Vec<Item>, DeriveError> {
-    let mut out = Vec::new();
-    for (name, ea, eb) in pairs(work, a, b).await? {
-        let p = join(path, &name);
-        let (fa, fb) = (file(ea), file(eb));
-        if (fa.is_some() || fb.is_some()) && keep_file(&p, paths) {
-            out.push(Item {
-                key: p.clone(),
-                path: p.clone(),
-                file: Some((fa, fb)),
-                dir: None,
-            });
-        }
-        let (da, db) = (dir(ea), dir(eb));
-        if (da.is_some() || db.is_some()) && enter_dir(&p, paths) {
-            let mut key = p.clone();
-            key.push(b'/');
-            out.push(Item {
-                key,
-                path: p,
-                file: None,
-                dir: Some((da, db)),
-            });
+/// One directory being walked: its differing entries as items, in key
+/// order. Pairs arrive in name order, and a directory's key (its path and a
+/// `/`) can sort after later names (`a/` after `a-c`), so items are held in
+/// a heap until no later pair can sort before them. The heap holds at most
+/// the directories whose names are prefixes of one another.
+struct Dir {
+    path: Vec<u8>,
+    pairs: Pairs,
+    held: BinaryHeap<std::cmp::Reverse<Item>>,
+    done: bool,
+}
+
+impl Dir {
+    async fn new<M: MetaStore>(
+        work: &mut TreeWork<'_, M>,
+        path: Vec<u8>,
+        a: Option<TreeId>,
+        b: Option<TreeId>,
+        after: Option<&[u8]>,
+    ) -> Result<Self, DeriveError> {
+        // Where to resume within this directory: the component of `after`
+        // just below it.
+        let from = after.map(|after| {
+            let rel = if path.is_empty() {
+                after
+            } else {
+                &after[path.len() + 1..]
+            };
+            rel.split(|&b| b == b'/').next().unwrap_or(rel).to_vec()
+        });
+        Ok(Self {
+            pairs: Pairs::new(work, a, b, from).await?,
+            path,
+            held: BinaryHeap::new(),
+            done: false,
+        })
+    }
+
+    async fn next<M: MetaStore>(
+        &mut self,
+        work: &mut TreeWork<'_, M>,
+        paths: &[RepoPath],
+    ) -> Result<Option<Item>, DeriveError> {
+        loop {
+            if self.done {
+                return Ok(self.held.pop().map(|r| r.0));
+            }
+            let Some((name, ea, eb)) = self.pairs.next(work).await? else {
+                self.done = true;
+                continue;
+            };
+            let p = join(&self.path, &name);
+            let (fa, fb) = (file(ea), file(eb));
+            if (fa.is_some() || fb.is_some()) && keep_file(&p, paths) {
+                self.held.push(std::cmp::Reverse(Item {
+                    key: p.clone(),
+                    path: p.clone(),
+                    file: Some((fa, fb)),
+                    dir: None,
+                }));
+            }
+            let (da, db) = (dir(ea), dir(eb));
+            if (da.is_some() || db.is_some()) && enter_dir(&p, paths) {
+                let mut key = p.clone();
+                key.push(b'/');
+                self.held.push(std::cmp::Reverse(Item {
+                    key,
+                    path: p.clone(),
+                    file: None,
+                    dir: Some((da, db)),
+                }));
+            }
+            // Every later pair has a greater name, so every later item has a
+            // key greater than `p`: what is held up to `p` is final.
+            if self.held.peek().is_some_and(|r| r.0.key <= p) {
+                return Ok(self.held.pop().map(|r| r.0));
+            }
         }
     }
-    out.sort_by(|x, y| x.key.cmp(&y.key));
-    let entered = out
-        .iter()
-        .filter_map(|i| match (&i.dir, resume(&i.key, after)) {
-            (Some((da, db)), Resume::All | Resume::Partly) => Some([*da, *db]),
-            _ => None,
-        });
-    work.prefetch(entered.flatten().flatten()).await?;
-    Ok(out)
 }
 
 impl<M: MetaStore, B: BlobStore> Ops<M, B> {
@@ -405,19 +487,15 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         let rb = RootTree::decode(&d.get(repo, &RootTree, b).await?)?;
         let mut cx = d.cx(repo);
         let mut files = Vec::new();
-        // One frame per directory being walked: its items, next first.
-        let mut stack: Vec<std::vec::IntoIter<Item>> = Vec::new();
+        // One frame per directory being walked.
+        let mut stack: Vec<Dir> = Vec::new();
         if ra != rb {
-            stack.push(
-                items(&mut cx.trees, b"", Some(ra), Some(rb), paths, after)
-                    .await?
-                    .into_iter(),
-            );
+            stack.push(Dir::new(&mut cx.trees, Vec::new(), Some(ra), Some(rb), after).await?);
         }
         // Walk until one file past the page, which proves there is a next
         // page.
         'walk: while let Some(frame) = stack.last_mut() {
-            let Some(item) = frame.next() else {
+            let Some(item) = frame.next(&mut cx.trees, paths).await? else {
                 stack.pop();
                 continue;
             };
@@ -442,8 +520,7 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
                     Resume::Partly => after,
                     Resume::None => continue,
                 };
-                let children = items(&mut cx.trees, &item.path, da, db, paths, within).await?;
-                stack.push(children.into_iter());
+                stack.push(Dir::new(&mut cx.trees, item.path, da, db, within).await?);
             }
         }
         let next = if files.len() > limit {

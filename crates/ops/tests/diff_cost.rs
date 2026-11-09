@@ -235,3 +235,71 @@ async fn diff_handles_shard_collapse_and_directory_file_replacement() {
         }
     }
 }
+
+/// A page reads only the tree nodes on the path to its entries, however wide
+/// the directory and wherever the page starts: it never lists the directory.
+#[tokio::test]
+async fn every_page_of_a_wide_directory_reads_only_the_nodes_on_its_path() {
+    let e = env().await;
+    let plain = ops(&e.meta, &e.blobs);
+    let n = 20_000;
+    let base = commit(
+        &plain,
+        &[],
+        "old",
+        (0..n)
+            .map(|i| (path(&format!("d/f{i:05}")), write(b"old\n")))
+            .collect(),
+        &[Bytes::from_static(b"old\n")],
+    )
+    .await
+    .unwrap();
+    let next = commit(
+        &plain,
+        &[base],
+        "new",
+        (0..n)
+            .map(|i| (path(&format!("d/f{i:05}")), write(b"new\n")))
+            .collect(),
+        &[Bytes::from_static(b"new\n")],
+    )
+    .await
+    .unwrap();
+    let page = |after: Option<&str>| {
+        let (meta, blobs) = (e.meta.clone(), e.blobs.clone());
+        let after = after.map(|a| ops::DiffCursor::from_bytes(a.as_bytes()).unwrap());
+        async move {
+            let faults = Faults::new();
+            let meta = Arc::new(FaultMetaStore::new(meta, faults.clone()));
+            let blobs = Arc::new(FaultBlobStore::new(blobs, faults.clone()));
+            let cold = ops(&meta, &blobs);
+            let got = cold
+                .diff(
+                    REPO,
+                    base,
+                    next,
+                    &ops::DiffOptions {
+                        mode: DiffMode::Names,
+                        paths: &[],
+                        after: after.as_ref(),
+                        limit: 100,
+                    },
+                )
+                .await
+                .unwrap();
+            (got, faults.counts().meta_get_keys)
+        }
+    };
+    let (first, first_keys) = page(None).await;
+    assert_eq!(first.files[0].path, b"d/f00000");
+    let (deep, deep_keys) = page(Some("d/f15000")).await;
+    assert_eq!(deep.files[0].path, b"d/f15001");
+    assert_eq!(deep.files.len(), 100);
+    // Each side of `d` is a trie of about 23 nodes (a top node, two shards,
+    // and 20 under them). A page reads only the nodes on the path to its
+    // entries, and the two RootTree values: about 10 keys, wherever it
+    // starts. Listing the whole directory would read more than 46.
+    for (what, keys) in [("first", first_keys), ("deep", deep_keys)] {
+        assert!(keys <= 16, "the {what} page read {keys} keys");
+    }
+}
