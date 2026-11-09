@@ -1,7 +1,7 @@
-//! A crash at every write step of uploading blobs and creating a changeset
-//! leaves no broken reference (INV-22), on Postgres and the object store:
-//! after the crash every stored record's references are stored, and rerunning
-//! the same work completes it.
+//! A crash at every write step of uploading blobs and creating a changeset,
+//! with one parent or as a merge, leaves no broken reference (INV-22), on
+//! Postgres and the object store: after the crash every stored record's
+//! references are stored, and rerunning the same work completes it.
 
 mod common;
 
@@ -20,11 +20,15 @@ use scion_core::{
 use store::fault::{CrashPoint, FaultBlobStore, FaultMetaStore, Faults, Write};
 use store::{BlobStore, MetaKey, MetaStore, ObjectBlobStore, ObjectKey, PgMetaStore};
 
-/// Uploads three blobs (one chunked) and creates a changeset on `base`.
+/// The side branch's file a merge takes.
+const SIDE: &[u8] = b"side\n";
+
+/// Uploads three blobs (one chunked) and creates a changeset on `parents`;
+/// a merge also takes the side branch's file.
 async fn flow<M: MetaStore, B: BlobStore>(
     meta: &Arc<M>,
     blobs: &Arc<B>,
-    base: ChangesetId,
+    parents: &[ChangesetId],
     variant: u32,
 ) -> Result<ChangesetId, ops::OpError> {
     let small = format!("small {variant}\n").into_bytes();
@@ -37,7 +41,7 @@ async fn flow<M: MetaStore, B: BlobStore>(
         Bytes::from(link.clone()),
     ];
     upload_blobs(&**meta, blobs, REPO, &contents).await?;
-    let changes = vec![
+    let mut changes = vec![
         (path("dir/a"), write(&small)),
         (path("new/deep/big"), write(&big)),
         (
@@ -50,10 +54,13 @@ async fn flow<M: MetaStore, B: BlobStore>(
         ),
         (path("dir/old"), FileChange::Deleted),
     ];
+    if parents.len() > 1 {
+        changes.push((path("side/s"), write(SIDE)));
+    }
     ops(meta, blobs)
         .create_changeset(
             REPO,
-            changeset(&[base], &format!("v{variant}"), changes),
+            changeset(parents, &format!("v{variant}"), changes),
             &CreateOptions::default(),
         )
         .await
@@ -206,9 +213,9 @@ fn written(faults: &Faults) -> BTreeSet<Key> {
     out
 }
 
-#[tokio::test]
-async fn a_crash_at_every_write_step_leaves_no_broken_reference() {
-    let env = env().await;
+/// The parents of the flow: `base` alone, or a merge of `base` and a side
+/// branch that adds `side/s` and changes `dir/a`.
+async fn parents(env: &Env, merge: bool) -> Vec<ChangesetId> {
     let plain = ops(&env.meta, &env.blobs);
     let mut m = Model::default();
     let (c, b) = m.apply(&[
@@ -216,12 +223,28 @@ async fn a_crash_at_every_write_step_leaves_no_broken_reference() {
         ("dir/old", Some((FileKind::Regular, b"o"))),
     ]);
     let base = commit(&plain, &[], "base", c, &b).await.unwrap();
+    if !merge {
+        return vec![base];
+    }
+    let (c, b) = m.apply(&[
+        ("dir/a", Some((FileKind::Regular, b"side a"))),
+        ("side/s", Some((FileKind::Regular, SIDE))),
+    ]);
+    let side = commit(&plain, &[base], "side", c, &b).await.unwrap();
+    vec![base, side]
+}
+
+/// A crash before or after every write step of the flow leaves no broken
+/// reference, and the client's retry after a restart completes it.
+async fn crash_at_every_write_step(merge: bool) {
+    let env = env().await;
+    let parents = parents(&env, merge).await;
 
     // Count the write steps of one complete run.
     let faults = Faults::new();
     let meta = Arc::new(FaultMetaStore::new(env.meta.clone(), faults.clone()));
     let blobs = Arc::new(FaultBlobStore::new(env.blobs.clone(), faults.clone()));
-    flow(&meta, &blobs, base, 0).await.unwrap();
+    flow(&meta, &blobs, &parents, 0).await.unwrap();
     assert!(
         !faults.crashed(),
         "a run with no crash point reports a crash"
@@ -237,7 +260,7 @@ async fn a_crash_at_every_write_step_leaves_no_broken_reference() {
             faults.crash_at(step, point);
             let meta = Arc::new(FaultMetaStore::new(env.meta.clone(), faults.clone()));
             let blobs = Arc::new(FaultBlobStore::new(env.blobs.clone(), faults.clone()));
-            let crashed = flow(&meta, &blobs, base, variant).await;
+            let crashed = flow(&meta, &blobs, &parents, variant).await;
             assert!(
                 crashed.is_err() && faults.crashed(),
                 "step {step} {point:?} did not crash"
@@ -252,7 +275,7 @@ async fn a_crash_at_every_write_step_leaves_no_broken_reference() {
             check_references(&env.meta, &env.blobs, &keys).await;
             // The process restarts and the client retries.
             faults.restart();
-            let id = flow(&meta, &blobs, base, variant).await.unwrap();
+            let id = flow(&meta, &blobs, &parents, variant).await.unwrap();
             keys.extend(written(&faults));
             keys.insert(Key::Meta(MetaKey::Changeset(id)));
             check_references(&env.meta, &env.blobs, &keys).await;
@@ -261,23 +284,26 @@ async fn a_crash_at_every_write_step_leaves_no_broken_reference() {
     }
 }
 
+#[tokio::test]
+async fn a_crash_at_every_write_step_leaves_no_broken_reference() {
+    crash_at_every_write_step(false).await;
+}
+
+#[tokio::test]
+async fn a_crash_at_every_write_step_of_a_merge_leaves_no_broken_reference() {
+    crash_at_every_write_step(true).await;
+}
+
 /// A transient store failure at any write step fails the create retryably,
 /// without crashing the server, and leaves no broken reference; the retry
 /// on the same server succeeds.
-#[tokio::test]
-async fn a_transient_failure_at_every_write_step_is_retryable() {
+async fn transient_failure_at_every_write_step(merge: bool) {
     let env = env().await;
-    let plain = ops(&env.meta, &env.blobs);
-    let mut m = Model::default();
-    let (c, b) = m.apply(&[
-        ("dir/a", Some((FileKind::Regular, b"a"))),
-        ("dir/old", Some((FileKind::Regular, b"o"))),
-    ]);
-    let base = commit(&plain, &[], "base", c, &b).await.unwrap();
+    let parents = parents(&env, merge).await;
     let faults = Faults::new();
     let meta = Arc::new(FaultMetaStore::new(env.meta.clone(), faults.clone()));
     let blobs = Arc::new(FaultBlobStore::new(env.blobs.clone(), faults.clone()));
-    flow(&meta, &blobs, base, 1000).await.unwrap();
+    flow(&meta, &blobs, &parents, 1000).await.unwrap();
     let steps = faults.writes().len() as u64;
     for step in 0..steps {
         let variant = 1001 + step as u32;
@@ -285,14 +311,24 @@ async fn a_transient_failure_at_every_write_step_is_retryable() {
         faults.fail_transiently_at(step);
         let meta = Arc::new(FaultMetaStore::new(env.meta.clone(), faults.clone()));
         let blobs = Arc::new(FaultBlobStore::new(env.blobs.clone(), faults.clone()));
-        let err = flow(&meta, &blobs, base, variant).await.unwrap_err();
+        let err = flow(&meta, &blobs, &parents, variant).await.unwrap_err();
         assert!(err.code.retryable(), "step {step}: {err}");
         assert!(!faults.crashed());
         let mut keys = written(&faults);
         check_references(&env.meta, &env.blobs, &keys).await;
-        let id = flow(&meta, &blobs, base, variant).await.unwrap();
+        let id = flow(&meta, &blobs, &parents, variant).await.unwrap();
         keys.extend(written(&faults));
         keys.insert(Key::Meta(MetaKey::Changeset(id)));
         check_references(&env.meta, &env.blobs, &keys).await;
     }
+}
+
+#[tokio::test]
+async fn a_transient_failure_at_every_write_step_is_retryable() {
+    transient_failure_at_every_write_step(false).await;
+}
+
+#[tokio::test]
+async fn a_transient_failure_at_every_write_step_of_a_merge_is_retryable() {
+    transient_failure_at_every_write_step(true).await;
 }
