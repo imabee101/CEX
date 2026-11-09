@@ -110,8 +110,8 @@ type Pair = (Vec<u8>, Option<EntryTarget>, Option<EntryTarget>);
 /// The entries that differ between two directories, in name order, read
 /// lazily: a shard is expanded only when the merge reaches it, and an entry
 /// or shard whose names all sort before `from` (and none of which is a
-/// prefix of it) is dropped unread. Memory is bounded by the nodes on the
-/// two frontiers. When a path filter names only some of the directory's
+/// prefix of it) is dropped unread. Memory is bounded by the nodes the
+/// request reads, which it keeps until it ends. When a path filter names only some of the directory's
 /// entries, those are looked up directly instead (`only`).
 struct Pairs {
     a: VecDeque<TreeEntry>,

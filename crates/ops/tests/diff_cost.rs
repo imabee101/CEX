@@ -465,20 +465,25 @@ async fn a_large_filter_takes_reads_bounded_by_the_nodes_it_reaches() {
     let faults = Faults::new();
     let meta = Arc::new(FaultMetaStore::new(e.meta.clone(), faults.clone()));
     let blobs = Arc::new(FaultBlobStore::new(e.blobs.clone(), faults.clone()));
-    let got = diff_paged(
-        &ops(&meta, &blobs),
-        base,
-        next,
-        DiffMode::Names,
-        &filters,
-        100,
-    )
-    .await
-    .unwrap();
+    // No shared tree cache: only the request's own record of the nodes it
+    // has read can keep the reads down.
+    let uncached = ops::Ops::new(Arc::new(derived::Deriver::new(
+        meta,
+        blobs,
+        derived::CacheSizes {
+            trees: 0,
+            ..derived::CacheSizes::default()
+        },
+    )));
+    let got = diff_paged(&uncached, base, next, DiffMode::Names, &filters, 100)
+        .await
+        .unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].path, b"d/f19999");
-    // `d` is a trie of about 23 nodes per side, each read once per request;
-    // reading per name would take thousands of reads.
+    // `d` is a trie of 23 nodes (a top node, two shards, and 20 leaves),
+    // and one store call reads both sides' node at each step; each is
+    // read once per request, so `d` costs about 23 calls and the root and
+    // derived values the rest. Reading per name would take thousands.
     let reads = faults.counts().meta_gets;
     assert!(reads <= 30, "{reads} store reads");
 }
