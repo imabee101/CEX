@@ -18,10 +18,14 @@ mod s3 {
     use std::sync::Arc;
 
     use store::ObjectBlobStore;
-    use store::testing::object_store;
+    use store::testing::TestPrefix;
 
-    async fn make() -> (Arc<ObjectBlobStore>, ()) {
-        (Arc::new(ObjectBlobStore::new(Arc::new(object_store()))), ())
+    async fn make() -> (Arc<ObjectBlobStore>, TestPrefix) {
+        let prefix = TestPrefix::create();
+        (
+            Arc::new(ObjectBlobStore::new(Arc::new(prefix.store()))),
+            prefix,
+        )
     }
 
     store::blob_store_conformance!(make);
@@ -99,10 +103,10 @@ mod separate_clients {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn on_s3() {
-        let prefix = store::testing::unique_name();
+        let prefix = store::testing::TestPrefix::create();
         // Each client gets its own HTTP client, as separate servers do.
         let separate: Vec<ObjectBlobStore> = (0..CLIENTS)
-            .map(|_| ObjectBlobStore::new(Arc::new(store::testing::named_object_store(&prefix))))
+            .map(|_| ObjectBlobStore::new(Arc::new(prefix.store())))
             .collect();
         race(separate).await;
     }

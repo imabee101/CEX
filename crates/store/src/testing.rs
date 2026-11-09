@@ -1,7 +1,9 @@
 //! Per-test isolation for tests that use the dev environment started by
-//! `cargo xtask dev-up`: each test gets its own Postgres database, created from
-//! the template database, and its own object-store key prefix, so tests run in
-//! parallel.
+//! `cargo xtask dev-up`: each test gets its own Postgres database
+//! ([`TestDatabase`]), created from the template database, and its own
+//! object-store key prefix ([`TestPrefix`]), so tests run in parallel. Each is
+//! removed when the test drops it; what a killed process leaves behind is
+//! removed by a later process's sweep (see [`Owner`] and [`Sweeper`]).
 //!
 //! Connection settings default to the values in the workspace `compose.yaml`
 //! and can be overridden with `SCION_TEST_PG_URL`, `SCION_TEST_S3_ENDPOINT`,
@@ -34,48 +36,119 @@ fn setting(var: &str, default: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| default.to_owned())
 }
 
-/// Returns a name no other test in any process has used, of the form the
-/// sweeper recognizes as owned by this process: use it for a database or key
-/// prefix that several handles in one test share.
-pub fn unique_name() -> String {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    name_for(
-        std::process::id(),
-        nanos,
-        NEXT.fetch_add(1, Ordering::Relaxed),
-    )
+/// The prefix of the application name of an owner's Postgres session; the
+/// owner's token follows it.
+const OWNER_SESSION: &str = "scion-test-owner:";
+
+/// The owner of the databases and key prefixes a test process names: a
+/// Postgres session in the dev environment, held open on its own thread for
+/// as long as the owner lives, whose application name carries the owner's
+/// token. Every name the owner makes carries the token too, so a sweep can
+/// tell the leftovers of a process that has gone (its session ended when
+/// the process did, however it ended) from the names of a running one. This
+/// works the same on every platform, and across machines, containers, and
+/// worktrees that share one dev environment.
+#[derive(Debug)]
+pub struct Owner {
+    token: String,
+    backend_pid: i32,
+    session: tokio_postgres::Client,
 }
 
-/// The name `unique_name` makes for process `pid` of this machine and PID
-/// namespace: `t_<namespace>_<pid>_<nanos>_<n>`.
-pub fn name_for(pid: u32, nanos: u128, n: u64) -> String {
-    format!("t_{}_{pid}_{nanos}_{n}", process_namespace())
-}
-
-/// This process's PID namespace, as 16 hex digits hashed from the machine's
-/// boot id and the namespace's inode, or `0` where they cannot be read. A
-/// pid identifies a process only within its namespace, so only names from
-/// this namespace are ever swept.
-fn process_namespace() -> &'static str {
-    static NAMESPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    NAMESPACE.get_or_init(|| {
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id");
-        let ns = std::fs::read_link("/proc/self/ns/pid");
-        match (boot, ns) {
-            (Ok(boot), Ok(ns)) => {
-                use std::hash::{Hash, Hasher};
-                // The same in every process of one build; a sweeper from
-                // another build sees different names and leaves them alone.
-                let mut h = std::hash::DefaultHasher::new();
-                (boot.trim(), ns).hash(&mut h);
-                format!("{:016x}", h.finish())
-            }
-            _ => "0".to_owned(),
+impl Owner {
+    /// Opens a new owner's session, with a token no other owner has.
+    pub fn register() -> Self {
+        use std::hash::BuildHasher;
+        // Each `RandomState` has its own random keys; the pid and the time
+        // only add to them.
+        let token = format!(
+            "{:016x}",
+            std::hash::RandomState::new().hash_one((std::process::id(), SystemTime::now()))
+        );
+        let (opened, receive) = std::sync::mpsc::channel();
+        let mut config = base_config();
+        config
+            .dbname("postgres")
+            .application_name(format!("{OWNER_SESSION}{token}"));
+        std::thread::Builder::new()
+            .name("scion-test-owner".into())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("building the owner's runtime failed")
+                    .block_on(async move {
+                        let (session, connection) = config
+                            .connect(tokio_postgres::NoTls)
+                            .await
+                            .expect(NOT_RUNNING);
+                        let driver = tokio::spawn(connection);
+                        let pid: i32 = session
+                            .query_one("SELECT pg_backend_pid()", &[])
+                            .await
+                            .expect("reading the owner's backend pid failed")
+                            .get(0);
+                        // The receiver waits for exactly this message.
+                        let _ = opened.send((session, pid));
+                        // Drives the session until it ends.
+                        let _ = driver.await;
+                    });
+            })
+            .expect("starting the owner's thread failed");
+        let (session, backend_pid) = receive.recv().expect(NOT_RUNNING);
+        Self {
+            token,
+            backend_pid,
+            session,
         }
-    })
+    }
+
+    /// The `n`th name this owner makes: `t_<token>_<n>`.
+    pub fn name(&self, n: u64) -> String {
+        assert!(
+            !self.session.is_closed(),
+            "the owner's session in the dev environment ended (did its Postgres restart?)"
+        );
+        format!("t_{}_{n}", self.token)
+    }
+
+    /// Ends the owner's session, as the server does when the process holding
+    /// it dies, and returns once the session is gone.
+    pub async fn end(self) {
+        let mut admin = base_config();
+        admin.dbname("postgres");
+        let ended: bool = connect(&admin)
+            .await
+            .query_one(
+                "SELECT pg_terminate_backend($1, 10000)",
+                &[&self.backend_pid],
+            )
+            .await
+            .expect("ending the owner's session failed")
+            .get(0);
+        assert!(ended, "the owner's session did not end");
+    }
+}
+
+/// Returns a name no other test in any process has used, owned by this
+/// process: use it for a database or key prefix that several handles in one
+/// test share.
+pub fn unique_name() -> String {
+    static OWNER: std::sync::OnceLock<Owner> = std::sync::OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    OWNER
+        .get_or_init(Owner::register)
+        .name(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The owner's token in `name`, if a test helper made it.
+fn owner_token(name: &str) -> Option<&str> {
+    let (token, n) = name.strip_prefix("t_")?.split_once('_')?;
+    let token_ok = token.len() == 16
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (token_ok && n.parse::<u64>().is_ok()).then_some(token)
 }
 
 /// Connection settings for the dev environment's Postgres server, with no
@@ -202,16 +275,58 @@ pub fn s3_env() -> (String, String, Vec<(&'static str, String)>) {
     )
 }
 
-/// Returns an object store confined to a key prefix no other test uses, in the
-/// dev environment's bucket.
-pub fn object_store() -> PrefixStore<AmazonS3> {
-    sweep_now_and_then();
-    named_object_store(&unique_name())
+/// An object-store key prefix owned by one test, in the dev environment's
+/// bucket, no other test uses; every object under it is deleted when this
+/// value is dropped.
+#[derive(Debug)]
+pub struct TestPrefix {
+    name: String,
+}
+
+impl TestPrefix {
+    /// Claims a fresh key prefix.
+    pub fn create() -> Self {
+        sweep_now_and_then();
+        Self {
+            name: unique_name(),
+        }
+    }
+
+    /// The prefix's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// An object store confined to the prefix, with its own client.
+    pub fn store(&self) -> PrefixStore<AmazonS3> {
+        named_object_store(&self.name)
+    }
+}
+
+impl Drop for TestPrefix {
+    fn drop(&mut self) {
+        let name = std::mem::take(&mut self.name);
+        // Drop may run inside or outside a runtime, so delete from a
+        // dedicated thread with its own runtime.
+        let deleted = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("building a runtime to delete the test prefix failed")
+                .block_on(delete_prefix(&name))
+        })
+        .join();
+        if !std::thread::panicking() {
+            deleted
+                .expect("deleting the test prefix panicked")
+                .expect("deleting the test prefix failed");
+        }
+    }
 }
 
 /// Returns an object store confined to the key prefix `prefix` in the dev
 /// environment's bucket. Only data shared on purpose, such as a cached
-/// generated repo, uses a fixed prefix; tests write to [`object_store()`].
+/// generated repo, uses a fixed prefix; tests write under a [`TestPrefix`].
 pub fn named_object_store(prefix: &str) -> PrefixStore<AmazonS3> {
     PrefixStore::new(bucket(), Path::from(prefix))
 }
@@ -240,7 +355,15 @@ pub struct TempDir {
 impl TempDir {
     /// Creates an empty directory no other test uses.
     pub fn create() -> Self {
-        let path = test_tmp_root().join(format!("scion-{}", unique_name()));
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let path = test_tmp_root().join(format!(
+            "scion-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&path).expect("creating the test directory failed");
         Self { path }
     }
@@ -312,41 +435,16 @@ impl<B: crate::BlobStore, T: crate::BlobStore> crate::BlobStore for OverlayBlobS
 
 // ---------------------------------------------------------------- sweeping
 
-/// How often, at most, test processes on one machine sweep the dev
-/// environment for leftovers.
+/// How often, at most, the test processes of one target directory start a
+/// sweep of the dev environment for leftovers.
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How many object deletions one sweep runs at once.
 const SWEEP_DELETE_CONCURRENCY: usize = 32;
 
-/// The test process that created a database or key prefix, from its name
-/// (`t_<namespace>_<pid>_<nanos>_<n>`), if it was made in this process's PID
-/// namespace; `None` otherwise, or for names no test helper creates.
-fn owner_pid(name: &str) -> Option<u32> {
-    let mut parts = name.strip_prefix("t_")?.split('_');
-    let namespace = parts.next()?;
-    if namespace == "0" || namespace != process_namespace() {
-        return None;
-    }
-    let pid = parts.next()?.parse().ok()?;
-    let nanos_ok = parts.next()?.parse::<u128>().is_ok();
-    let n_ok = parts.next()?.parse::<u64>().is_ok();
-    (nanos_ok && n_ok && parts.next().is_none()).then_some(pid)
-}
-
-/// Whether the process `pid` may still be running. Where liveness cannot be
-/// checked (no `/proc`), every process counts as running, so nothing is
-/// swept.
-fn may_be_running(pid: u32) -> bool {
-    let proc = std::path::Path::new("/proc");
-    !proc.is_dir() || proc.join(pid.to_string()).exists()
-}
-
-/// Whether `name` was created by a test process that has exited, so it is
-/// garbage: its owner can never drop it.
-fn is_orphan(name: &str) -> bool {
-    owner_pid(name).is_some_and(|pid| !may_be_running(pid))
-}
+/// The advisory-lock key that serializes sweeps across every process using
+/// the dev environment.
+const SWEEP_LOCK: i64 = 0x5C10_5EE9;
 
 /// What one sweep removed.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -359,51 +457,97 @@ pub struct Swept {
     pub objects: usize,
 }
 
-/// Drops every test database and deletes every test key prefix whose
-/// creating process has exited.
+/// The holder of the dev environment's sweep lock, a session-level advisory
+/// lock in its Postgres: at most one sweep runs at a time, whichever process
+/// and machine it runs on. The lock is released when this value is dropped.
 ///
-/// A test drops its own database when it ends, but a killed test process
-/// (a nextest timeout, a cargo-mutants timeout, the OOM killer) never does,
-/// and nothing deletes test key prefixes. Left alone, these accumulate
-/// without bound. Databases that still have connections are kept.
-pub async fn sweep_orphans() -> Result<Swept, String> {
-    sweep_orphans_among(|_| true).await
+/// A test drops its own database and deletes its own key prefix when it
+/// ends, but a killed test process (a nextest timeout, a cargo-mutants
+/// timeout, the OOM killer) never does. Left alone, these accumulate without
+/// bound, so sweeps remove them.
+#[derive(Debug)]
+pub struct Sweeper {
+    admin: tokio_postgres::Client,
 }
 
-/// Like [`sweep_orphans`], but considers only the databases and key prefixes
-/// whose names `scope` accepts.
-pub async fn sweep_orphans_among(scope: impl Fn(&str) -> bool) -> Result<Swept, String> {
-    let mut swept = Swept::default();
-    let mut admin = base_config();
-    admin.dbname("postgres");
-    let client = connect(&admin).await;
-    let rows = client
-        .query(
-            "SELECT d.datname FROM pg_database d \
-             WHERE d.datname LIKE 't\\_%' \
-             AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)",
-            &[],
-        )
-        .await
-        .map_err(|e| format!("listing test databases failed: {e}"))?;
-    for row in rows {
-        let name: String = row.get(0);
-        if scope(&name) && is_orphan(&name) {
-            client
+impl Sweeper {
+    async fn admin() -> tokio_postgres::Client {
+        let mut admin = base_config();
+        admin.dbname("postgres");
+        connect(&admin).await
+    }
+
+    /// Waits for the sweep lock.
+    pub async fn lock() -> Self {
+        let admin = Self::admin().await;
+        admin
+            .execute("SELECT pg_advisory_lock($1)", &[&SWEEP_LOCK])
+            .await
+            .expect("taking the sweep lock failed");
+        Self { admin }
+    }
+
+    /// Takes the sweep lock, or returns `None` when another sweep holds it.
+    pub async fn try_lock() -> Option<Self> {
+        let admin = Self::admin().await;
+        let taken: bool = admin
+            .query_one("SELECT pg_try_advisory_lock($1)", &[&SWEEP_LOCK])
+            .await
+            .expect("taking the sweep lock failed")
+            .get(0);
+        taken.then_some(Self { admin })
+    }
+
+    /// Drops every test database and deletes every test key prefix whose
+    /// name `scope` accepts and whose owner's session has ended. Databases
+    /// that still have connections are kept.
+    pub async fn sweep_among(&self, scope: impl Fn(&str) -> bool) -> Result<Swept, String> {
+        let databases: Vec<String> = self
+            .admin
+            .query(
+                "SELECT d.datname FROM pg_database d \
+                 WHERE d.datname LIKE 't\\_%' \
+                 AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("listing test databases failed: {e}"))?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let prefixes = top_level_prefixes().await?;
+        // Read after the names: an owner registers before it makes a name,
+        // so the owner of every name listed above is live here unless it has
+        // ended.
+        let live: std::collections::HashSet<String> = self
+            .admin
+            .query(
+                "SELECT substr(application_name, length($1) + 1) FROM pg_stat_activity \
+                 WHERE starts_with(application_name, $1)",
+                &[&OWNER_SESSION],
+            )
+            .await
+            .map_err(|e| format!("listing live owners failed: {e}"))?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let orphan = |name: &str| {
+            scope(name) && owner_token(name).is_some_and(|token| !live.contains(token))
+        };
+        let mut swept = Swept::default();
+        for name in databases.iter().filter(|n| orphan(n)) {
+            self.admin
                 .batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\""))
                 .await
                 .map_err(|e| format!("dropping orphaned database {name} failed: {e}"))?;
             swept.databases += 1;
         }
-    }
-
-    for name in top_level_prefixes().await? {
-        if scope(&name) && is_orphan(&name) {
-            swept.objects += delete_prefix(&name).await?;
+        for name in prefixes.iter().filter(|n| orphan(n)) {
+            swept.objects += delete_prefix(name).await?;
             swept.prefixes += 1;
         }
+        Ok(swept)
     }
-    Ok(swept)
 }
 
 /// The names of the top-level key prefixes in the dev environment's bucket.
@@ -467,11 +611,11 @@ fn join_delete(
 }
 
 /// Starts a background sweep of the dev environment at most once per
-/// [`SWEEP_INTERVAL`] across every test process on this machine. Called by
-/// the per-test helpers, so leftovers of killed runs are removed by later
-/// runs with no separate cleanup step. The sweep runs on its own thread and
-/// never delays the test; a process that exits mid-sweep leaves the rest to
-/// the next sweeper.
+/// [`SWEEP_INTERVAL`] across the test processes of one target directory,
+/// unless another sweep is running. Called by the per-test helpers, so
+/// leftovers of killed runs are removed by later runs with no separate
+/// cleanup step. The sweep runs on its own thread and never delays the test;
+/// a process that exits mid-sweep leaves the rest to the next sweeper.
 fn sweep_now_and_then() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -483,53 +627,25 @@ fn sweep_now_and_then() {
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age < SWEEP_INTERVAL);
-        if recent || !claim_sweep_lock(&dir.join("sweep.lock")) {
+        if recent {
             return;
         }
+        std::fs::write(&stamp, b"").expect("writing the sweep stamp failed");
         std::thread::spawn(move || {
-            let swept = tokio::runtime::Builder::new_current_thread()
+            tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("building a runtime to sweep the dev environment failed")
-                .block_on(sweep_orphans());
-            std::fs::write(&stamp, b"").expect("writing the sweep stamp failed");
-            std::fs::remove_file(dir.join("sweep.lock")).expect("removing the sweep lock failed");
-            swept.expect("sweeping the dev environment failed");
+                .block_on(async {
+                    if let Some(sweeper) = Sweeper::try_lock().await {
+                        sweeper
+                            .sweep_among(|_| true)
+                            .await
+                            .expect("sweeping the dev environment failed");
+                    }
+                });
         });
     });
-}
-
-/// Takes the machine-wide sweep lock, a file holding the sweeper's pid,
-/// taking it over when that process has exited. Returns whether this
-/// process now holds it.
-fn claim_sweep_lock(lock: &std::path::Path) -> bool {
-    use std::io::Write;
-    let holder = std::fs::read_to_string(lock).ok();
-    if holder
-        .as_deref()
-        .and_then(|pid| pid.trim().parse().ok())
-        .is_some_and(|pid| !may_be_running(pid))
-    {
-        // Two processes may both see the dead holder; only one of them wins
-        // the `create_new` below.
-        match std::fs::remove_file(lock) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => panic!("removing a dead sweeper's lock failed: {e}"),
-        }
-    }
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(lock)
-    {
-        Ok(mut file) => {
-            write!(file, "{}", std::process::id()).expect("writing the sweep lock failed");
-            true
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(e) => panic!("creating the sweep lock failed: {e}"),
-    }
 }
 
 fn test_tmp_root() -> std::path::PathBuf {
@@ -539,35 +655,25 @@ fn test_tmp_root() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn only_names_made_by_test_helpers_have_an_owner() {
-        use super::{name_for, owner_pid};
+    fn only_names_made_by_owners_have_an_owner_token() {
+        use super::owner_token;
         assert_eq!(
-            owner_pid(&name_for(42, 1_700_000_000_000_000_000, 7)),
-            Some(42)
+            owner_token("t_0123456789abcdef_7"),
+            Some("0123456789abcdef")
         );
-        let ns = super::process_namespace();
-        assert_ne!(ns, "0", "this test runs where namespaces can be read");
-        let other_namespace = "t_0123456789abcdef_42_1700000000000000000_7".to_owned();
         for name in [
-            other_namespace.as_str(),
-            &format!("t_{ns}_42_1700000000000000000"),
-            &format!("t_{ns}_42_1700000000000000000_7_8"),
-            &format!("t_{ns}_x_1_2"),
-            &format!("t_{ns}_42_1_x"),
+            "t_0123456789abcdef",
+            "t_0123456789abcdef_7_8",
+            "t_0123456789abcde_7",
+            "t_0123456789ABCDEF_7",
+            "t_0123456789abcdeg_7",
+            "t_0123456789abcdef_x",
+            "u_0123456789abcdef_7",
             "bench_7b4173f81314ef72",
             "scion_template",
         ] {
-            assert_eq!(owner_pid(name), None, "{name}");
+            assert_eq!(owner_token(name), None, "{name}");
         }
-    }
-
-    #[test]
-    fn names_of_running_processes_are_not_orphans() {
-        let own = super::name_for(std::process::id(), 1, 0);
-        assert!(!super::is_orphan(&own));
-        // No process has this pid: Linux pids stay below 2^22.
-        assert!(super::is_orphan(&super::name_for(u32::MAX, 1, 0)));
-        assert!(!super::is_orphan("bench_7b4173f81314ef72"));
     }
 
     use super::TempDir;

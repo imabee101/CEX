@@ -16,7 +16,7 @@ use scion_core::{
     MAX_TREE_ENTRIES, RepoPath, Timestamp, Tree, TreeEntry, TreeId,
 };
 use sha2::{Digest, Sha256};
-use store::testing::{TestDatabase, object_store};
+use store::testing::{TestDatabase, TestPrefix};
 use store::{BlobStore, MetaStore, ObjectBlobStore, PgMetaStore, RepoId};
 
 pub const REPO: RepoId = RepoId(7);
@@ -31,6 +31,7 @@ pub struct Env {
     pub db: TestDatabase,
     pub meta: Arc<PgMetaStore>,
     pub blobs: Arc<ObjectBlobStore>,
+    pub prefix: TestPrefix,
 }
 
 pub async fn env() -> Env {
@@ -42,10 +43,12 @@ pub async fn env() -> Env {
     )
     .unwrap();
     meta.migrate().await.unwrap();
+    let prefix = TestPrefix::create();
     Env {
         db,
         meta: Arc::new(meta),
-        blobs: Arc::new(ObjectBlobStore::new(Arc::new(object_store()))),
+        blobs: Arc::new(ObjectBlobStore::new(Arc::new(prefix.store()))),
+        prefix,
     }
 }
 

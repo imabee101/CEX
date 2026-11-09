@@ -5,7 +5,7 @@ mod support;
 
 use object_store::ObjectStoreExt;
 use scion_core::{BlobId, Changeset, ChunkId, ChunkList, Frame, Tree};
-use store::testing::{TestDatabase, object_store};
+use store::testing::{TestDatabase, TestPrefix};
 use support::vectors::{self, Ty};
 
 #[tokio::test]
@@ -18,7 +18,8 @@ async fn canonical_vectors_and_ids_survive_postgres_and_object_storage() {
         .batch_execute("CREATE TABLE vectors (name TEXT PRIMARY KEY, bytes BYTEA NOT NULL)")
         .await
         .unwrap();
-    let objects = object_store();
+    let prefix = TestPrefix::create();
+    let objects = prefix.store();
     for vector in vectors {
         client
             .execute(
