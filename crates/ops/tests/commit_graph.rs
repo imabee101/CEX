@@ -346,42 +346,42 @@ async fn check(shape: Shape, n: usize, seed: u64) {
 }
 
 #[tokio::test]
-async fn slow_commit_graph_equals_the_model_on_a_linear_history() {
+async fn commit_graph_equals_the_model_on_a_linear_history() {
     check(Shape::Linear, 3000, 1).await;
 }
 
 #[tokio::test]
-async fn slow_commit_graph_equals_the_model_with_short_side_branches() {
+async fn commit_graph_equals_the_model_with_short_side_branches() {
     check(Shape::ShortSideBranches, 3000, 2).await;
 }
 
 #[tokio::test]
-async fn slow_commit_graph_equals_the_model_with_overlapping_feature_branches() {
+async fn commit_graph_equals_the_model_with_overlapping_feature_branches() {
     // Long enough for branches forking 2,000 main-line commits back.
     check(Shape::OverlappingFeatures, 4500, 3).await;
 }
 
 #[tokio::test]
-async fn slow_commit_graph_equals_the_model_with_long_lived_branches() {
+async fn commit_graph_equals_the_model_with_long_lived_branches() {
     check(Shape::LongLived, 3000, 4).await;
 }
 
 #[tokio::test]
-async fn slow_commit_graph_equals_the_model_with_release_branches() {
+async fn commit_graph_equals_the_model_with_release_branches() {
     check(Shape::Releases, 3000, 5).await;
 }
 
 #[tokio::test]
-async fn slow_commit_graph_equals_the_model_with_octopus_merges() {
+async fn commit_graph_equals_the_model_with_octopus_merges() {
     check(Shape::Octopus, 3000, 6).await;
 }
 
 #[tokio::test]
-async fn slow_commit_graph_equals_the_model_with_criss_cross_merges() {
+async fn commit_graph_equals_the_model_with_criss_cross_merges() {
     check(Shape::CrissCross, 3000, 7).await;
 }
 
 #[tokio::test]
-async fn slow_commit_graph_equals_the_model_with_several_roots() {
+async fn commit_graph_equals_the_model_with_several_roots() {
     check(Shape::SeveralRoots, 3000, 8).await;
 }
