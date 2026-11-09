@@ -651,3 +651,45 @@ async fn upload(ops: &PgOps, content: &[u8]) {
     .await
     .unwrap();
 }
+
+/// A case conflict reports the added path exactly, at every depth, with
+/// directory names holding dots and non-ASCII letters.
+#[tokio::test]
+async fn case_conflicts_report_the_exact_path_at_every_depth() {
+    let env = env().await;
+    let ops = ops(&env.meta, &env.blobs);
+    let dirs = [
+        "",
+        "src",
+        "src/caf\u{e9}.d",
+        "src/caf\u{e9}.d/v1.2",
+        "src/caf\u{e9}.d/v1.2/x/y.z",
+    ];
+    let file = |dir: &str, name: &str| {
+        if dir.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{dir}/{name}")
+        }
+    };
+    let changes: Vec<(String, FileChange)> = dirs
+        .iter()
+        .map(|d| {
+            let p = file(d, "Read.me");
+            let c = content(&p);
+            (p, c)
+        })
+        .collect();
+    let base = try_create(
+        &ops,
+        commit(&ops, &[], "root", vec![], &[]).await.unwrap(),
+        changes.iter().map(|(p, c)| (p.as_str(), *c)).collect(),
+        &CreateOptions::default(),
+    )
+    .await
+    .unwrap();
+    for d in dirs {
+        let p = file(d, "READ.ME");
+        expect(&ops, base, vec![(&p, content(&p))], Code::CaseConflict, &p).await;
+    }
+}
