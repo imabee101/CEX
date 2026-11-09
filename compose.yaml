@@ -23,7 +23,7 @@ services:
       - -c
       - max_connections=1000
     # Bounded, so a leak fails loudly instead of consuming host memory. The
-    # largest database, the cached bench repo, is about 2 GB.
+    # largest database, the cached 3M-file repo, is about 2 GB.
     tmpfs:
       - /var/lib/postgresql:size=12g
     ports:

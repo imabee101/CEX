@@ -1,7 +1,12 @@
 //! Create cost does not grow with repo size (INV-1): on Postgres and the
-//! object store, creating a changeset on the 3,000,000-file bench repo costs
-//! within 1.5× of the same change on a 10,000-file repo from the same
-//! generator, by wall time and by every store-call measure.
+//! object store, creating a changeset on a 3,000,000-file repo costs within
+//! 1.5× of the same change on a 10,000-file repo from the same generator, by
+//! wall time and by every store-call measure.
+//!
+//! Both repos have the bench repo's layout and small file contents. Create
+//! never reads an unchanged file's content, so content size cannot change
+//! its cost, and small contents keep the 3M-file fixture within a CI
+//! runner's disk.
 //!
 //! INV-1 bounds cost by changed files × path depth, so each run makes the
 //! same changes in both repos. The picked files are one per top-level
@@ -37,6 +42,15 @@ const DEPTH: usize = 4;
 const RUNS: usize = 9;
 /// The largest allowed ratio of big-repo cost to small-repo cost.
 const MAX_RATIO: f64 = 1.5;
+
+/// The 3M-file repo: the bench repo's layout, with file sizes log-normal
+/// around 64 bytes and at most 4 KiB.
+const BIG: BenchParams = BenchParams {
+    median_size: 64.0,
+    sigma: 1.0,
+    max_size: 4096,
+    ..BENCH_TIP
+};
 
 #[derive(Debug)]
 struct Cost {
@@ -212,11 +226,11 @@ fn median(mut v: Vec<f64>) -> f64 {
 async fn slow_create_cost_is_independent_of_repo_size() {
     let small_params = BenchParams {
         files: 10_000,
-        ..BENCH_TIP
+        ..BIG
     };
-    let (small_files, big_files) = pick(&layout(&small_params), &layout(&BENCH_TIP));
+    let (small_files, big_files) = pick(&layout(&small_params), &layout(&BIG));
     let small = measure(&small_params, &small_files).await;
-    let big = measure(&BENCH_TIP, &big_files).await;
+    let big = measure(&BIG, &big_files).await;
     let metrics: [Metric; 6] = [
         ("wall time (ms)", |c| c.time.as_secs_f64() * 1000.0),
         ("metadata reads", |c| c.counts.meta_gets as f64),

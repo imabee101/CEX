@@ -56,8 +56,8 @@ mod separate_clients {
     use scion_core::BlobId;
     use store::{BlobStore, ObjectBlobStore, ObjectKey, PutOutcome, RepoId};
 
-    /// The eight concurrent writers of the ci-full incident this test
-    /// reproduces. The dev object store queues conditional writers of one key
+    /// Concurrent writers of one key, enough that their conditional puts
+    /// collide. The dev object store queues conditional writers of one key
     /// and answers them in one-second steps, so this race takes seconds there;
     /// S3 and the local filesystem answer at once.
     const CLIENTS: usize = 8;

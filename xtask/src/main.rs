@@ -49,11 +49,15 @@ enum Cmd {
         #[arg(long, value_enum)]
         only: Vec<Step>,
     },
-    /// Run the full check tier.
+    /// Run the full check tier: the fast tier's steps and the full tier's own.
     CiFull {
         /// Run only these steps.
         #[arg(long, value_enum)]
         only: Vec<Step>,
+        /// Run only shard K of N of the fuzz targets, written `K/N`, so that
+        /// N machines share the fuzz step.
+        #[arg(long, value_parser = parse_shard)]
+        fuzz_shard: Option<Shard>,
     },
     /// Run cargo-mutants with nextest on the diff against main, testing each
     /// mutant with the whole workspace's fast tests.
@@ -79,8 +83,8 @@ enum Step {
     Clippy,
     /// Tests outside the slow group.
     Test,
-    /// Every test, including the slow group.
-    TestAll,
+    /// The slow group.
+    TestSlow,
     Doctest,
     Doc,
     Deny,
@@ -89,7 +93,9 @@ enum Step {
     ProtoCheck,
     Fuzz,
     Msrv,
-    /// Public-crate and vfs tests; the full tier runs these on macOS and Windows too.
+    /// Clippy over the workspace, and the portable crates' tests and doc
+    /// tests: the checks CI also runs on macOS and Windows, where the dev
+    /// environment does not run.
     Portable,
 }
 
@@ -106,29 +112,23 @@ const FAST_TIER: &[Step] = &[
     Step::ProtoCheck,
 ];
 
-const FULL_TIER: &[Step] = &[
-    Step::Fmt,
-    Step::Build,
-    Step::Clippy,
-    Step::TestAll,
-    Step::Doctest,
-    Step::Doc,
-    Step::Deny,
-    Step::Semver,
-    Step::Buf,
-    Step::ProtoCheck,
-    Step::Fuzz,
-    Step::Msrv,
-    Step::Portable,
-];
+/// The steps the full tier adds to the fast tier's.
+const FULL_ONLY: &[Step] = &[Step::TestSlow, Step::Fuzz, Step::Msrv, Step::Portable];
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Cmd::DevUp => dev_up(),
         Cmd::DevDown => dev_down(),
-        Cmd::Ci { only } => run_tier("ci", FAST_TIER, &only, Tier::Fast),
-        Cmd::CiFull { only } => run_tier("ci-full", FULL_TIER, &only, Tier::Full),
+        Cmd::Ci { only } => run_tier("ci", FAST_TIER, &only, None),
+        Cmd::CiFull { only, fuzz_shard } => {
+            let steps: Vec<Step> = FAST_TIER.iter().chain(FULL_ONLY).copied().collect();
+            if fuzz_shard.is_some() && !(only.is_empty() || only.contains(&Step::Fuzz)) {
+                Err("ci-full: --fuzz-shard needs the fuzz step".into())
+            } else {
+                run_tier("ci-full", &steps, &only, fuzz_shard)
+            }
+        }
         Cmd::Mutants { args } => mutants(&args),
         Cmd::Proto { check } => proto(check),
         Cmd::Fuzz { target, duration } => parse_duration(&duration).and_then(|d| fuzz(&target, d)),
@@ -243,13 +243,7 @@ fn dev_down() -> Result {
 
 // ---------------------------------------------------------------- tiers
 
-#[derive(Clone, Copy)]
-enum Tier {
-    Fast,
-    Full,
-}
-
-fn run_tier(name: &str, steps: &[Step], only: &[Step], tier: Tier) -> Result {
+fn run_tier(name: &str, steps: &[Step], only: &[Step], fuzz_shard: Option<Shard>) -> Result {
     if let Some(step) = only.iter().find(|s| !steps.contains(s)) {
         return Err(format!("{name}: step {step:?} is not part of this tier").into());
     }
@@ -264,7 +258,7 @@ fn run_tier(name: &str, steps: &[Step], only: &[Step], tier: Tier) -> Result {
     for step in selected {
         eprintln!("==> {name}: {step:?}");
         let t = Instant::now();
-        let result = run_step(step, tier);
+        let result = run_step(step, fuzz_shard);
         let secs = t.elapsed().as_secs_f64();
         match result {
             Ok(()) => eprintln!("<== {step:?} ok ({secs:.1}s)"),
@@ -286,30 +280,36 @@ fn run_tier(name: &str, steps: &[Step], only: &[Step], tier: Tier) -> Result {
     }
 }
 
-fn nextest_profile(tier: Tier) -> &'static str {
-    match (tier, in_ci()) {
-        (Tier::Fast, false) => "default",
-        (Tier::Fast, true) => "ci",
-        (Tier::Full, false) => "full",
-        (Tier::Full, true) => "ci-full",
+/// The nextest profile for a test step: CI's profiles report every failure
+/// and size the run to the machine.
+fn nextest_profile(slow: bool) -> &'static str {
+    match (slow, in_ci()) {
+        (false, false) => "default",
+        (false, true) => "ci",
+        (true, false) => "slow",
+        (true, true) => "ci-slow",
     }
 }
 
-fn run_step(step: Step, tier: Tier) -> Result {
+fn clippy() -> Result {
+    run(cargo([
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings",
+    ]))
+}
+
+fn run_step(step: Step, fuzz_shard: Option<Shard>) -> Result {
     match step {
         Step::Fmt => run(cargo(["fmt", "--all", "--check"])),
         Step::Build => run(cargo(["build", "--workspace", "--all-targets", "--locked"])),
-        Step::Clippy => run(cargo([
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--locked",
-            "--",
-            "-D",
-            "warnings",
-        ])),
-        Step::Test => nextest(Tier::Fast, &["--workspace"]),
-        Step::TestAll => nextest(Tier::Full, &["--workspace"]),
+        Step::Clippy => clippy(),
+        Step::Test => nextest(false, &["--workspace"]),
+        Step::TestSlow => nextest(true, &["--workspace"]),
         Step::Doctest => run(cargo(["test", "--doc", "--workspace", "--locked"])),
         Step::Doc => {
             let mut c = cargo(["doc", "--workspace", "--no-deps", "--locked"]);
@@ -320,43 +320,44 @@ fn run_step(step: Step, tier: Tier) -> Result {
         Step::Semver => semver(),
         Step::Buf => buf_breaking(),
         Step::ProtoCheck => proto(true),
-        Step::Fuzz => fuzz_all(),
+        Step::Fuzz => fuzz_all(fuzz_shard.unwrap_or(Shard { index: 1, count: 1 })),
         Step::Msrv => {
+            // Type checking finds every use of a language or library feature
+            // newer than the MSRV; code generation adds nothing to that.
             let msrv = msrv()?;
             install_toolchain(&msrv)?;
             run(cargo([
                 format!("+{msrv}").as_str(),
-                "build",
+                "check",
                 "--workspace",
                 "--all-targets",
                 "--locked",
             ]))
         }
         Step::Portable => {
+            clippy()?;
             let crates = portable_crates()?;
-            let mut args = vec!["--no-tests=warn"];
+            let mut packages = Vec::new();
             for krate in &crates {
-                args.extend(["--package", krate.as_str()]);
+                packages.extend(["--package", krate.as_str()]);
             }
-            nextest(tier, &args)?;
-            if !in_ci() {
-                eprintln!(
-                    "portable: ran on {} only; the macOS and Windows runs happen in CI",
-                    std::env::consts::OS
-                );
-            }
-            Ok(())
+            let mut tests = vec!["--no-tests=warn"];
+            tests.extend(&packages);
+            nextest(false, &tests)?;
+            let mut doctests = cargo(["test", "--doc", "--locked"]);
+            doctests.args(&packages);
+            run(doctests)
         }
     }
 }
 
-fn nextest(tier: Tier, args: &[&str]) -> Result {
+fn nextest(slow: bool, args: &[&str]) -> Result {
     let mut c = cargo([
         "nextest",
         "run",
         "--locked",
         "--profile",
-        nextest_profile(tier),
+        nextest_profile(slow),
     ]);
     c.args(args);
     run(c)
@@ -376,6 +377,8 @@ fn msrv() -> Result<String> {
 /// A workspace member's name and manifest.
 struct Member {
     name: String,
+    /// Its directory, relative to the workspace root, with `/` separators.
+    dir: String,
     manifest: toml::Table,
 }
 
@@ -399,7 +402,16 @@ fn members() -> Result<Vec<Member>> {
                 .and_then(|n| n.as_str())
                 .ok_or_else(|| format!("{}: no package name", manifest_path.display()))?
                 .to_owned();
-            out.push(Member { name, manifest });
+            out.push(Member {
+                name,
+                dir: format!(
+                    "{dir}/{}",
+                    path.file_name()
+                        .expect("a directory entry")
+                        .to_string_lossy()
+                ),
+                manifest,
+            });
         }
     }
     Ok(out)
@@ -629,43 +641,165 @@ fn fuzz_targets() -> Result<Vec<String>> {
         .collect())
 }
 
-/// Runs every fuzz target for the full budget at once: the targets are
-/// independent, so running them in parallel gives each its whole budget in
-/// a fraction of the wall time.
-fn fuzz_all() -> Result {
-    let targets = fuzz_targets()?;
+/// One of `count` disjoint parts of a list, numbered from 1.
+#[derive(Clone, Copy, Debug)]
+struct Shard {
+    index: usize,
+    count: usize,
+}
+
+fn parse_shard(s: &str) -> Result<Shard, String> {
+    let parsed = s
+        .split_once('/')
+        .and_then(|(k, n)| Some((k.parse().ok()?, n.parse().ok()?)));
+    match parsed {
+        Some((index, count)) if 1 <= index && index <= count => Ok(Shard { index, count }),
+        _ => Err(format!("invalid shard `{s}`: write K/N with 1 <= K <= N")),
+    }
+}
+
+/// Paths whose change can change what a fuzz target executes: the fuzz
+/// crate, every workspace crate it depends on (directly or not), the
+/// lockfile, and the workspace manifest.
+fn fuzzed_paths() -> Result<Vec<String>> {
+    let members = members()?;
+    let mut paths = vec![
+        "fuzz/".to_owned(),
+        "Cargo.lock".to_owned(),
+        "Cargo.toml".to_owned(),
+    ];
+    let mut pending = workspace_deps(&read_toml(&root().join("fuzz/Cargo.toml"))?, &members);
+    let mut seen = Vec::new();
+    while let Some(name) = pending.pop() {
+        if seen.contains(&name) {
+            continue;
+        }
+        let member = members
+            .iter()
+            .find(|m| m.name == name)
+            .expect("workspace_deps returns members only");
+        paths.push(format!("{}/", member.dir));
+        pending.extend(workspace_deps(&member.manifest, &members));
+        seen.push(name);
+    }
+    Ok(paths)
+}
+
+/// The workspace members a manifest's normal and build dependencies name,
+/// on every target.
+fn workspace_deps(manifest: &toml::Table, members: &[Member]) -> Vec<String> {
+    let tables = ["dependencies", "build-dependencies"];
+    let direct = tables.iter().filter_map(|t| manifest.get(*t));
+    let per_target = manifest
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|targets| targets.values())
+        .flat_map(|target| tables.iter().filter_map(|t| target.get(*t)));
+    direct
+        .chain(per_target)
+        .filter_map(toml::Value::as_table)
+        .flat_map(|deps| deps.iter())
+        .map(|(key, spec)| {
+            // A renamed dependency names its crate in `package`.
+            spec.get("package")
+                .and_then(toml::Value::as_str)
+                .unwrap_or(key)
+                .to_owned()
+        })
+        .filter(|name| members.iter().any(|m| &m.name == name))
+        .collect()
+}
+
+/// The ref the diff-based checks compare against: the local `main` branch,
+/// or, in a CI checkout that has none, the remote's.
+fn main_ref() -> Result<&'static str> {
+    for candidate in ["refs/heads/main", "refs/remotes/origin/main"] {
+        let mut c = cmd("git");
+        c.args(["rev-parse", "--verify", "--quiet", candidate]);
+        if c.output()?.status.success() {
+            return Ok(candidate);
+        }
+    }
+    Err("neither a local nor a remote main branch exists to diff against".into())
+}
+
+/// The files changed against the merge base with main, including
+/// uncommitted changes.
+fn changed_files() -> Result<Vec<String>> {
+    let mut c = cmd("git");
+    c.args(["diff", "--name-only", "--merge-base", main_ref()?]);
+    let out = output(c).map_err(|e| format!("cannot diff against main: {e}"))?;
+    Ok(out.lines().map(str::to_owned).collect())
+}
+
+/// The first of `files` that is one of `paths` or lies under one of them
+/// (a path ending in `/` is a directory).
+fn first_under<'a>(files: &'a [String], paths: &[String]) -> Option<&'a String> {
+    files.iter().find(|f| {
+        paths.iter().any(|p| {
+            if p.ends_with('/') {
+                f.starts_with(p.as_str())
+            } else {
+                *f == p
+            }
+        })
+    })
+}
+
+/// Runs the shard's fuzz targets for the full budget each, when the fuzzed
+/// code differs from main; fuzzing code main already fuzzed finds nothing
+/// that a regression could have introduced. At most one target runs per
+/// core, so each target gets its whole budget of CPU time.
+fn fuzz_all(shard: Shard) -> Result {
+    let changed = changed_files()?;
+    let fuzzed = fuzzed_paths()?;
+    let Some(reason) = first_under(&changed, &fuzzed) else {
+        eprintln!("fuzz: no fuzzed code differs from main; nothing to fuzz");
+        return Ok(());
+    };
+    eprintln!("fuzz: fuzzed code differs from main ({reason})");
+    let targets: Vec<String> = fuzz_targets()?
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| i % shard.count == shard.index - 1)
+        .map(|(_, t)| t)
+        .collect();
     if targets.is_empty() {
-        return Err("fuzz: no fuzz targets defined".into());
+        return Err(format!("fuzz: shard {}/{} has no targets", shard.index, shard.count).into());
     }
     let budget = Duration::from_secs(FUZZ_BUDGET_SECONDS);
     let setup = fuzz_setup()?;
     run(fuzz_command(&setup, "build", None, None))?;
-    let mut children: Vec<(&String, std::process::Child)> = Vec::new();
-    for target in &targets {
-        let mut c = fuzz_command(&setup, "run", Some(target), Some(budget));
-        eprintln!("$ cargo fuzz run {target} (budget {}s)", budget.as_secs());
-        let child = match c.spawn() {
-            Ok(child) => child,
-            Err(e) => {
-                // Stop the fuzzers already running rather than leave them
-                // for their whole budget. This is cleanup on the way to
-                // reporting the spawn error, so its own failures (a fuzzer
-                // that already exited) change nothing.
-                for (_, mut running) in children {
-                    let _ = running.kill();
-                    let _ = running.wait();
-                }
-                return Err(format!("cannot start fuzzer `{target}`: {e}").into());
-            }
-        };
-        children.push((target, child));
-    }
+    let cores = std::thread::available_parallelism()?.get();
     let mut failed = Vec::new();
-    for (target, mut child) in children {
-        let status = child.wait()?;
-        eprintln!("fuzz: {target} finished: {status}");
-        if !status.success() {
-            failed.push(target.as_str());
+    for wave in targets.chunks(cores) {
+        let mut children: Vec<(&String, std::process::Child)> = Vec::new();
+        for target in wave {
+            let mut c = fuzz_command(&setup, "run", Some(target), Some(budget));
+            eprintln!("$ cargo fuzz run {target} (budget {}s)", budget.as_secs());
+            let child = match c.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    // Stop the fuzzers already running rather than leave
+                    // them for their whole budget. This is cleanup on the way
+                    // to reporting the spawn error, so its own failures (a
+                    // fuzzer that already exited) change nothing.
+                    for (_, mut running) in children {
+                        let _ = running.kill();
+                        let _ = running.wait();
+                    }
+                    return Err(format!("cannot start fuzzer `{target}`: {e}").into());
+                }
+            };
+            children.push((target, child));
+        }
+        for (target, mut child) in children {
+            let status = child.wait()?;
+            eprintln!("fuzz: {target} finished: {status}");
+            if !status.success() {
+                failed.push(target.as_str());
+            }
         }
     }
     if failed.is_empty() {
@@ -797,7 +931,7 @@ fn parse_duration(s: &str) -> Result<Duration> {
 
 fn mutants(args: &[OsString]) -> Result {
     let mut c = cmd("git");
-    c.args(["diff", "--merge-base", "main"]);
+    c.args(["diff", "--merge-base", main_ref()?]);
     let diff = output(c).map_err(|e| format!("cannot diff against main: {e}"))?;
     if diff.trim().is_empty() {
         return Err("mutants: no changes against main, so nothing to mutate".into());
@@ -841,4 +975,86 @@ fn install_toolchain(channel: &str) -> Result {
     let mut c = cmd("rustup");
     c.args(["toolchain", "install", "--profile", "minimal", channel]);
     run(c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shards_are_k_of_n() {
+        let s = parse_shard("2/3").unwrap();
+        assert_eq!((s.index, s.count), (2, 3));
+        assert_eq!(parse_shard("1/1").unwrap().index, 1);
+        for bad in ["0/2", "3/2", "1/0", "2", "a/b", "1/2/3", ""] {
+            assert!(parse_shard(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn fuzzed_paths_follow_the_fuzz_crates_workspace_dependencies() {
+        let paths = fuzzed_paths().unwrap();
+        for p in [
+            "fuzz/",
+            "Cargo.lock",
+            "Cargo.toml",
+            "crates/scion-core/",
+            "crates/derived/",
+        ] {
+            assert!(paths.iter().any(|q| q == p), "{p} missing from {paths:?}");
+        }
+        // derived depends on store, so store is fuzzed code too.
+        assert!(paths.iter().any(|q| q == "crates/store/"), "{paths:?}");
+        // Nothing depends on the bench generator or on ops.
+        for p in ["bins/scion-bench/", "crates/ops/", "xtask/"] {
+            assert!(!paths.iter().any(|q| q == p), "{p} in {paths:?}");
+        }
+    }
+
+    #[test]
+    fn workspace_deps_include_renamed_build_and_target_dependencies() {
+        let members: Vec<Member> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| Member {
+                name: (*n).to_owned(),
+                dir: format!("crates/{n}"),
+                manifest: toml::Table::new(),
+            })
+            .collect();
+        let manifest: toml::Table = r#"
+            [dependencies]
+            a = { workspace = true }
+            renamed = { package = "b", workspace = true }
+            outside = "1"
+            [build-dependencies]
+            c = { workspace = true }
+            [dev-dependencies]
+            excluded = { package = "a", workspace = true }
+            [target.'cfg(unix)'.dependencies]
+            d = { workspace = true }
+        "#
+        .parse()
+        .unwrap();
+        let mut deps = workspace_deps(&manifest, &members);
+        deps.sort();
+        assert_eq!(deps, ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn first_under_matches_files_and_directories_exactly() {
+        let paths = ["crates/derived/".to_owned(), "Cargo.lock".to_owned()];
+        let files = |fs: &[&str]| fs.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            first_under(&files(&["crates/derived-x/a.rs"]), &paths),
+            None
+        );
+        assert_eq!(
+            first_under(&files(&["Cargo.lock.bak", "crates/derive"]), &paths),
+            None
+        );
+        let hit = files(&["README", "crates/derived/src/a.rs"]);
+        assert_eq!(first_under(&hit, &paths), Some(&hit[1]));
+        let hit = files(&["Cargo.lock"]);
+        assert_eq!(first_under(&hit, &paths), Some(&hit[0]));
+    }
 }

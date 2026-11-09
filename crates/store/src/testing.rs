@@ -394,21 +394,31 @@ pub async fn sweep_orphans_among(scope: impl Fn(&str) -> bool) -> Result<Swept, 
         }
     }
 
-    let bucket = std::sync::Arc::new(bucket());
-    let top = object_store::ObjectStore::list_with_delimiter(&*bucket, None)
-        .await
-        .map_err(|e| format!("listing test key prefixes failed: {e}"))?;
-    for prefix in top.common_prefixes {
-        let Some(name) = prefix.parts().next() else {
-            continue;
-        };
-        if !scope(name.as_ref()) || !is_orphan(name.as_ref()) {
-            continue;
+    for name in top_level_prefixes().await? {
+        if scope(&name) && is_orphan(&name) {
+            swept.objects += delete_prefix(&name).await?;
+            swept.prefixes += 1;
         }
-        swept.objects += delete_tree(&bucket, prefix).await?;
-        swept.prefixes += 1;
     }
     Ok(swept)
+}
+
+/// The names of the top-level key prefixes in the dev environment's bucket.
+pub async fn top_level_prefixes() -> Result<Vec<String>, String> {
+    let listed = object_store::ObjectStore::list_with_delimiter(&bucket(), None)
+        .await
+        .map_err(|e| format!("listing key prefixes failed: {e}"))?;
+    Ok(listed
+        .common_prefixes
+        .iter()
+        .filter_map(|p| p.parts().next().map(|n| n.as_ref().to_owned()))
+        .collect())
+}
+
+/// Deletes every object under the top-level key prefix `name` in the dev
+/// environment's bucket, and returns how many it deleted.
+pub async fn delete_prefix(name: &str) -> Result<usize, String> {
+    delete_tree(&std::sync::Arc::new(bucket()), Path::from(name)).await
 }
 
 /// Deletes every object under `prefix`, a bounded number at a time, and

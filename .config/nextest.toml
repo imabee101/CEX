@@ -1,7 +1,8 @@
 # Test tiers. A test that takes longer than SLOW_TEST_SECONDS (30 s) belongs in
 # the slow group: name it with a `slow_` prefix. The fast tier (`cargo xtask ci`)
 # excludes the slow group, and a test outside it is terminated, and fails, after
-# 30 s. The full tier (`cargo xtask ci-full`) runs everything.
+# 30 s. The full tier (`cargo xtask ci-full`) runs the slow group as its own
+# step, with the `slow` profile.
 #
 # Tests that use the dev environment run in parallel: each has its own database
 # and key prefix. Their Postgres connections must stay below max_connections
@@ -11,7 +12,7 @@
 # 4 × 65 + 28 × 17 = 736 connections.
 
 [test-groups]
-# Slow tests build large fixtures (up to the 3M-file bench repo); four at once
+# Slow tests build large fixtures (up to a 3M-file repo); four at once
 # fit in a 16 GB CI runner.
 slow = { max-threads = 4 }
 # Tests that open one Postgres connection per client at 64-way concurrency;
@@ -35,13 +36,17 @@ slow-timeout = { period = "60s", terminate-after = 60 }
 filter = "package(store) and test(/concurrent|64_way/)"
 test-group = "wide"
 
-# CI reports every failure instead of stopping at the first.
+# CI reports every failure instead of stopping at the first, and runs one
+# test per core: CI runners have few cores, and oversubscribing them would
+# push tests past the 30 s limit for want of CPU, not because they are slow.
 [profile.ci]
 fail-fast = false
+test-threads = "num-cpus"
 
-[profile.full]
-default-filter = "all()"
+[profile.slow]
+default-filter = "test(/(^|::)slow_/)"
 
-[profile.ci-full]
-default-filter = "all()"
+[profile.ci-slow]
+default-filter = "test(/(^|::)slow_/)"
 fail-fast = false
+test-threads = "num-cpus"
