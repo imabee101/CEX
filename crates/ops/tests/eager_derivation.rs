@@ -256,7 +256,7 @@ async fn parents_lacking_eager_values_are_derived_within_the_bound() {
 }
 
 #[tokio::test]
-async fn a_parent_chain_at_the_bound_is_derived_in_one_request() {
+async fn slow_a_parent_chain_at_the_bound_is_derived_in_one_request() {
     let e = env().await;
     let (plain, chain) = base_and_chain(&e, MAX_DERIVE_PER_REQUEST).await;
     let child = changeset(&[*chain.last().unwrap()], "child", vec![]);
@@ -268,7 +268,7 @@ async fn a_parent_chain_at_the_bound_is_derived_in_one_request() {
 }
 
 #[tokio::test]
-async fn a_parent_chain_past_the_bound_is_finished_by_retries() {
+async fn slow_a_parent_chain_past_the_bound_is_finished_by_retries() {
     let e = env().await;
     let (plain, chain) = base_and_chain(&e, MAX_DERIVE_PER_REQUEST + 1).await;
     let child = changeset(&[*chain.last().unwrap()], "child", vec![]);
@@ -357,7 +357,7 @@ async fn an_underived_ancestry_past_the_exploration_limit_is_refused_for_good() 
 }
 
 #[tokio::test]
-async fn an_underived_ancestry_at_the_exploration_limit_is_pending_not_refused() {
+async fn slow_an_underived_ancestry_at_the_exploration_limit_is_pending_not_refused() {
     let e = env().await;
     let plain = ops(&e.meta, &e.blobs);
     let top = wide_bare_history(&e, MAX_DERIVE_EXPLORE).await;
