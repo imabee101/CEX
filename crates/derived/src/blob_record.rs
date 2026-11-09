@@ -1,8 +1,11 @@
 //! A blob's metadata record, stored under `MetaKey::Blob` once the blob's
 //! frames are in blob storage.
 
+use scion_core::FormatError;
+use scion_core::wire::put_uvarint;
+
 use crate::DeriveError;
-use crate::codec::{Reader, put_uvarint};
+use crate::codec::decode;
 
 /// What the metadata database knows about a stored blob.
 ///
@@ -43,32 +46,37 @@ impl BlobRecord {
 
     /// Decodes stored bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, DeriveError> {
-        let mut r = Reader::new(bytes, "blob record");
-        if r.u8()? != Self::VERSION {
-            return Err(DeriveError::DataLoss("unknown blob record version".into()));
-        }
-        let size = r.uvarint()?;
-        let sha256 = r.array32()?;
-        let git_sha1 = match r.u8()? {
-            0 => None,
-            1 => {
-                let mut s = [0; 20];
-                s.copy_from_slice(r.take(20)?);
-                Some(s)
+        decode("blob record", bytes, |r| {
+            let version = r.u8()?;
+            if version != Self::VERSION {
+                return Err(FormatError::UnsupportedVersion(version));
             }
-            _ => return Err(DeriveError::DataLoss("bad blob record tag".into())),
-        };
-        let text = match r.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(DeriveError::DataLoss("bad text classification".into())),
-        };
-        r.finish()?;
-        Ok(Self {
-            size,
-            sha256,
-            git_sha1,
-            text,
+            let size = r.uvarint()?;
+            let sha256 = r.array32()?;
+            let git_sha1 = match r.opt_tag()? {
+                false => None,
+                true => {
+                    let mut s = [0; 20];
+                    s.copy_from_slice(r.take(20)?);
+                    Some(s)
+                }
+            };
+            let text = match r.u8()? {
+                0 => false,
+                1 => true,
+                code => {
+                    return Err(FormatError::InvalidCode {
+                        field: "text classification",
+                        code,
+                    });
+                }
+            };
+            Ok(Self {
+                size,
+                sha256,
+                git_sha1,
+                text,
+            })
         })
     }
 }

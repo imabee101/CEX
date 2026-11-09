@@ -6,10 +6,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use scion_core::{Changeset, ChangesetId, EntryTarget, RepoPath, TreeId};
+use scion_core::wire::{put_bytes, put_uvarint};
+use scion_core::{Changeset, ChangesetId, EntryTarget, FormatError, RepoPath, TreeId};
 use store::{BlobStore, MetaStore};
 
-use crate::codec::{Reader, put_bytes, put_uvarint};
+use crate::codec::decode;
 use crate::{DeriveCx, DeriveError, DerivedType, Mode, RootTree, kinds};
 
 /// One version of a repo's ACL config: path prefixes mapped to ACL domains,
@@ -70,22 +71,19 @@ impl RestrictedRoots {
 
     /// Decodes a stored value.
     pub fn decode(bytes: &[u8]) -> Result<BTreeMap<RepoPath, TreeId>, DeriveError> {
-        let mut r = Reader::new(bytes, "RestrictedRoots value");
-        let n = r.count(34)?;
-        let mut out = BTreeMap::new();
-        for _ in 0..n {
-            let p = RepoPath::new(r.bytes()?)
-                .map_err(|e| DeriveError::DataLoss(format!("RestrictedRoots path: {e}")))?;
-            // Paths are strictly increasing, so each value has one encoding.
-            if out.last_key_value().is_some_and(|(last, _)| *last >= p) {
-                return Err(DeriveError::DataLoss(
-                    "RestrictedRoots paths are not strictly increasing".into(),
-                ));
+        decode("RestrictedRoots value", bytes, |r| {
+            let n = r.count(34)?;
+            let mut out = BTreeMap::new();
+            for _ in 0..n {
+                let p = RepoPath::new(r.bytes()?)?;
+                // Paths are strictly increasing, so each value has one encoding.
+                if out.last_key_value().is_some_and(|(last, _)| *last >= p) {
+                    return Err(FormatError::NotSorted);
+                }
+                out.insert(p, TreeId::from_bytes(r.array32()?));
             }
-            out.insert(p, TreeId::from_bytes(r.array32()?));
-        }
-        r.finish()?;
-        Ok(out)
+            Ok(out)
+        })
     }
 }
 
