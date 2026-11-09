@@ -447,15 +447,14 @@ mod tests {
 }
 
 #[cfg(test)]
-mod cancellation_tests {
-    use super::*;
-    use crate::testing::TestDatabase;
+pub(crate) mod test_support {
+    use tokio_postgres::Client;
 
     /// Whether `client`'s next statement runs inside a transaction that
-    /// began before it.
-    async fn in_transaction(client: &Client) -> bool {
-        // In a transaction's first statement, sent as one simple-protocol
-        // message, the transaction and statement timestamps are equal.
+    /// began before it. In a transaction's first statement, sent as one
+    /// simple-protocol message, the transaction and statement timestamps
+    /// are equal.
+    pub(crate) async fn in_transaction(client: &Client) -> bool {
         let rows = client
             .simple_query("SELECT now() <> statement_timestamp()")
             .await
@@ -466,6 +465,13 @@ mod cancellation_tests {
         });
         row.expect("one row").get(0) == Some("t")
     }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::test_support::in_transaction;
+    use super::*;
+    use crate::testing::TestDatabase;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_connection_never_returns_to_the_pool_inside_a_transaction() {

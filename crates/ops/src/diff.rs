@@ -126,17 +126,13 @@ struct Only {
     tops: (Option<TreeId>, Option<TreeId>),
     names: VecDeque<Vec<u8>>,
     ready: VecDeque<Pair>,
-    batch: usize,
 }
 
-/// How many filtered names the first batched lookup reads; each later batch
-/// of the same directory reads twice as many, up to [`ONLY_BATCH_MAX`], so a
-/// page stops early when the first names fill it, and a filter of many
-/// unchanged names takes O(log N) round trips.
+/// How many filtered names one batched lookup reads. A page stops after the
+/// batches its entries need. Store reads are per tree node, and a node read
+/// once is kept for the request, so the reads are bounded by the trie nodes
+/// the looked-up names reach, whatever the batch size.
 const ONLY_BATCH: usize = 64;
-
-/// The most filtered names one batched lookup reads.
-const ONLY_BATCH_MAX: usize = 1024;
 
 impl Only {
     async fn next<M: MetaStore>(
@@ -153,9 +149,8 @@ impl Only {
             let (a, b) = self.tops;
             let batch: Vec<Vec<u8>> = self
                 .names
-                .drain(..self.batch.min(self.names.len()))
+                .drain(..ONLY_BATCH.min(self.names.len()))
                 .collect();
-            self.batch = (self.batch * 2).min(ONLY_BATCH_MAX);
             let mut queries: Vec<(TreeId, &[u8])> = Vec::new();
             for name in &batch {
                 queries.extend(a.map(|a| (a, name.as_slice())));
@@ -205,7 +200,7 @@ impl Pairs {
     }
 
     /// The pairs for exactly `names` (sorted), looked up lazily in both
-    /// directories in growing batches (see [`ONLY_BATCH`]), so a page reads
+    /// directories [`ONLY_BATCH`] names at a time, so a page reads
     /// the nodes for the names it reaches, not for every name it is given.
     fn only(a: Option<TreeId>, b: Option<TreeId>, names: Vec<Vec<u8>>) -> Self {
         Self {
@@ -216,7 +211,6 @@ impl Pairs {
                 tops: (a, b),
                 names: names.into(),
                 ready: VecDeque::new(),
-                batch: ONLY_BATCH,
             }),
         }
     }

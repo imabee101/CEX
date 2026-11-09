@@ -426,11 +426,59 @@ async fn a_filtered_page_after_a_cursor_reads_only_what_follows_it() {
             "{after}"
         );
     }
-    // A page reads the nodes for the filtered names it reaches, looked up
-    // 64 at a time: about a dozen keys wherever it starts. Looking up all
+    // A page reads the nodes for the filtered names it reaches (two batches
+    // of 64 for a page of 100): about a dozen keys wherever it starts. Looking up all
     // 2,000 names would read every shard of the root on both sides.
     for after in [None, Some("gen-09995"), Some("gen-19000")] {
         let (_, keys) = page_keys(&e, old, new, &filters, after).await;
         assert!(keys <= 16, "the page after {after:?} read {keys} keys");
     }
+}
+
+/// A filter of 20,000 names in a sharded directory, with the one change at
+/// the end, takes store reads bounded by the trie nodes it reaches, not by
+/// the number of names.
+#[tokio::test]
+async fn a_large_filter_takes_reads_bounded_by_the_nodes_it_reaches() {
+    let e = env().await;
+    let plain = ops(&e.meta, &e.blobs);
+    let names: Vec<String> = (0..20_000).map(|i| format!("d/f{i:05}")).collect();
+    let base = commit(
+        &plain,
+        &[],
+        "base",
+        names.iter().map(|p| (path(p), write(b"x\n"))).collect(),
+        &[Bytes::from_static(b"x\n")],
+    )
+    .await
+    .unwrap();
+    let next = commit(
+        &plain,
+        &[base],
+        "one change",
+        vec![(path("d/f19999"), write(b"y\n"))],
+        &[Bytes::from_static(b"y\n")],
+    )
+    .await
+    .unwrap();
+    let filters: Vec<_> = names.iter().map(|p| path(p)).collect();
+    let faults = Faults::new();
+    let meta = Arc::new(FaultMetaStore::new(e.meta.clone(), faults.clone()));
+    let blobs = Arc::new(FaultBlobStore::new(e.blobs.clone(), faults.clone()));
+    let got = diff_paged(
+        &ops(&meta, &blobs),
+        base,
+        next,
+        DiffMode::Names,
+        &filters,
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].path, b"d/f19999");
+    // `d` is a trie of about 23 nodes per side, each read once per request;
+    // reading per name would take thousands of reads.
+    let reads = faults.counts().meta_gets;
+    assert!(reads <= 30, "{reads} store reads");
 }

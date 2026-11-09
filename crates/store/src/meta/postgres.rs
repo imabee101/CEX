@@ -749,28 +749,23 @@ mod release_tests {
 #[cfg(test)]
 mod cancelled_release_tests {
     use super::*;
+    use crate::meta::pg_pool::test_support::in_transaction;
     use crate::testing::TestDatabase;
 
-    /// Whether `client`'s next statement runs inside a transaction that began
-    /// before it.
-    async fn in_transaction(client: &tokio_postgres::Client) -> bool {
-        let rows = client
-            .simple_query("SELECT now() <> statement_timestamp()")
+    async fn backend_pid(client: &tokio_postgres::Client) -> i32 {
+        client
+            .query_one("SELECT pg_backend_pid()", &[])
             .await
-            .unwrap();
-        let row = rows.iter().find_map(|m| match m {
-            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
-            _ => None,
-        });
-        row.expect("one row").get(0) == Some("t")
+            .unwrap()
+            .get(0)
     }
 
-    /// A release abandoned at any point, with its connection still open, or
-    /// run to completion, never leaves the connection in the pool inside a
-    /// transaction: either the connection is closed, or its ROLLBACK was
-    /// queued on it and runs before anything the next user sends.
+    /// A release abandoned while its ROLLBACK is in flight, with the
+    /// connection open, closes the connection rather than pooling it; one
+    /// that completes returns the connection to the pool outside any
+    /// transaction.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_abandoned_release_never_pools_a_transaction() {
+    async fn a_release_never_pools_a_transaction() {
         let db = TestDatabase::create().await;
         let pool = Pool::new(
             db.config().clone(),
@@ -778,53 +773,48 @@ mod cancelled_release_tests {
             PoolLimits::new(1),
         )
         .unwrap();
-        let mut abandoned = 0;
-        let mut finished = 0;
         for polls in 1..=8u32 {
             let tx = pool.begin().await.unwrap();
-            // A statement, so the transaction has begun on the server.
-            tx.batch_execute("SELECT 1").await.unwrap();
-            // Poll the release `polls` times, yielding between polls, and
-            // abandon it if it has not finished: from right after ROLLBACK is
-            // sent to after it completes. Timers are too coarse for this: a
-            // local ROLLBACK completes before the shortest timeout fires.
+            let pid = backend_pid(&tx).await;
+            // Poll the release up to `polls` times, yielding between polls,
+            // then abandon it unless it completed. Timers are too coarse to
+            // abandon a local ROLLBACK in flight; polling by hand can.
             let mut pending = Box::pin(release(tx));
-            let mut done = false;
+            let mut completed = false;
             for _ in 0..polls {
-                done = std::future::poll_fn(|cx| {
+                completed = std::future::poll_fn(|cx| {
                     std::task::Poll::Ready(pending.as_mut().poll(cx).is_ready())
                 })
                 .await;
-                if done {
+                if completed {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
-            if done {
-                finished += 1;
-            } else {
-                abandoned += 1;
-            }
             drop(pending);
-            let conn = pool.checkout().await.unwrap();
-            assert!(
-                !in_transaction(&conn).await,
-                "abandoned after {polls} polls: pooled a transaction"
-            );
+            let conn = if completed {
+                // The reply came in time: the connection was returned.
+                assert_eq!(pool.idle_len(), 1, "completed within {polls} polls");
+                let conn = pool.checkout().await.unwrap();
+                assert_eq!(backend_pid(&conn).await, pid);
+                conn
+            } else {
+                // Still marked as in a transaction, the connection was closed.
+                assert_eq!(pool.idle_len(), 0, "abandoned after {polls} polls");
+                let conn = pool.checkout().await.unwrap();
+                assert_ne!(backend_pid(&conn).await, pid);
+                conn
+            };
+            assert!(!in_transaction(&conn).await, "after {polls} polls");
         }
-        // And one release that runs to completion.
+        // A release that completes returns its connection, outside any
+        // transaction.
         let tx = pool.begin().await.unwrap();
-        tx.batch_execute("SELECT 1").await.unwrap();
+        let pid = backend_pid(&tx).await;
         release(tx).await;
-        finished += 1;
+        assert_eq!(pool.idle_len(), 1);
         let conn = pool.checkout().await.unwrap();
-        assert!(
-            !in_transaction(&conn).await,
-            "completed: pooled a transaction"
-        );
-        assert!(
-            abandoned > 0 && finished > 0,
-            "{abandoned} abandoned, {finished} finished"
-        );
+        assert_eq!(backend_pid(&conn).await, pid);
+        assert!(!in_transaction(&conn).await);
     }
 }
