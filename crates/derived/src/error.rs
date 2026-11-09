@@ -52,10 +52,14 @@ pub enum DeriveError {
         other: Vec<u8>,
     },
     /// A value cannot be derived within one request's bound: too many
-    /// ancestors lack it. The background deriver will derive them; a retry
-    /// may succeed.
+    /// ancestors lack it. The request derived the oldest of them; a retry
+    /// continues from there.
     #[error("derivation pending: {0}")]
     Pending(String),
+    /// A fixed limit is exceeded: deriving the value needs exploring more
+    /// underived ancestors than one request may. A retry cannot succeed.
+    #[error("limit exceeded: {0}")]
+    LimitExceeded(String),
     /// A defect: an internal invariant does not hold, or a task failed.
     #[error("internal error: {0}")]
     Internal(String),

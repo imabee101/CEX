@@ -23,9 +23,14 @@ pub const FRAME_ZSTD_LEVEL: i32 = 3;
 /// underived ancestors.
 pub const DERIVE_BATCH: usize = 256;
 
-/// The most changesets one request derives a type for; a value needing
-/// more is pending until the background deriver catches up.
+/// The most changesets one request derives a type for. A value needing more
+/// is pending: the request derives the oldest ones and fails retryably, and
+/// each retry continues from where the last stopped.
 pub const MAX_DERIVE_PER_REQUEST: usize = 4096;
+
+/// The most ancestors lacking a value that one request explores; a value
+/// needing more fails with [`DeriveError::LimitExceeded`].
+pub const MAX_DERIVE_EXPLORE: usize = 1 << 16;
 
 /// The most frame writes one derivation has in flight.
 pub const FRAME_WRITES: usize = 32;
@@ -314,9 +319,26 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
             return Ok(v);
         }
         if t.reads_parents() {
-            let order = self.underived(repo, t, cs, MAX_DERIVE_PER_REQUEST).await?;
-            for (id, changeset) in order {
-                self.derive_one(repo, t, id, &changeset).await?;
+            let order = self.underived(repo, t, cs).await?;
+            // Oldest first, so a request that stops at the bound has made
+            // progress a retry continues from.
+            for chunk in order
+                .chunks(DERIVE_BATCH)
+                .take(MAX_DERIVE_PER_REQUEST / DERIVE_BATCH)
+            {
+                for (id, changeset) in chunk.iter().zip(self.changesets(repo, chunk).await?) {
+                    self.derive_one(repo, t, *id, &changeset).await?;
+                }
+            }
+            if order.len() > MAX_DERIVE_PER_REQUEST {
+                let key = t.key(cs);
+                return Err(DeriveError::Pending(format!(
+                    "derived type {} version {} for the oldest {MAX_DERIVE_PER_REQUEST} of {} \
+                     ancestors of {cs}; retry to continue",
+                    key.kind,
+                    key.version,
+                    order.len()
+                )));
             }
         } else {
             let changeset = self.changeset(repo, cs).await?;
@@ -330,30 +352,35 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
     }
 
     /// The changesets from `cs` back to the first ancestors that have a
-    /// value of type `t`, parents before children, or `Pending` if there are
-    /// more than `max`.
+    /// value of type `t`, parents before children (oldest first), or
+    /// [`DeriveError::LimitExceeded`] if there are more than
+    /// [`MAX_DERIVE_EXPLORE`].
     async fn underived(
         &self,
         repo: RepoId,
         t: &dyn AnyType<M, B>,
         cs: ChangesetId,
-        max: usize,
-    ) -> Result<Vec<(ChangesetId, Arc<Changeset>)>, DeriveError> {
-        let mut found: HashMap<ChangesetId, Arc<Changeset>> = HashMap::new();
+    ) -> Result<Vec<ChangesetId>, DeriveError> {
+        // Each found changeset's parents; only ids are kept, so memory is
+        // bounded by the exploration limit, not by changeset sizes.
+        let mut found: HashMap<ChangesetId, Vec<ChangesetId>> = HashMap::new();
         let mut level = vec![cs];
         while !level.is_empty() {
-            if found.len() + level.len() > max {
+            if found.len() + level.len() > MAX_DERIVE_EXPLORE {
                 let key = t.key(cs);
-                return Err(DeriveError::Pending(format!(
-                    "more than {max} ancestors of {cs} lack derived type {} version {}",
+                return Err(DeriveError::LimitExceeded(format!(
+                    "more than {MAX_DERIVE_EXPLORE} ancestors of {cs} lack derived type {} \
+                     version {}",
                     key.kind, key.version
                 )));
             }
-            let changesets = self.changesets(repo, &level).await?;
             let mut parents: Vec<ChangesetId> = Vec::new();
-            for (id, c) in level.iter().zip(changesets) {
-                parents.extend(&c.parts().parents);
-                found.insert(*id, c);
+            for chunk in level.chunks(DERIVE_BATCH) {
+                for (id, c) in chunk.iter().zip(self.changesets(repo, chunk).await?) {
+                    let p = c.parts().parents.clone();
+                    parents.extend(&p);
+                    found.insert(*id, p);
+                }
             }
             parents.sort_unstable();
             parents.dedup();
@@ -376,19 +403,11 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
         // Parents first: Kahn's algorithm over the found subgraph.
         let mut waiting: HashMap<ChangesetId, usize> = found
             .iter()
-            .map(|(id, c)| {
-                let n = c
-                    .parts()
-                    .parents
-                    .iter()
-                    .filter(|p| found.contains_key(p))
-                    .count();
-                (*id, n)
-            })
+            .map(|(id, ps)| (*id, ps.iter().filter(|p| found.contains_key(p)).count()))
             .collect();
         let mut children: HashMap<ChangesetId, Vec<ChangesetId>> = HashMap::new();
-        for (id, c) in &found {
-            for p in &c.parts().parents {
+        for (id, ps) in &found {
+            for p in ps {
                 if found.contains_key(p) {
                     children.entry(*p).or_default().push(*id);
                 }
@@ -411,12 +430,9 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
                     ready.push(child);
                 }
             }
-            let c = found
-                .remove(&id)
-                .ok_or_else(|| DeriveError::Internal("a changeset left the subgraph".into()))?;
-            order.push((id, c));
+            order.push(id);
         }
-        if !found.is_empty() {
+        if order.len() != found.len() {
             return Err(DeriveError::DataLoss(format!(
                 "the parents of {cs} form a cycle"
             )));

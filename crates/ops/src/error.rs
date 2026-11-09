@@ -120,6 +120,7 @@ impl From<DeriveError> for OpError {
                 &path,
             ),
             DeriveError::Pending(m) => Self::new(Code::Unavailable, m),
+            DeriveError::LimitExceeded(m) => Self::new(Code::LimitExceeded, m),
             DeriveError::Internal(m) => Self::new(Code::Internal, m),
         }
     }

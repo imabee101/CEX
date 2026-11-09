@@ -222,8 +222,28 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
                 format!("parent changeset {p}"),
             ));
         }
+        let eager = eager_types::<M, B>(opts);
+        // Bring every type's parent values up to date first, each within its
+        // own per-request bound, so one request makes progress on all of them
+        // and a retry continues every type from where it stopped.
+        let mut pending = None;
+        for t in &eager {
+            if !t.reads_parents() {
+                continue;
+            }
+            for p in &parts.parents {
+                match self.deriver.get_any(repo, &**t, *p).await {
+                    Ok(_) => {}
+                    Err(e @ derived::DeriveError::Pending(_)) => pending = Some(e),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        if let Some(e) = pending {
+            return Err(e.into());
+        }
         let mut cx = self.deriver.cx(repo);
-        for t in &eager_types::<M, B>(opts) {
+        for t in &eager {
             let value = t.derive_any(&mut cx, id, cs).await?;
             cx.set_value(t.key(id), value);
         }

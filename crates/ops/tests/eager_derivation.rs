@@ -218,7 +218,7 @@ async fn parents_lacking_eager_values_are_derived_within_the_bound() {
 }
 
 #[tokio::test]
-async fn a_parent_chain_past_the_bound_is_refused_retryably() {
+async fn slow_a_parent_chain_past_the_bound_is_finished_by_retries() {
     let e = env().await;
     let plain = ops(&e.meta, &e.blobs);
     let base = plain
@@ -230,25 +230,76 @@ async fn a_parent_chain_past_the_bound_is_refused_retryably() {
         .await
         .unwrap();
     let tip = bare_chain(&e, base, MAX_DERIVE_PER_REQUEST + 1).await;
+    let child = changeset(&[tip], "child", vec![]);
     let err = plain
-        .create_changeset(
-            REPO,
-            changeset(&[tip], "child", vec![]),
-            &CreateOptions::default(),
-        )
+        .create_changeset(REPO, child.clone(), &CreateOptions::default())
         .await
         .unwrap_err();
     assert_eq!(err.code, Code::Unavailable, "{err}");
     assert!(err.code.retryable());
-    // Nothing was written for the child.
-    let child = changeset(&[tip], "child", vec![]).id();
+    // Nothing was written for the child, but the first request derived the
+    // oldest ancestors of every type, so one retry finishes.
     assert_eq!(
         e.meta
-            .get(REPO, &[MetaKey::Changeset(child)])
+            .get(REPO, &[MetaKey::Changeset(child.id())])
             .await
             .unwrap(),
         vec![None]
     );
+    plain
+        .create_changeset(REPO, child, &CreateOptions::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_underived_ancestry_past_the_exploration_limit_is_refused_for_good() {
+    use derived::MAX_DERIVE_EXPLORE;
+    let e = env().await;
+    let plain = ops(&e.meta, &e.blobs);
+    // A wide bare history: 64 × 1,025 roots under 1,025 merges under one
+    // tip, more underived ancestors than one request may explore.
+    let mut rows = Vec::new();
+    let mut merges = Vec::new();
+    for m in 0..(MAX_DERIVE_EXPLORE / 64 + 1) {
+        let roots: Vec<ChangesetId> = (0..64)
+            .map(|r| {
+                let cs = changeset(&[], &format!("root {m} {r}"), vec![]);
+                rows.push((MetaKey::Changeset(cs.id()), Bytes::from(cs.encode())));
+                cs.id()
+            })
+            .collect();
+        let merge = changeset(&roots, &format!("merge {m}"), vec![]);
+        rows.push((MetaKey::Changeset(merge.id()), Bytes::from(merge.encode())));
+        merges.push(merge.id());
+    }
+    let mut tips = Vec::new();
+    for chunk in merges.chunks(64) {
+        let cs = changeset(chunk, &format!("tip {}", tips.len()), vec![]);
+        rows.push((MetaKey::Changeset(cs.id()), Bytes::from(cs.encode())));
+        tips.push(cs.id());
+    }
+    for batch in rows.chunks(1000) {
+        e.meta.put(REPO, batch).await.unwrap();
+    }
+    let top = changeset(&tips, "top", vec![]);
+    e.meta
+        .put(
+            REPO,
+            &[(MetaKey::Changeset(top.id()), Bytes::from(top.encode()))],
+        )
+        .await
+        .unwrap();
+    let err = plain
+        .create_changeset(
+            REPO,
+            changeset(&[top.id()], "child", vec![]),
+            &CreateOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Code::LimitExceeded, "{err}");
+    assert!(!err.code.retryable());
 }
 
 #[tokio::test]
