@@ -574,11 +574,9 @@ async fn a_cursor_under_path_filters_returns_exactly_the_filtered_entries_after_
         ]
     );
     for after in [
-        "a", "a-c", "a.x", "a/", "a/b", "a/b/c", "a/bb", "a0", "a-", "a.y", "b",
+        "a", "a-c", "a.x", "a/b", "a/b/c", "a/bb", "a0", "a-", "a.y", "b",
     ] {
-        let Ok(cursor) = ops::DiffCursor::from_bytes(after.as_bytes()) else {
-            continue;
-        };
+        let cursor = ops::DiffCursor::from_bytes(after.as_bytes()).unwrap();
         let page = o
             .diff(
                 REPO,
