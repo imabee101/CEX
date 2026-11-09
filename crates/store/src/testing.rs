@@ -27,6 +27,9 @@ const DEFAULT_S3_SECRET_KEY: &str = "scion-dev-secret";
 
 const NOT_RUNNING: &str = "the dev environment is not reachable; run `cargo xtask dev-up`";
 
+mod pg_proxy;
+pub use pg_proxy::{Direction, PgProxy, Stopped};
+
 fn setting(var: &str, default: &str) -> String {
     std::env::var(var).unwrap_or_else(|_| default.to_owned())
 }

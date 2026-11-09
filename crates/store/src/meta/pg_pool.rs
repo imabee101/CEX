@@ -471,39 +471,60 @@ pub(crate) mod test_support {
 mod cancellation_tests {
     use super::test_support::in_transaction;
     use super::*;
-    use crate::testing::TestDatabase;
+    use crate::testing::{Direction, PgProxy, TestDatabase};
 
+    /// A transaction abandoned at every message boundary of its `BEGIN` and
+    /// its statement, in each direction, never leaves its connection in the
+    /// pool inside the transaction.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_connection_never_returns_to_the_pool_inside_a_transaction() {
         let db = TestDatabase::create().await;
+        let proxy = PgProxy::start(db.config()).await;
         let pool = Pool::new(
-            db.config().clone(),
+            proxy.config(db.config()),
             PgTls::LoopbackPlaintext,
             PoolLimits::new(1),
         )
         .unwrap();
+        drop(pool.checkout().await.unwrap());
         let mut abandoned_inside = 0;
-        for i in 0..60u64 {
-            // Abandon a transaction at a growing delay: before, during, and
-            // after its BEGIN and its statement.
-            let work = async {
-                let conn = pool.begin().await?;
-                conn.batch_execute("SELECT pg_sleep(0.002)")
-                    .await
-                    .map_err(super::super::postgres::pg)?;
-                Ok::<_, StoreError>(conn)
-            };
-            match tokio::time::timeout(Duration::from_micros(i * i * 3), work).await {
-                Ok(Ok(conn)) => drop(conn),
-                Ok(Err(e)) => panic!("{e}"),
-                Err(_) => abandoned_inside += 1,
+        for direction in [Direction::ToServer, Direction::ToClient] {
+            for pass in 0.. {
+                let work = async {
+                    let conn = pool.begin().await?;
+                    conn.batch_execute("SELECT 1")
+                        .await
+                        .map_err(super::super::postgres::pg)?;
+                    Ok::<_, StoreError>(conn)
+                };
+                proxy.hold(direction, pass);
+                let ended = proxy.run_or_abandon(work).await;
+                proxy.release();
+                let completed = match ended {
+                    Ok(conn) => {
+                        drop(conn.unwrap());
+                        true
+                    }
+                    Err(stopped) => {
+                        abandoned_inside += usize::from(stopped.in_transaction);
+                        false
+                    }
+                };
+                let conn = pool.checkout().await.unwrap();
+                assert!(
+                    !in_transaction(&conn).await,
+                    "{direction:?} after {pass} messages: reused a connection in a transaction"
+                );
+                drop(conn);
+                proxy.wait_until_open(1).await;
+                if completed {
+                    break;
+                }
             }
-            let conn = pool.checkout().await.unwrap();
-            assert!(
-                !in_transaction(&conn).await,
-                "delay {i}: reused a connection in a transaction"
-            );
         }
-        assert!(abandoned_inside > 0, "no call was abandoned");
+        assert!(
+            abandoned_inside > 0,
+            "no call was abandoned inside its transaction"
+        );
     }
 }
