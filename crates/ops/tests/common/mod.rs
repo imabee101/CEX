@@ -257,3 +257,49 @@ impl Rng {
         self.next_u64() % n
     }
 }
+
+/// The page size [`diff_all`] reads with: small, so every diff in the tests
+/// that has more than a few files crosses page boundaries.
+pub const DIFF_PAGE: usize = 3;
+
+/// Every file of a diff, read [`DIFF_PAGE`] files at a time through the cursor.
+pub async fn diff_all<M: MetaStore, B: BlobStore>(
+    ops: &Ops<M, B>,
+    a: ChangesetId,
+    b: ChangesetId,
+    mode: ops::DiffMode,
+    paths: &[RepoPath],
+) -> Result<Vec<ops::FileDiff>, ops::OpError> {
+    diff_paged(ops, a, b, mode, paths, DIFF_PAGE).await
+}
+
+/// Every file of a diff, read `page` files at a time through the cursor.
+pub async fn diff_paged<M: MetaStore, B: BlobStore>(
+    ops: &Ops<M, B>,
+    a: ChangesetId,
+    b: ChangesetId,
+    mode: ops::DiffMode,
+    paths: &[RepoPath],
+    page: usize,
+) -> Result<Vec<ops::FileDiff>, ops::OpError> {
+    let mut files = Vec::new();
+    let mut after = None;
+    loop {
+        let options = ops::DiffOptions {
+            mode,
+            paths,
+            after: after.as_ref(),
+            limit: page,
+        };
+        let got = ops.diff(REPO, a, b, &options).await?;
+        assert!(got.files.len() <= page);
+        files.extend(got.files);
+        match got.next {
+            Some(next) => {
+                // The cursor survives its byte form, as a client returns it.
+                after = Some(ops::DiffCursor::from_bytes(&next.to_bytes()).unwrap());
+            }
+            None => return Ok(files),
+        }
+    }
+}

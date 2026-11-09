@@ -279,7 +279,7 @@ async fn diff_skips_equal_shards_even_when_the_split_prefix_changes() {
             let meta = Arc::new(FaultMetaStore::new(e.meta.clone(), faults.clone()));
             let blobs = Arc::new(FaultBlobStore::new(e.blobs.clone(), faults.clone()));
             let cold = ops(&meta, &blobs);
-            let diff = cold.diff(REPO, a, b, DiffMode::Names, &[]).await.unwrap();
+            let diff = diff_all(&cold, a, b, DiffMode::Names, &[]).await.unwrap();
             assert_eq!(diff.len(), 1);
             assert_eq!(diff[0].path, name.as_bytes());
             assert!(
@@ -321,7 +321,7 @@ async fn binary_diff_uses_metadata_without_reading_content() {
                 let meta = Arc::new(FaultMetaStore::new(e.meta.clone(), faults.clone()));
                 let blobs = Arc::new(FaultBlobStore::new(e.blobs.clone(), faults.clone()));
                 let cold = ops(&meta, &blobs);
-                let out = cold.diff(REPO, a, b, mode, &[]).await.unwrap();
+                let out = diff_all(&cold, a, b, mode, &[]).await.unwrap();
                 assert_eq!(out.len(), 1);
                 assert!(out[0].binary);
                 assert_eq!((out[0].added_lines, out[0].removed_lines), (0, 0));
@@ -361,7 +361,9 @@ async fn diff_classification_batches_metadata_reads() {
         let meta = Arc::new(FaultMetaStore::new(e.meta.clone(), faults.clone()));
         let blobs = Arc::new(FaultBlobStore::new(e.blobs.clone(), faults.clone()));
         let cold = ops(&meta, &blobs);
-        let out = cold.diff(REPO, base, next, mode, &[]).await.unwrap();
+        let out = diff_paged(&cold, base, next, mode, &[], ops::MAX_DIFF_PAGE)
+            .await
+            .unwrap();
         assert_eq!(out.len(), n);
         assert_eq!(faults.counts().blob_reads, 0);
         if mode == DiffMode::Names {
@@ -408,8 +410,7 @@ async fn diff_classification_deduplicates_blobs_within_each_batch() {
         let faults = Faults::new();
         let meta = Arc::new(FaultMetaStore::new(e.meta.clone(), faults.clone()));
         let blobs = Arc::new(FaultBlobStore::new(e.blobs.clone(), faults.clone()));
-        let out = ops(&meta, &blobs)
-            .diff(REPO, base, next, mode, &[])
+        let out = diff_paged(&ops(&meta, &blobs), base, next, mode, &[], 100)
             .await
             .unwrap();
         assert_eq!(out.len(), 100);
@@ -424,169 +425,6 @@ async fn diff_classification_deduplicates_blobs_within_each_batch() {
             assert_eq!(faults.counts().blob_reads, 0);
         }
     }
-}
-
-/// The first read cannot complete until a second starts. This makes a
-/// serial legacy-sniff implementation fail by timeout, without timing races.
-struct ConcurrentReads<B> {
-    inner: Arc<B>,
-    entered: std::sync::atomic::AtomicUsize,
-    active: std::sync::atomic::AtomicUsize,
-    max: std::sync::atomic::AtomicUsize,
-    first_pair: tokio::sync::Semaphore,
-}
-
-impl<B: BlobStore> BlobStore for ConcurrentReads<B> {
-    async fn put_if_absent(
-        &self,
-        repo: store::RepoId,
-        key: ObjectKey,
-        bytes: Bytes,
-    ) -> Result<store::PutOutcome, store::StoreError> {
-        self.inner.put_if_absent(repo, key, bytes).await
-    }
-
-    async fn contains(
-        &self,
-        repo: store::RepoId,
-        key: ObjectKey,
-    ) -> Result<bool, store::StoreError> {
-        self.inner.contains(repo, key).await
-    }
-
-    async fn get(
-        &self,
-        repo: store::RepoId,
-        key: ObjectKey,
-    ) -> Result<Option<Bytes>, store::StoreError> {
-        use std::sync::atomic::Ordering::SeqCst;
-        let active = self.active.fetch_add(1, SeqCst) + 1;
-        self.max.fetch_max(active, SeqCst);
-        let entered = self.entered.fetch_add(1, SeqCst);
-        if entered < 2 {
-            if entered == 1 {
-                self.first_pair.add_permits(2);
-            }
-            self.first_pair.acquire().await.unwrap().forget();
-        }
-        let result = self.inner.get(repo, key).await;
-        self.active.fetch_sub(1, SeqCst);
-        result
-    }
-}
-
-#[tokio::test]
-async fn legacy_classification_reads_are_concurrent_and_bounded() {
-    use sha2::{Digest, Sha256};
-    let e = env().await;
-    let mut changes = Vec::new();
-    for i in 0..40 {
-        let raw = format!("\0legacy-{i}").into_bytes();
-        let id = scion_core::BlobId::hash(&raw);
-        let frame = derived::encode_frame(scion_core::FrameId::Blob(id), &raw).unwrap();
-        e.blobs
-            .put_if_absent(REPO, ObjectKey::blob(id), frame)
-            .await
-            .unwrap();
-        let record = derived::BlobRecord {
-            size: raw.len() as u64,
-            sha256: Sha256::digest(&raw).into(),
-            git_sha1: None,
-            text: None,
-        };
-        e.meta
-            .put(REPO, &[(MetaKey::Blob(id), Bytes::from(record.encode()))])
-            .await
-            .unwrap();
-        changes.push((path(&format!("f{i:03}")), write(&raw)));
-    }
-    let plain = ops(&e.meta, &e.blobs);
-    let base = commit(&plain, &[], "empty", vec![], &[]).await.unwrap();
-    let next = commit(&plain, &[base], "legacy", changes, &[])
-        .await
-        .unwrap();
-    let blobs = Arc::new(ConcurrentReads {
-        inner: e.blobs.clone(),
-        entered: 0.into(),
-        active: 0.into(),
-        max: 0.into(),
-        first_pair: tokio::sync::Semaphore::new(0),
-    });
-    let cold = ops(&e.meta, &blobs);
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        cold.diff(REPO, base, next, DiffMode::Stat, &[]),
-    )
-    .await
-    .expect("legacy classifications ran serially")
-    .unwrap();
-    assert_eq!(out.len(), 40);
-    assert!(out.iter().all(|f| f.binary));
-    let max = blobs.max.load(std::sync::atomic::Ordering::SeqCst);
-    assert!((2..=16).contains(&max), "{max} concurrent legacy reads");
-    assert_eq!(blobs.entered.load(std::sync::atomic::Ordering::SeqCst), 40);
-}
-
-#[tokio::test]
-async fn legacy_binary_diff_reads_only_the_first_chunk() {
-    let e = env().await;
-    let bytes = Bytes::from(vec![0; 9 << 20]);
-    let id = ops::blob::upload_blobs(&*e.meta, &e.blobs, REPO, std::slice::from_ref(&bytes))
-        .await
-        .unwrap()[0];
-    let repo = store::RepoId(REPO.0 + 1);
-    // Copy the uploaded frames to a repo with a pre-classification v1 record.
-    let mut keys = std::collections::BTreeSet::from([ObjectKey::blob(id)]);
-    keys.extend(
-        bytes
-            .chunks(scion_core::CHUNK_BYTES)
-            .map(|c| ObjectKey::chunk(scion_core::ChunkId::hash(c))),
-    );
-    for key in keys {
-        let frame = e.blobs.get(REPO, key).await.unwrap().unwrap();
-        e.blobs.put_if_absent(repo, key, frame).await.unwrap();
-    }
-    let mut record = e.meta.get(REPO, &[MetaKey::Blob(id)]).await.unwrap()[0]
-        .as_ref()
-        .unwrap()
-        .to_vec();
-    record[0] = 1;
-    record.pop();
-    e.meta
-        .put(repo, &[(MetaKey::Blob(id), Bytes::from(record))])
-        .await
-        .unwrap();
-    let plain = ops(&e.meta, &e.blobs);
-    let base = plain
-        .create_changeset(
-            repo,
-            changeset(&[], "empty", vec![]),
-            &CreateOptions::default(),
-        )
-        .await
-        .unwrap();
-    let next = plain
-        .create_changeset(
-            repo,
-            changeset(&[base], "legacy", vec![(path("f"), write(&bytes))]),
-            &CreateOptions::default(),
-        )
-        .await
-        .unwrap();
-    let faults = Faults::new();
-    let meta = Arc::new(FaultMetaStore::new(e.meta.clone(), faults.clone()));
-    let blobs = Arc::new(FaultBlobStore::new(e.blobs.clone(), faults.clone()));
-    let cold = ops(&meta, &blobs);
-    let out = cold
-        .diff(repo, base, next, DiffMode::Patch, &[])
-        .await
-        .unwrap();
-    assert!(out[0].binary);
-    assert_eq!(
-        faults.counts().blob_reads,
-        2,
-        "only the chunk list and first chunk"
-    );
 }
 
 #[tokio::test]
@@ -617,16 +455,14 @@ async fn diff_handles_shard_collapse_and_directory_file_replacement() {
         .await
         .unwrap();
     for (a, b) in [(base, collapsed), (collapsed, base)] {
-        let out = ops(&e.meta, &e.blobs)
-            .diff(REPO, a, b, DiffMode::Names, &[])
+        let out = diff_all(&ops(&e.meta, &e.blobs), a, b, DiffMode::Names, &[])
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, b"d/f4096");
     }
     for (a, b) in [(collapsed, replaced), (replaced, collapsed)] {
-        let out = ops(&e.meta, &e.blobs)
-            .diff(REPO, a, b, DiffMode::Names, &[])
+        let out = diff_all(&ops(&e.meta, &e.blobs), a, b, DiffMode::Names, &[])
             .await
             .unwrap();
         assert_eq!(out.len(), 4097);

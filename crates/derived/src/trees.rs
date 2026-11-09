@@ -268,6 +268,14 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
     }
 
     /// Loads, in one batch, every node in `ids` not already at hand.
+    /// Loads every node of `ids` not yet loaded, in one batch.
+    pub async fn prefetch(
+        &mut self,
+        ids: impl IntoIterator<Item = TreeId>,
+    ) -> Result<(), DeriveError> {
+        self.ensure(ids).await
+    }
+
     async fn ensure(&mut self, ids: impl IntoIterator<Item = TreeId>) -> Result<(), DeriveError> {
         let mut seen = HashSet::new();
         let need: Vec<TreeId> = ids

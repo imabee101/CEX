@@ -1,6 +1,7 @@
 //! Diff between two changesets' trees: the changed paths, their line
-//! counts, or a unified patch. Equal subtrees are skipped by id, so the walk
-//! skips matching directory and shard ids without loading their entries.
+//! counts, or a unified patch, one page at a time in path byte order. Equal
+//! subtrees are skipped by id, so the walk skips matching directory and
+//! shard ids without loading their entries.
 
 use std::collections::VecDeque;
 
@@ -9,14 +10,13 @@ use imara_diff::{Algorithm, Diff, InternedInput};
 use scion_core::{BlobId, ChangesetId, EntryTarget, FileKind, RepoPath, TreeId};
 use store::{BlobStore, MetaStore, RepoId};
 
-use crate::blob::{MAX_TEXT_BYTES, classify_blobs, is_text, read_blob};
-use crate::{OpError, Ops};
+use tokio::task::JoinSet;
+
+use crate::blob::{classify_blobs, is_text, read_blob};
+use crate::{Code, OpError, Ops};
 
 /// Lines of context around each patch hunk.
 pub const PATCH_CONTEXT: u32 = 3;
-
-/// Bound temporary classification state independently of the diff's size.
-const CLASSIFICATION_FILES: usize = 256;
 
 /// What a diff reports per path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -251,97 +251,281 @@ fn unified(old: &[u8], new: &[u8], out: &mut Vec<u8>) -> (u64, u64) {
     )
 }
 
+/// The most files one diff page holds.
+pub const MAX_DIFF_PAGE: usize = 1000;
+
+/// The most blobs a diff page reads at once.
+const BLOB_READS: usize = 16;
+
+/// Where the next page of a diff starts: after the last path of the previous
+/// page. It carries no state the server trusts: a client that sends any
+/// other path gets exactly the diff entries after that path, so a forged
+/// cursor can produce neither a wrong result nor extra work.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DiffCursor(Vec<u8>);
+
+impl DiffCursor {
+    /// The cursor's opaque bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.clone()
+    }
+
+    /// Parses a cursor's bytes; they must be a valid path.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, OpError> {
+        RepoPath::new(bytes)
+            .map(|p| Self(p.into_bytes()))
+            .map_err(|_| OpError::new(Code::InvalidArgument, "malformed diff cursor"))
+    }
+}
+
+/// What one diff page covers.
+#[derive(Clone, Copy, Debug)]
+pub struct DiffOptions<'a> {
+    /// What to report per path.
+    pub mode: DiffMode,
+    /// When not empty, only paths equal to or under one of these.
+    pub paths: &'a [RepoPath],
+    /// Start after this cursor, from the previous page.
+    pub after: Option<&'a DiffCursor>,
+    /// The most files in the page: 1 to [`MAX_DIFF_PAGE`].
+    pub limit: usize,
+}
+
+/// One page of a diff.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DiffPage {
+    /// The page's files, in path byte order.
+    pub files: Vec<FileDiff>,
+    /// Where the next page starts, or `None` if this is the last page.
+    pub next: Option<DiffCursor>,
+}
+
+/// One entry of a directory diff, keyed for path byte order: a file by its
+/// path, a directory by its path and a trailing `/`, which is where its
+/// contents sort among its siblings.
+struct Item {
+    key: Vec<u8>,
+    path: Vec<u8>,
+    file: Option<(Option<FileState>, Option<FileState>)>,
+    dir: Option<(Option<TreeId>, Option<TreeId>)>,
+}
+
+/// Where a directory's subtree lies relative to the resume point `after`.
+enum Resume {
+    /// Every path in it comes after `after`.
+    All,
+    /// `after` lies inside it.
+    Partly,
+    /// No path in it comes after `after`.
+    None,
+}
+
+fn resume(key: &[u8], after: Option<&[u8]>) -> Resume {
+    match after {
+        None => Resume::All,
+        Some(after) if after < key => Resume::All,
+        Some(after) if after.starts_with(key) => Resume::Partly,
+        // `after` follows `key` and does not extend it, so it follows every
+        // path that does.
+        Some(_) => Resume::None,
+    }
+}
+
+/// The items of the directories `a` and `b` at `path`, sorted by key, with
+/// the subdirectories a walk will enter prefetched in one batch.
+async fn items<M: MetaStore>(
+    work: &mut TreeWork<'_, M>,
+    path: &[u8],
+    a: Option<TreeId>,
+    b: Option<TreeId>,
+    paths: &[RepoPath],
+    after: Option<&[u8]>,
+) -> Result<Vec<Item>, DeriveError> {
+    let mut out = Vec::new();
+    for (name, ea, eb) in pairs(work, a, b).await? {
+        let p = join(path, &name);
+        let (fa, fb) = (file(ea), file(eb));
+        if (fa.is_some() || fb.is_some()) && keep_file(&p, paths) {
+            out.push(Item {
+                key: p.clone(),
+                path: p.clone(),
+                file: Some((fa, fb)),
+                dir: None,
+            });
+        }
+        let (da, db) = (dir(ea), dir(eb));
+        if (da.is_some() || db.is_some()) && enter_dir(&p, paths) {
+            let mut key = p.clone();
+            key.push(b'/');
+            out.push(Item {
+                key,
+                path: p,
+                file: None,
+                dir: Some((da, db)),
+            });
+        }
+    }
+    out.sort_by(|x, y| x.key.cmp(&y.key));
+    let entered = out
+        .iter()
+        .filter_map(|i| match (&i.dir, resume(&i.key, after)) {
+            (Some((da, db)), Resume::All | Resume::Partly) => Some([*da, *db]),
+            _ => None,
+        });
+    work.prefetch(entered.flatten().flatten()).await?;
+    Ok(out)
+}
+
 impl<M: MetaStore, B: BlobStore> Ops<M, B> {
-    /// The files that differ between `a` and `b`, in path byte order,
-    /// limited to paths equal to or under one of `paths` when it is not
-    /// empty.
+    /// One page of the files that differ between `a` and `b`, in path byte
+    /// order, as `options` selects. Equal subtrees are skipped by id, and
+    /// the work is bounded by the page, not by the size of the whole diff.
     pub async fn diff(
         &self,
         repo: RepoId,
         a: ChangesetId,
         b: ChangesetId,
-        mode: DiffMode,
-        paths: &[RepoPath],
-    ) -> Result<Vec<FileDiff>, OpError> {
+        options: &DiffOptions<'_>,
+    ) -> Result<DiffPage, OpError> {
+        let DiffOptions {
+            mode,
+            paths,
+            after,
+            limit,
+        } = *options;
+        if !(1..=MAX_DIFF_PAGE).contains(&limit) {
+            return Err(OpError::new(
+                Code::InvalidArgument,
+                format!("a diff page holds 1 to {MAX_DIFF_PAGE} files"),
+            ));
+        }
+        let after = after.map(|c| c.0.as_slice());
         let d = self.deriver();
         let ra = RootTree::decode(&d.get(repo, &RootTree, a).await?)?;
         let rb = RootTree::decode(&d.get(repo, &RootTree, b).await?)?;
         let mut cx = d.cx(repo);
-        let mut out = Vec::new();
-        let mut stack = vec![(Vec::new(), Some(ra), Some(rb))];
-        while let Some((path, ta, tb)) = stack.pop() {
-            if ta == tb || !enter_dir(&path, paths) {
+        let mut files = Vec::new();
+        // One frame per directory being walked: its items, next first.
+        let mut stack: Vec<std::vec::IntoIter<Item>> = Vec::new();
+        if ra != rb {
+            stack.push(
+                items(&mut cx.trees, b"", Some(ra), Some(rb), paths, after)
+                    .await?
+                    .into_iter(),
+            );
+        }
+        // Walk until one file past the page, which proves there is a next
+        // page.
+        'walk: while let Some(frame) = stack.last_mut() {
+            let Some(item) = frame.next() else {
+                stack.pop();
                 continue;
-            }
-            for (name, ea, eb) in pairs(&mut cx.trees, ta, tb).await? {
-                let p = join(&path, &name);
-                let (fa, fb) = (file(ea), file(eb));
-                if (fa.is_some() || fb.is_some()) && keep_file(&p, paths) {
-                    out.push(FileDiff {
-                        path: p.clone(),
-                        old: fa,
-                        new: fb,
-                        ..FileDiff::default()
-                    });
+            };
+            if let Some((old, new)) = item.file {
+                if after.is_some_and(|after| item.path.as_slice() <= after) {
+                    continue;
                 }
-                let (da, db) = (dir(ea), dir(eb));
-                if da.is_some() || db.is_some() {
-                    stack.push((p, da, db));
+                files.push(FileDiff {
+                    path: item.path,
+                    old,
+                    new,
+                    ..FileDiff::default()
+                });
+                if files.len() > limit {
+                    break 'walk;
                 }
+            } else if let Some((da, db)) = item.dir
+                && da != db
+            {
+                let within = match resume(&item.key, after) {
+                    Resume::All => None,
+                    Resume::Partly => after,
+                    Resume::None => continue,
+                };
+                let children = items(&mut cx.trees, &item.path, da, db, paths, within).await?;
+                stack.push(children.into_iter());
             }
         }
-        out.sort_by(|x, y| x.path.cmp(&y.path));
+        let next = if files.len() > limit {
+            files.truncate(limit);
+            files.last().map(|f| DiffCursor(f.path.clone()))
+        } else {
+            None
+        };
         if mode != DiffMode::Names {
-            let blobs = d.blobs();
-            for files in out.chunks_mut(CLASSIFICATION_FILES) {
-                for f in files.iter_mut() {
-                    if [f.old, f.new]
-                        .into_iter()
-                        .flatten()
-                        .any(|s| s.size > MAX_TEXT_BYTES as u64)
-                    {
-                        f.binary = true;
-                        continue;
-                    }
-                }
-                let requests: Vec<_> = files
-                    .iter()
-                    .filter(|f| !f.binary)
-                    .flat_map(|f| [f.old, f.new].into_iter().flatten())
-                    .map(|s| (s.blob, s.size))
-                    .collect();
-                let text = classify_blobs(&**d.meta(), blobs, repo, &requests).await?;
-                for f in files {
-                    if f.binary {
-                        continue;
-                    }
-                    f.binary = [f.old, f.new].into_iter().flatten().any(|s| !text[&s.blob]);
-                    if f.binary {
-                        continue;
-                    }
-                    let old = match f.old {
-                        Some(s) => read_blob(&**blobs, repo, s.blob).await?,
-                        None => Vec::new(),
-                    };
-                    let new = match f.new {
-                        Some(s) => read_blob(&**blobs, repo, s.blob).await?,
-                        None => Vec::new(),
-                    };
-                    if !is_text(&old) || !is_text(&new) {
-                        f.binary = true;
-                        continue;
-                    }
-                    let mut patch = Vec::new();
-                    let (added, removed) = unified(&old, &new, &mut patch);
-                    f.added_lines = added;
-                    f.removed_lines = removed;
-                    if mode == DiffMode::Patch {
-                        f.patch = patch;
-                    }
-                }
-            }
+            self.compare_contents(repo, mode, &mut files).await?;
         }
-        Ok(out)
+        Ok(DiffPage { files, next })
+    }
+
+    /// Fills in each file's binary flag, line counts, and (in Patch mode)
+    /// patch. Text classification comes from the blob records; blobs are
+    /// read at most [`BLOB_READS`] at a time, and not at all when both sides
+    /// have the same blob.
+    async fn compare_contents(
+        &self,
+        repo: RepoId,
+        mode: DiffMode,
+        files: &mut [FileDiff],
+    ) -> Result<(), OpError> {
+        let d = self.deriver();
+        let requests: Vec<_> = files
+            .iter()
+            .flat_map(|f| [f.old, f.new].into_iter().flatten())
+            .map(|s| (s.blob, s.size))
+            .collect();
+        let text = classify_blobs(&**d.meta(), repo, &requests).await?;
+        let mut reads = JoinSet::new();
+        let mut index = 0;
+        let mut done = 0;
+        while done < files.len() {
+            while index < files.len() && reads.len() < BLOB_READS {
+                let f = &mut files[index];
+                let i = index;
+                index += 1;
+                f.binary = [f.old, f.new].into_iter().flatten().any(|s| !text[&s.blob]);
+                let same = f.old.map(|s| s.blob) == f.new.map(|s| s.blob);
+                if f.binary || same {
+                    done += 1;
+                    continue;
+                }
+                let (old, new) = (f.old.map(|s| s.blob), f.new.map(|s| s.blob));
+                let blobs = d.blobs().clone();
+                reads.spawn(async move {
+                    let read = async |id: Option<BlobId>| match id {
+                        Some(id) => read_blob(&*blobs, repo, id).await,
+                        None => Ok(Vec::new()),
+                    };
+                    Ok::<_, OpError>((i, read(old).await?, read(new).await?))
+                });
+            }
+            let Some(joined) = reads.join_next().await else {
+                continue;
+            };
+            let (i, old, new) = joined.map_err(|e| {
+                OpError::new(Code::Internal, format!("a blob read task failed: {e}"))
+            })??;
+            let f = &mut files[i];
+            if !is_text(&old) || !is_text(&new) {
+                // The record said text; the verified bytes disagree.
+                return Err(OpError::new(
+                    Code::DataLoss,
+                    format!(
+                        "{}: a blob classified as text holds binary bytes",
+                        String::from_utf8_lossy(&f.path)
+                    ),
+                ));
+            }
+            let mut patch = Vec::new();
+            let (added, removed) = unified(&old, &new, &mut patch);
+            f.added_lines = added;
+            f.removed_lines = removed;
+            if mode == DiffMode::Patch {
+                f.patch = patch;
+            }
+            done += 1;
+        }
+        Ok(())
     }
 }
 

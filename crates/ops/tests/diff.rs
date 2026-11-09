@@ -145,7 +145,7 @@ async fn diffs_equal_a_naive_comparison() {
                 .filter(|p| ma.files.get(*p) != mb.files.get(*p))
                 .cloned()
                 .collect();
-            let got: Vec<FileDiff> = ops.diff(REPO, *a, *b, DiffMode::Patch, &[]).await.unwrap();
+            let got: Vec<FileDiff> = diff_all(&ops, *a, *b, DiffMode::Patch, &[]).await.unwrap();
             assert_eq!(got.iter().map(|f| f.path.clone()).collect::<Vec<_>>(), want);
             for f in &got {
                 let old = ma
@@ -184,7 +184,7 @@ async fn diffs_equal_a_naive_comparison() {
                 assert_eq!((f.added_lines, f.removed_lines), (pluses, minuses));
             }
             // Names mode reports the same paths, with no contents read.
-            let names = ops.diff(REPO, *a, *b, DiffMode::Names, &[]).await.unwrap();
+            let names = diff_all(&ops, *a, *b, DiffMode::Names, &[]).await.unwrap();
             assert_eq!(names.len(), got.len());
             assert!(
                 names
@@ -193,8 +193,7 @@ async fn diffs_equal_a_naive_comparison() {
             );
             // Filters select exactly the files under them.
             let filter = [path("b/d"), path("big")];
-            let filtered = ops
-                .diff(REPO, *a, *b, DiffMode::Names, &filter)
+            let filtered = diff_all(&ops, *a, *b, DiffMode::Names, &filter)
                 .await
                 .unwrap();
             let want_filtered: Vec<_> = got
@@ -229,8 +228,7 @@ async fn either_side_binary_makes_the_file_binary() {
         ("t2t", Some((FileKind::Regular, b"other\n"))),
     ]);
     let two = commit(&ops, &[one], "two", c, &b).await.unwrap();
-    let out = ops
-        .diff(REPO, one, two, DiffMode::Patch, &[])
+    let out = diff_all(&ops, one, two, DiffMode::Patch, &[])
         .await
         .unwrap();
     let got: Vec<(String, bool, bool)> = out
@@ -286,7 +284,7 @@ async fn kind_changes_and_file_directory_swaps_are_reported() {
             .collect::<Vec<_>>()
     };
     for (a, bb) in [(one, two), (two, one)] {
-        let out = ops.diff(REPO, a, bb, DiffMode::Stat, &[]).await.unwrap();
+        let out = diff_all(&ops, a, bb, DiffMode::Stat, &[]).await.unwrap();
         let got: Vec<Vec<u8>> = out.iter().map(|f| f.path.clone()).collect();
         assert_eq!(got, want(&["k", "l", "x", "x/w", "y", "y/z"]));
         let (ma, mb) = if a == one {
@@ -300,8 +298,7 @@ async fn kind_changes_and_file_directory_swaps_are_reported() {
         }
         let k = &out[0];
         assert_eq!((k.added_lines, k.removed_lines), (0, 0), "kind-only change");
-        let filtered = ops
-            .diff(REPO, a, bb, DiffMode::Names, &[path("x"), path("y/z")])
+        let filtered = diff_all(&ops, a, bb, DiffMode::Names, &[path("x"), path("y/z")])
             .await
             .unwrap();
         assert_eq!(
@@ -309,4 +306,222 @@ async fn kind_changes_and_file_directory_swaps_are_reported() {
             want(&["x", "x/w", "y/z"])
         );
     }
+}
+
+/// Names around a directory `a`: `a-c` and `a.x` sort before the contents of
+/// `a/`, and `a0` after them, so path byte order is not tree order.
+const ORDER_PATHS: &[&str] = &[
+    "a-c", "a.x", "a/b-1", "a/b/c", "a/b/d", "a/b0", "a/bb", "a0", "b", "b-/a", "z/y/x",
+];
+
+async fn order_fixture() -> (Env, ChangesetId, ChangesetId) {
+    let e = env().await;
+    let plain = ops(&e.meta, &e.blobs);
+    let base = commit(
+        &plain,
+        &[],
+        "base",
+        vec![(path("keep"), write(b"k\n"))],
+        &[bytes::Bytes::from_static(b"k\n")],
+    )
+    .await
+    .unwrap();
+    let changes = ORDER_PATHS
+        .iter()
+        .map(|p| (path(p), write(p.as_bytes())))
+        .collect();
+    let contents: Vec<bytes::Bytes> = ORDER_PATHS
+        .iter()
+        .map(|p| bytes::Bytes::copy_from_slice(p.as_bytes()))
+        .collect();
+    let next = commit(&plain, &[base], "next", changes, &contents)
+        .await
+        .unwrap();
+    (e, base, next)
+}
+
+#[tokio::test]
+async fn pages_reassemble_the_whole_diff_in_path_byte_order_at_every_size() {
+    let (e, base, next) = order_fixture().await;
+    let o = ops(&e.meta, &e.blobs);
+    let mut want: Vec<&[u8]> = ORDER_PATHS.iter().map(|p| p.as_bytes()).collect();
+    want.sort();
+    for page in [1, 2, 3, 5, ops::MAX_DIFF_PAGE] {
+        for mode in [DiffMode::Names, DiffMode::Patch] {
+            let got = diff_paged(&o, base, next, mode, &[], page).await.unwrap();
+            let paths: Vec<&[u8]> = got.iter().map(|f| f.path.as_slice()).collect();
+            assert_eq!(paths, want, "page {page}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cursor_at_any_path_returns_exactly_the_entries_after_it() {
+    let (e, base, next) = order_fixture().await;
+    let o = ops(&e.meta, &e.blobs);
+    let all = diff_paged(&o, base, next, DiffMode::Names, &[], ops::MAX_DIFF_PAGE)
+        .await
+        .unwrap();
+    // Cursors a client could forge, at, between, and around the changed
+    // paths.
+    for after in [
+        "a", "a-c", "a/", "a/b", "a/b/", "a/b/c", "a/c", "a0", "aa", "b/a", "zz", "\u{1}",
+    ] {
+        let Ok(cursor) = ops::DiffCursor::from_bytes(after.as_bytes()) else {
+            continue;
+        };
+        let page = o
+            .diff(
+                REPO,
+                base,
+                next,
+                &ops::DiffOptions {
+                    mode: DiffMode::Names,
+                    paths: &[],
+                    after: Some(&cursor),
+                    limit: ops::MAX_DIFF_PAGE,
+                },
+            )
+            .await
+            .unwrap();
+        let want: Vec<&FileDiff> = all
+            .iter()
+            .filter(|f| f.path.as_slice() > after.as_bytes())
+            .collect();
+        assert_eq!(
+            page.files.iter().collect::<Vec<_>>(),
+            want,
+            "after {after:?}"
+        );
+        assert_eq!(page.next, None);
+    }
+}
+
+#[tokio::test]
+async fn malformed_cursors_and_page_sizes_are_invalid_arguments() {
+    let (e, base, next) = order_fixture().await;
+    let o = ops(&e.meta, &e.blobs);
+    for bad in [&b""[..], b"/a", b"a//b", b"a\0"] {
+        let err = ops::DiffCursor::from_bytes(bad).unwrap_err();
+        assert_eq!(err.code, ops::Code::InvalidArgument, "{bad:?}");
+    }
+    for limit in [0, ops::MAX_DIFF_PAGE + 1] {
+        let err = o
+            .diff(
+                REPO,
+                base,
+                next,
+                &ops::DiffOptions {
+                    mode: DiffMode::Names,
+                    paths: &[],
+                    after: None,
+                    limit,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ops::Code::InvalidArgument, "{limit}");
+    }
+}
+
+#[tokio::test]
+async fn a_kind_only_change_reads_no_content() {
+    let e = env().await;
+    let plain = ops(&e.meta, &e.blobs);
+    let body = bytes::Bytes::from_static(b"#!/bin/sh\necho hi\n");
+    let base = commit(
+        &plain,
+        &[],
+        "regular",
+        vec![(path("run"), write(&body))],
+        std::slice::from_ref(&body),
+    )
+    .await
+    .unwrap();
+    let id = scion_core::BlobId::hash(&body);
+    let exec = scion_core::FileChange::File {
+        kind: FileKind::Executable,
+        blob: id,
+        size: body.len() as u64,
+    };
+    let next = commit(&plain, &[base], "exec", vec![(path("run"), exec)], &[])
+        .await
+        .unwrap();
+    let faults = store::fault::Faults::new();
+    let meta = std::sync::Arc::new(store::fault::FaultMetaStore::new(
+        e.meta.clone(),
+        faults.clone(),
+    ));
+    let blobs = std::sync::Arc::new(store::fault::FaultBlobStore::new(
+        e.blobs.clone(),
+        faults.clone(),
+    ));
+    let got = diff_all(&ops(&meta, &blobs), base, next, DiffMode::Patch, &[])
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].old.unwrap().kind, FileKind::Regular);
+    assert_eq!(got[0].new.unwrap().kind, FileKind::Executable);
+    assert!(!got[0].binary);
+    assert_eq!((got[0].added_lines, got[0].removed_lines), (0, 0));
+    assert!(got[0].patch.is_empty());
+    assert_eq!(faults.counts().blob_reads, 0);
+}
+
+#[tokio::test]
+async fn a_text_record_over_binary_bytes_is_data_loss() {
+    use store::{BlobStore, MetaKey, MetaStore, ObjectKey};
+    let e = env().await;
+    let plain = ops(&e.meta, &e.blobs);
+    let base = commit(
+        &plain,
+        &[],
+        "text",
+        vec![(path("f"), write(b"a\n"))],
+        &[bytes::Bytes::from_static(b"a\n")],
+    )
+    .await
+    .unwrap();
+    // A record that claims text for bytes with a NUL, with the real frame.
+    let binary = b"x\0y\n";
+    let id = scion_core::BlobId::hash(binary);
+    let record = derived::BlobRecord {
+        size: binary.len() as u64,
+        sha256: [0; 32],
+        git_sha1: None,
+        text: true,
+    };
+    e.meta
+        .put(
+            REPO,
+            &[(MetaKey::Blob(id), bytes::Bytes::from(record.encode()))],
+        )
+        .await
+        .unwrap();
+    let frame = derived::encode_frame(scion_core::FrameId::Blob(id), binary).unwrap();
+    e.blobs
+        .put_if_absent(REPO, ObjectKey::blob(id), frame)
+        .await
+        .unwrap();
+    let next = commit(
+        &plain,
+        &[base],
+        "lie",
+        vec![(path("f"), write(binary))],
+        &[],
+    )
+    .await
+    .unwrap();
+    let err = diff_all(&plain, base, next, DiffMode::Stat, &[])
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ops::Code::DataLoss);
+    // Names mode reads no content, so it reports the change.
+    assert_eq!(
+        diff_all(&plain, base, next, DiffMode::Names, &[])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }

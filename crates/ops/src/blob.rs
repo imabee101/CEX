@@ -94,7 +94,7 @@ pub async fn upload_blobs<M: MetaStore, B: BlobStore>(
                     size: content.len() as u64,
                     sha256: Sha256::digest(&content).into(),
                     git_sha1: None,
-                    text: Some(is_text(&content)),
+                    text: is_text(&content),
                 }
                 .encode(),
             ),
@@ -150,14 +150,11 @@ fn decode_payload(bytes: &[u8], id: FrameId) -> Result<Vec<u8>, OpError> {
 
 /// The maximum number of blob records in a classification metadata read.
 const CLASSIFICATION_BATCH_SIZE: usize = 256;
-/// The maximum number of legacy first-chunk reads in flight.
-const SNIFF_CONCURRENCY: usize = 16;
 
-/// Classifies distinct blobs with bounded metadata batches. Legacy records
-/// are sniffed concurrently, with at most `SNIFF_CONCURRENCY` tasks in flight.
-pub(crate) async fn classify_blobs<M: MetaStore, B: BlobStore>(
+/// Classifies distinct blobs as text or binary from their stored records, in
+/// bounded metadata batches; no blob content is read.
+pub(crate) async fn classify_blobs<M: MetaStore>(
     meta: &M,
-    blobs: &Arc<B>,
     repo: RepoId,
     requests: &[(BlobId, u64)],
 ) -> Result<HashMap<BlobId, bool>, OpError> {
@@ -171,106 +168,33 @@ pub(crate) async fn classify_blobs<M: MetaStore, B: BlobStore>(
         }
     }
     let mut out = HashMap::new();
-    let keys: Vec<_> = sizes
-        .iter()
-        .filter_map(|(&id, &size)| {
-            if size > MAX_TEXT_BYTES as u64 {
-                out.insert(id, false);
-                None
-            } else {
-                Some(MetaKey::Blob(id))
-            }
-        })
-        .collect();
-    let mut tasks = JoinSet::new();
-    for batch in keys.chunks(CLASSIFICATION_BATCH_SIZE) {
-        let records = meta.get(repo, batch).await?;
+    let mut lookups = Vec::new();
+    for (&id, &size) in &sizes {
+        if size > MAX_TEXT_BYTES as u64 {
+            out.insert(id, false);
+        } else {
+            lookups.push(id);
+        }
+    }
+    for batch in lookups.chunks(CLASSIFICATION_BATCH_SIZE) {
+        let keys: Vec<MetaKey> = batch.iter().map(|&id| MetaKey::Blob(id)).collect();
+        let records = meta.get(repo, &keys).await?;
         if records.len() != batch.len() {
             return Err(OpError::new(
-                Code::DataLoss,
-                "incomplete blob metadata batch",
+                Code::Internal,
+                "the store returned a short metadata batch",
             ));
         }
-        for (key, bytes) in batch.iter().zip(records) {
-            let MetaKey::Blob(id) = *key else {
-                unreachable!("blob keys only")
-            };
+        for (&id, bytes) in batch.iter().zip(records) {
             let bytes = bytes.ok_or_else(|| data_loss(id, "missing blob record"))?;
             let record = BlobRecord::decode(&bytes)?;
             if record.size != sizes[&id] {
                 return Err(data_loss(id, "tree and blob sizes differ"));
             }
-            if let Some(text) = record.text {
-                out.insert(id, text);
-            } else {
-                if tasks.len() >= SNIFF_CONCURRENCY {
-                    collect_classification(&mut tasks, &mut out).await?;
-                }
-                let blobs = blobs.clone();
-                tasks.spawn(
-                    async move { Ok((id, sniff_blob(&*blobs, repo, id, record.size).await?)) },
-                );
-            }
+            out.insert(id, record.text);
         }
-    }
-    while !tasks.is_empty() {
-        collect_classification(&mut tasks, &mut out).await?;
     }
     Ok(out)
-}
-
-async fn collect_classification(
-    tasks: &mut JoinSet<Result<(BlobId, bool), OpError>>,
-    out: &mut HashMap<BlobId, bool>,
-) -> Result<(), OpError> {
-    if let Some(result) = tasks.join_next().await {
-        let (id, text) = result
-            .map_err(|e| OpError::new(Code::DataLoss, format!("blob sniff task failed: {e}")))??;
-        out.insert(id, text);
-    }
-    Ok(())
-}
-
-/// A legacy classification reads at most the first (4 MiB) chunk, never
-/// the rest of a binary blob.
-async fn sniff_blob<B: BlobStore>(
-    blobs: &B,
-    repo: RepoId,
-    id: BlobId,
-    size: u64,
-) -> Result<bool, OpError> {
-    let bytes = blobs
-        .get(repo, ObjectKey::blob(id))
-        .await?
-        .ok_or_else(|| data_loss(id, "missing frame"))?;
-    let frame = Frame::decode(&bytes).map_err(|e| data_loss(id, &e.to_string()))?;
-    if frame.header().raw_len() != size {
-        return Err(data_loss(id, "frame and blob sizes differ"));
-    }
-    let raw = if frame.header().kind() == FrameKind::ChunkList {
-        let list = ChunkList::decode(&decode_payload(&bytes, FrameId::ChunkList(id))?)
-            .map_err(|e| data_loss(id, &e.to_string()))?;
-        let first = list
-            .chunks
-            .first()
-            .ok_or_else(|| data_loss(id, "empty chunk list"))?;
-        let bytes = blobs
-            .get(repo, ObjectKey::chunk(*first))
-            .await?
-            .ok_or_else(|| data_loss(id, "missing first chunk"))?;
-        let raw = decode_payload(&bytes, FrameId::Chunk(*first))?;
-        if raw.len() != CHUNK_BYTES || ChunkId::hash(&raw) != *first {
-            return Err(data_loss(id, "invalid first chunk"));
-        }
-        raw
-    } else {
-        let raw = decode_payload(&bytes, FrameId::Blob(id))?;
-        if raw.len() as u64 != size || BlobId::hash(&raw) != id {
-            return Err(data_loss(id, "invalid blob bytes"));
-        }
-        raw
-    };
-    Ok(is_text(&raw))
 }
 
 /// Reads a blob's bytes, verifying every frame and the blob's id.

@@ -5,6 +5,10 @@ use crate::DeriveError;
 use crate::codec::{Reader, put_uvarint};
 
 /// What the metadata database knows about a stored blob.
+///
+/// Encoded as: `u8` version, `uvarint` size, the 32-byte SHA-256,
+/// `opt<20-byte git SHA-1>`, and `u8` text (0 binary, 1 text). The decoder
+/// accepts only that canonical form.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BlobRecord {
     /// The blob's length in bytes.
@@ -13,9 +17,8 @@ pub struct BlobRecord {
     pub sha256: [u8; 32],
     /// The git SHA-1 of the blob, when it was imported.
     pub git_sha1: Option<[u8; 20]>,
-    /// Text classification computed from uploaded bytes. `None` for legacy
-    /// records whose contents must be sniffed before a textual diff.
-    pub text: Option<bool>,
+    /// Whether the blob is text, classified from its bytes when uploaded.
+    pub text: bool,
 }
 
 impl BlobRecord {
@@ -34,19 +37,14 @@ impl BlobRecord {
                 out.extend_from_slice(s);
             }
         }
-        out.push(match self.text {
-            None => 0,
-            Some(true) => 1,
-            Some(false) => 2,
-        });
+        out.push(u8::from(self.text));
         out
     }
 
     /// Decodes stored bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, DeriveError> {
         let mut r = Reader::new(bytes, "blob record");
-        let version = r.u8()?;
-        if version != 1 && version != Self::VERSION {
+        if r.u8()? != Self::VERSION {
             return Err(DeriveError::DataLoss("unknown blob record version".into()));
         }
         let size = r.uvarint()?;
@@ -60,15 +58,10 @@ impl BlobRecord {
             }
             _ => return Err(DeriveError::DataLoss("bad blob record tag".into())),
         };
-        let text = if version == 1 {
-            None
-        } else {
-            match r.u8()? {
-                0 => None,
-                1 => Some(true),
-                2 => Some(false),
-                _ => return Err(DeriveError::DataLoss("bad text classification tag".into())),
-            }
+        let text = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(DeriveError::DataLoss("bad text classification".into())),
         };
         r.finish()?;
         Ok(Self {
@@ -85,43 +78,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trips() {
+    fn records_round_trip() {
         for git_sha1 in [None, Some([7; 20])] {
-            let r = BlobRecord {
-                size: 1 << 40,
-                sha256: [9; 32],
-                git_sha1,
-                text: Some(false),
-            };
-            assert_eq!(BlobRecord::decode(&r.encode()).unwrap(), r);
+            for text in [false, true] {
+                let r = BlobRecord {
+                    size: 1 << 40,
+                    sha256: [9; 32],
+                    git_sha1,
+                    text,
+                };
+                assert_eq!(BlobRecord::decode(&r.encode()).unwrap(), r);
+            }
         }
-        let mut bad = BlobRecord {
-            size: 1,
-            sha256: [0; 32],
-            git_sha1: None,
-            text: None,
-        }
-        .encode();
-        bad.push(0);
-        assert!(BlobRecord::decode(&bad).is_err());
     }
 
     #[test]
-    fn classification_versions_and_tags() {
-        // v1: version, size, SHA-256, absent git SHA-1; no classification.
-        let mut legacy = vec![1, 7];
-        legacy.extend_from_slice(&[9; 32]);
-        legacy.push(0);
-        let record = BlobRecord::decode(&legacy).unwrap();
-        assert_eq!(record.text, None);
-        for text in [None, Some(true), Some(false)] {
-            let record = BlobRecord { text, ..record };
-            assert_eq!(BlobRecord::decode(&record.encode()).unwrap(), record);
+    fn only_the_canonical_encoding_is_accepted() {
+        let good = BlobRecord {
+            size: 7,
+            sha256: [9; 32],
+            git_sha1: None,
+            text: true,
         }
-        let mut bad = record.encode();
-        *bad.last_mut().unwrap() = 3;
-        assert!(BlobRecord::decode(&bad).is_err());
-        legacy.push(0);
-        assert!(BlobRecord::decode(&legacy).is_err());
+        .encode();
+        let mut trailing = good.clone();
+        trailing.push(0);
+        let mut text_2 = good.clone();
+        *text_2.last_mut().unwrap() = 2;
+        let mut tag_2 = good.clone();
+        tag_2[1 + 1 + 32] = 2;
+        let mut version_1 = good.clone();
+        version_1[0] = 1;
+        let mut long_size = good.clone();
+        long_size.splice(1..2, [0x87, 0x00]);
+        for bad in [
+            trailing,
+            text_2,
+            tag_2,
+            version_1,
+            long_size,
+            good[..good.len() - 1].to_vec(),
+        ] {
+            assert!(BlobRecord::decode(&bad).is_err(), "{bad:?}");
+        }
     }
 }

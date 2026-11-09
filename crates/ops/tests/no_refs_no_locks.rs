@@ -41,7 +41,7 @@ async fn creation_never_touches_refs() {
     let (c, b) = Model::default().apply(&[("e", Some((FileKind::Symlink, b"a/b")))]);
     commit(&ops, &[left, right], "merge", c, &b).await.unwrap();
     // Diff reads no refs either.
-    ops.diff(REPO, root, right, ops::DiffMode::Patch, &[])
+    diff_all(&ops, root, right, ops::DiffMode::Patch, &[])
         .await
         .unwrap();
     assert_eq!(faults.ref_violations(), Vec::<String>::new());

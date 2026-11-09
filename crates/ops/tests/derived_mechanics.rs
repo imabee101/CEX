@@ -293,8 +293,7 @@ async fn diff_reads_only_differing_reachable_trees() {
             let meta = Arc::new(FaultMetaStore::new(e.meta.clone(), faults.clone()));
             let blobs = Arc::new(FaultBlobStore::new(e.blobs.clone(), faults.clone()));
             let ops = ops(&meta, &blobs);
-            let out = ops
-                .diff(REPO, a, b, ops::DiffMode::Names, &paths)
+            let out = diff_all(&ops, a, b, ops::DiffMode::Names, &paths)
                 .await
                 .unwrap();
             (out.len(), faults.counts().meta_get_keys)
