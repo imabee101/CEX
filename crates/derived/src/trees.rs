@@ -531,6 +531,10 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
         has_prefix_entry: bool,
         groups: &BTreeMap<u8, Group>,
     ) -> Result<bool, DeriveError> {
+        // Nodes are read one at a time on purpose: the check stops as soon as
+        // the total passes the limit, usually after the first group, so a
+        // batched read of every group would read more keys than it saves in
+        // round trips, and the keys read are what INV-1 bounds.
         let mut total = usize::from(has_prefix_entry);
         for g in groups.values() {
             let id = match g {

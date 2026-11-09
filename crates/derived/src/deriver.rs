@@ -49,6 +49,9 @@ pub trait DerivedType: Send + Sync {
     const VERSION: u16;
     /// Whether create derives it.
     const MODE: Mode;
+    /// Whether a value reads its parents' values of this type. A type that
+    /// does not is derived for one changeset alone, with no ancestors first.
+    const READS_PARENTS: bool = true;
 
     /// The extra key component, such as an ACL config version; 0 otherwise.
     fn param(&self) -> u64 {
@@ -282,7 +285,8 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
     }
 
     /// The value of type `t` for the stored changeset `cs`, deriving it, and
-    /// first every ancestor that lacks it, if needed.
+    /// first every ancestor that lacks it when the type reads its parents'
+    /// values, if needed.
     ///
     /// The ancestors lacking a value are found level by level from `cs`,
     /// with one batched read of changesets and one of values per level, and
@@ -309,9 +313,14 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
         if let Some(v) = self.lookup_many(repo, &[t.key(cs)]).await?.pop().flatten() {
             return Ok(v);
         }
-        let order = self.underived(repo, t, cs, MAX_DERIVE_PER_REQUEST).await?;
-        for (id, changeset) in order {
-            self.derive_one(repo, t, id, &changeset).await?;
+        if t.reads_parents() {
+            let order = self.underived(repo, t, cs, MAX_DERIVE_PER_REQUEST).await?;
+            for (id, changeset) in order {
+                self.derive_one(repo, t, id, &changeset).await?;
+            }
+        } else {
+            let changeset = self.changeset(repo, cs).await?;
+            self.derive_one(repo, t, cs, &changeset).await?;
         }
         self.lookup_many(repo, &[t.key(cs)])
             .await?
@@ -601,6 +610,8 @@ pub trait AnyType<M, B>: Send + Sync {
     fn key(&self, cs: ChangesetId) -> DerivedKey;
     /// Whether create derives it.
     fn mode(&self) -> Mode;
+    /// Whether a value reads its parents' values of this type.
+    fn reads_parents(&self) -> bool;
     /// Computes the value for `cs`, as [`DerivedType::derive`] does.
     fn derive_any<'c, 'd>(
         &'c self,
@@ -619,6 +630,10 @@ impl<T: DerivedType, M: MetaStore, B: BlobStore> AnyType<M, B> for T {
 
     fn mode(&self) -> Mode {
         T::MODE
+    }
+
+    fn reads_parents(&self) -> bool {
+        T::READS_PARENTS
     }
 
     fn derive_any<'c, 'd>(

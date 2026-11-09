@@ -7,7 +7,7 @@ mod common;
 
 use bytes::Bytes;
 use common::*;
-use scion_core::{FileChange, FileKind, MAX_TREE_ENTRIES};
+use scion_core::{FileKind, MAX_TREE_ENTRIES};
 
 const PATHS: &[&str] = &[
     "a", "b", "a.txt", "d/a", "d/b", "d/e/f", "d/e/g", "d/e/h/i", "x/y/z/w", "x/y/q", "Q", "d/e",
@@ -182,5 +182,4 @@ async fn reverting_a_change_restores_the_tree_id() {
     let third = commit(&ops, &[second], "3", c, &b).await.unwrap();
     assert_ne!(root_of(&ops, first).await, root_of(&ops, second).await);
     assert_eq!(root_of(&ops, first).await, root_of(&ops, third).await);
-    let _ = FileChange::Deleted;
 }

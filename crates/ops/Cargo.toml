@@ -25,7 +25,6 @@ blake3 = { workspace = true }
 # Read only for the Unicode version their data was generated from.
 icu_casemap_data = { workspace = true }
 icu_normalizer_data = { workspace = true }
-proptest = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tokio-postgres = { workspace = true }
 

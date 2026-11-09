@@ -17,7 +17,6 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 store = { workspace = true, features = ["testing"] }
-proptest = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

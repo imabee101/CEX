@@ -158,8 +158,16 @@ async fn diffs_equal_a_naive_comparison() {
                     .get(&f.path)
                     .map(|(_, c)| c.clone())
                     .unwrap_or_default();
-                assert_eq!(f.old.is_some(), ma.files.contains_key(&f.path));
-                assert_eq!(f.new.is_some(), mb.files.contains_key(&f.path));
+                // Each side's entry is exactly the model's: kind, blob, and size.
+                let state = |m: &Model| {
+                    m.files.get(&f.path).map(|(k, c)| ops::FileState {
+                        kind: *k,
+                        blob: scion_core::BlobId::hash(c),
+                        size: c.len() as u64,
+                    })
+                };
+                assert_eq!(f.old, state(ma), "{}", String::from_utf8_lossy(&f.path));
+                assert_eq!(f.new, state(mb), "{}", String::from_utf8_lossy(&f.path));
                 if old.contains(&0) || new.contains(&0) {
                     assert!(f.binary && f.patch.is_empty());
                     continue;
@@ -183,9 +191,17 @@ async fn diffs_equal_a_naive_comparison() {
                     .count() as u64;
                 assert_eq!((f.added_lines, f.removed_lines), (pluses, minuses));
             }
-            // Names mode reports the same paths, with no contents read.
+            // Names mode reports the same entries, with no contents read.
             let names = diff_all(&ops, *a, *b, DiffMode::Names, &[]).await.unwrap();
-            assert_eq!(names.len(), got.len());
+            assert_eq!(
+                names
+                    .iter()
+                    .map(|f| (&f.path, f.old, f.new))
+                    .collect::<Vec<_>>(),
+                got.iter()
+                    .map(|f| (&f.path, f.old, f.new))
+                    .collect::<Vec<_>>()
+            );
             assert!(
                 names
                     .iter()

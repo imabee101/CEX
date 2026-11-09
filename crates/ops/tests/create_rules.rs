@@ -112,6 +112,16 @@ async fn no_op_entries_are_rejected() {
         "new/dir/f",
     )
     .await;
+    // Deleting an absent file while writing beneath its path: the delete is
+    // still a no-op, not a file replaced by a directory.
+    expect(
+        &ops,
+        base,
+        vec![("nope", FileChange::Deleted), ("nope/x", content("nope/x"))],
+        Code::NoOpChange,
+        "nope",
+    )
+    .await;
     // A no-op among real changes still fails the whole changeset.
     expect(
         &ops,
@@ -550,4 +560,94 @@ async fn limits_are_exact() {
         let p = changeset(&roots[..n], "merge", vec![]).into_parts();
         check(create(p).await, ok, "parents");
     }
+}
+
+/// Every size limit applies to new changesets and none to imported ones:
+/// each over-limit field is rejected without `imported` and accepted with
+/// it.
+#[tokio::test]
+async fn every_limit_is_waived_for_imports() {
+    let env = env().await;
+    let (ops, base) = base(&env).await;
+    let imported = CreateOptions {
+        imported: true,
+        ..CreateOptions::default()
+    };
+    // 65 parents, one more than allowed.
+    let mut parents = vec![base];
+    for i in 0..ops::MAX_PARENTS {
+        parents.push(
+            ops.create_changeset(
+                REPO,
+                changeset(&[], &format!("root {i}"), vec![]),
+                &CreateOptions::default(),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let long_component = "c".repeat(ops::MAX_COMPONENT_BYTES + 1);
+    // Components of 200 bytes, more than 4,096 bytes in all.
+    let long_path = vec!["p".repeat(200); ops::MAX_PATH_BYTES / 200 + 1].join("/");
+    let body = |p: &str| content(p);
+    let cases: Vec<(&str, scion_core::ChangesetParts)> = vec![
+        ("component", {
+            let mut p = changeset(&[base], "m", vec![]).into_parts();
+            p.file_changes = [(path(&long_component), body(&long_component))].into();
+            p
+        }),
+        ("path", {
+            let mut p = changeset(&[base], "m", vec![]).into_parts();
+            p.file_changes = [(path(&long_path), body(&long_path))].into();
+            p
+        }),
+        ("message", {
+            let mut p = changeset(&[base], "m", vec![]).into_parts();
+            p.message = vec![b'm'; ops::MAX_MESSAGE_BYTES + 1];
+            p
+        }),
+        ("author", {
+            let mut p = changeset(&[base], "m", vec![]).into_parts();
+            p.author = vec![b'a'; ops::MAX_AUTHOR_BYTES + 1];
+            p
+        }),
+        ("signature", {
+            let mut p = changeset(&[base], "m", vec![]).into_parts();
+            p.signature = Some(vec![b's'; ops::MAX_SIGNATURE_BYTES + 1]);
+            p
+        }),
+        ("parents", changeset(&parents, "m", vec![]).into_parts()),
+    ];
+    for (what, parts) in cases {
+        for p in parts.file_changes.keys() {
+            let p = String::from_utf8(p.as_bytes().to_vec()).unwrap();
+            upload(&ops, format!("content of {p}\n").as_bytes()).await;
+        }
+        let err = ops
+            .create_changeset(
+                REPO,
+                scion_core::Changeset::new(parts.clone()).unwrap(),
+                &CreateOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Code::LimitExceeded, "{what}: {err}");
+        let mut parts = parts;
+        parts.git_headers = Some(b"author x 0 +0000\n\nm".to_vec());
+        ops.create_changeset(REPO, scion_core::Changeset::new(parts).unwrap(), &imported)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: an import was refused: {e}"));
+    }
+}
+
+async fn upload(ops: &PgOps, content: &[u8]) {
+    let d = ops.deriver();
+    ops::blob::upload_blobs(
+        &**d.meta(),
+        d.blobs(),
+        REPO,
+        &[bytes::Bytes::copy_from_slice(content)],
+    )
+    .await
+    .unwrap();
 }

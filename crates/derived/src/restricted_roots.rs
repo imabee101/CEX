@@ -107,6 +107,8 @@ impl DerivedType for RestrictedRoots {
     const KIND: u16 = kinds::RESTRICTED_ROOTS;
     const VERSION: u16 = 1;
     const MODE: Mode = Mode::Eager;
+    // The first parent's value is only a shortcut, used when stored.
+    const READS_PARENTS: bool = false;
 
     fn param(&self) -> u64 {
         self.config.version

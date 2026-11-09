@@ -1,7 +1,7 @@
-//! Tree ids re-derived from the byte layout and id rules in AGENTS.md by a
-//! second hand encoder that uses only `blake3` and `sha2` (never scion-core's
-//! encoder), compared with the root trees CreateChangeset derives on Postgres
-//! plus the object store. Also checks that each hand-encoded node is the one
+//! Tree and changeset ids re-derived from the byte layout and id rules in
+//! AGENTS.md by a hand encoder that uses only `blake3` and `sha2` (never
+//! scion-core's encoder), compared with the changesets and root trees
+//! CreateChangeset stores on Postgres plus the object store. Also checks that each hand-encoded node is the one
 //! canonical encoding the scion-core decoder accepts, and that its
 //! single-byte perturbations are rejected or decode to a different node.
 
@@ -29,6 +29,52 @@ fn uvarint(out: &mut Vec<u8>, mut v: u64) {
 
 fn blob_id(c: &[u8]) -> [u8; 32] {
     blake3::derive_key("scion v1 blob", c)
+}
+
+fn svarint(out: &mut Vec<u8>, v: i64) {
+    uvarint(out, ((v << 1) ^ (v >> 63)) as u64);
+}
+
+fn bytes_field(out: &mut Vec<u8>, b: &[u8]) {
+    uvarint(out, b.len() as u64);
+    out.extend_from_slice(b);
+}
+
+/// The id of the changeset `common::changeset` builds, encoded by hand from
+/// the layout: version, parents, author, author date, no committer, the
+/// message, no signature or git headers, and the changes in path order.
+fn hand_changeset(parents: &[ChangesetId], message: &str, changes: &[Spec<'_>]) -> [u8; 32] {
+    let mut out = vec![0x01];
+    uvarint(&mut out, parents.len() as u64);
+    for p in parents {
+        out.extend_from_slice(p.as_bytes());
+    }
+    bytes_field(&mut out, b"Test <test@example.com>");
+    svarint(&mut out, 1_700_000_000);
+    svarint(&mut out, 3600);
+    out.extend_from_slice(&[0, 0]);
+    bytes_field(&mut out, message.as_bytes());
+    out.extend_from_slice(&[0, 0]);
+    let mut sorted: Vec<&Spec<'_>> = changes.iter().collect();
+    sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    uvarint(&mut out, sorted.len() as u64);
+    for (p, c) in sorted {
+        bytes_field(&mut out, p.as_bytes());
+        match c {
+            None => out.push(0),
+            Some((k, content)) => {
+                // A change's kind codes: 1 Regular, 2 Executable, 3 Symlink.
+                out.push(match k {
+                    FileKind::Regular => 1,
+                    FileKind::Executable => 2,
+                    FileKind::Symlink => 3,
+                });
+                out.extend_from_slice(&blob_id(content));
+                uvarint(&mut out, content.len() as u64);
+            }
+        }
+    }
+    blake3::derive_key("scion v1 changeset", &out)
 }
 
 #[derive(Clone)]
@@ -204,6 +250,11 @@ impl Repo {
         let cs = commit(&self.ops, &parents, label, fc, &contents)
             .await
             .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(
+            *cs.as_bytes(),
+            hand_changeset(&parents, label, changes),
+            "{label}: changeset id differs from hand encoding"
+        );
         self.tip = Some(cs);
         let got = root_of(&self.ops, cs).await;
         let (want, nodes) = hand_root(&self.model);
