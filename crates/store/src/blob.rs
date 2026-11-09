@@ -110,7 +110,7 @@ impl MemoryBlobStore {
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Objects>, StoreError> {
         self.objects
             .lock()
-            .map_err(|_| StoreError::Unavailable("in-memory store lock poisoned".into()))
+            .map_err(|_| StoreError::Internal("in-memory store lock poisoned".into()))
     }
 }
 
@@ -139,13 +139,35 @@ impl BlobStore for MemoryBlobStore {
     }
 }
 
+/// How many times [`ObjectBlobStore::put_if_absent`] tries a write before it
+/// reports the store unavailable.
+const PUT_ATTEMPTS: u32 = 8;
+
+/// The first retry's delay; each later retry doubles it, up to
+/// [`PUT_BACKOFF_MAX`], and every delay is jittered down by up to half.
+const PUT_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The longest delay between two attempts of one write.
+const PUT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A [`BlobStore`] over an `object_store` store: S3-compatible storage in a
 /// cluster, the local filesystem in single-node mode. The store must support
 /// atomic put-if-absent (`PutMode::Create`).
 ///
 /// Keys are `<repo>/<b|c|t>/<hex id>`.
+///
+/// Writes are robust to contention and transient failures. Concurrent puts
+/// of one key in this process are coalesced: they run one at a time, so at
+/// most one is in flight. A put that fails transiently is retried with
+/// bounded, jittered backoff; that is safe because a key is content-addressed
+/// and every frame for an id is byte-identical (INV-44), so a retry can only
+/// find the same bytes. A conditional write that reports the key exists is
+/// confirmed with a read before it is believed: S3 also answers a write that
+/// races another writer still in flight with a conflict, and that is not
+/// proof the key holds bytes (INV-22).
 pub struct ObjectBlobStore {
     store: Arc<dyn ObjectStore>,
+    writing: KeyLocks,
 }
 
 impl fmt::Debug for ObjectBlobStore {
@@ -159,7 +181,10 @@ impl fmt::Debug for ObjectBlobStore {
 impl ObjectBlobStore {
     /// Wraps an object store.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            writing: KeyLocks::default(),
+        }
     }
 
     fn path(repo: RepoId, key: ObjectKey) -> Path {
@@ -176,10 +201,133 @@ impl ObjectBlobStore {
         }
         Path::from(format!("{}/{kind}/{hex}", repo.0))
     }
+
+    /// Reads the key back after the store said it exists. Returns `None` when
+    /// it does not exist yet: the store reported a writer still in flight.
+    async fn confirm(
+        &self,
+        path: &Path,
+        ours: &Bytes,
+        ambiguous: bool,
+    ) -> Result<Option<PutOutcome>, Attempt> {
+        if !ambiguous {
+            return match self.store.head(path).await {
+                Ok(_) => Ok(Some(PutOutcome::Existed)),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(classify(e)),
+            };
+        }
+        // An earlier attempt failed after it may have reached the store, so
+        // the bytes there may be this call's own.
+        let stored = match self.store.get(path).await {
+            Ok(r) => r.bytes().await.map_err(classify)?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(classify(e)),
+        };
+        Ok(Some(if stored == *ours {
+            PutOutcome::Created
+        } else {
+            PutOutcome::Existed
+        }))
+    }
+}
+
+/// How one failed attempt at a store operation should be handled.
+enum Attempt {
+    /// The failure may be transient, and the request may have reached the
+    /// store.
+    Transient(object_store::Error),
+    /// Retrying cannot succeed.
+    Permanent(StoreError),
+}
+
+/// Sorts an `object_store` error into what a retry can and cannot fix.
+fn classify(e: object_store::Error) -> Attempt {
+    use object_store::Error as E;
+    match e {
+        // Network failures, timeouts, and server errors left after the
+        // client's own retries all surface as `Generic`.
+        E::Generic { .. } => Attempt::Transient(e),
+        E::InvalidPath { .. } => {
+            Attempt::Permanent(StoreError::invalid(format!("object store: {e}")))
+        }
+        // Missing permissions or credentials, a store without conditional
+        // writes, or a bad configuration: an operator must fix these.
+        _ => Attempt::Permanent(StoreError::Internal(format!("object store: {e}"))),
+    }
 }
 
 fn object_err(e: object_store::Error) -> StoreError {
-    StoreError::Unavailable(format!("object store: {e}"))
+    match classify(e) {
+        Attempt::Transient(e) => StoreError::Unavailable(format!("object store: {e}")),
+        Attempt::Permanent(e) => e,
+    }
+}
+
+/// The delay before retry `attempt` (0 for the first retry) of the write of
+/// `path`: exponential, capped, and jittered down by up to half so that
+/// writers that collided do not collide again in step.
+fn backoff(path: &Path, attempt: u32) -> std::time::Duration {
+    let full = PUT_BACKOFF_BASE
+        .saturating_mul(1 << attempt.min(16))
+        .min(PUT_BACKOFF_MAX);
+    let mut seed = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(
+        &(path.as_ref(), attempt, std::time::SystemTime::now()),
+        &mut seed,
+    );
+    let jitter = std::hash::Hasher::finish(&seed) % 1000;
+    full.mul_f64(1.0 - jitter as f64 / 2000.0)
+}
+
+/// One key's write lock.
+type KeyLock = Arc<tokio::sync::Mutex<()>>;
+
+/// Per-key async locks for the keys being written in this process; an entry
+/// lives only while some put of its key runs or waits.
+#[derive(Default)]
+struct KeyLocks {
+    locks: Mutex<HashMap<(RepoId, ObjectKey), KeyLock>>,
+}
+
+/// Holds one key's write lock, and forgets the key when no one else waits.
+struct KeyTurn<'a> {
+    locks: &'a KeyLocks,
+    key: (RepoId, ObjectKey),
+    lock: KeyLock,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl KeyLocks {
+    async fn turn(&self, key: (RepoId, ObjectKey)) -> Result<KeyTurn<'_>, StoreError> {
+        let lock = self
+            .locks
+            .lock()
+            .map_err(|_| StoreError::Internal("the key lock table is poisoned".into()))?
+            .entry(key)
+            .or_default()
+            .clone();
+        let guard = Some(lock.clone().lock_owned().await);
+        Ok(KeyTurn {
+            locks: self,
+            key,
+            lock,
+            guard,
+        })
+    }
+}
+
+impl Drop for KeyTurn<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        if let Ok(mut locks) = self.locks.locks.lock() {
+            // The table and this turn hold the only references: nobody else
+            // is writing or waiting for this key.
+            if Arc::strong_count(&self.lock) == 2 {
+                locks.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl BlobStore for ObjectBlobStore {
@@ -190,18 +338,49 @@ impl BlobStore for ObjectBlobStore {
         bytes: Bytes,
     ) -> Result<PutOutcome, StoreError> {
         let path = Self::path(repo, key);
-        match self
-            .store
-            .put_opts(&path, bytes.into(), PutOptions::from(PutMode::Create))
-            .await
-        {
-            Ok(_) => Ok(PutOutcome::Created),
-            Err(object_store::Error::AlreadyExists { .. }) => Ok(PutOutcome::Existed),
-            // Anything else, including a conflict with a concurrent writer
-            // still in flight, is not proof the key holds bytes: fail closed
-            // and let the caller retry.
-            Err(e) => Err(object_err(e)),
+        let _turn = self.writing.turn((repo, key)).await?;
+        let mut ambiguous = false;
+        let mut last = None;
+        for attempt in 0..PUT_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(backoff(&path, attempt - 1)).await;
+            }
+            let written = self
+                .store
+                .put_opts(
+                    &path,
+                    bytes.clone().into(),
+                    PutOptions::from(PutMode::Create),
+                )
+                .await;
+            let failure = match written {
+                Ok(_) => return Ok(PutOutcome::Created),
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    match self.confirm(&path, &bytes, ambiguous).await {
+                        Ok(Some(outcome)) => return Ok(outcome),
+                        // A concurrent writer is still in flight; try again.
+                        Ok(None) => continue,
+                        Err(f) => f,
+                    }
+                }
+                Err(e) => classify(e),
+            };
+            match failure {
+                Attempt::Transient(e) => {
+                    ambiguous = true;
+                    last = Some(e);
+                }
+                Attempt::Permanent(e) => return Err(e),
+            }
         }
+        Err(StoreError::Unavailable(match last {
+            Some(e) => {
+                format!("object store: writing {path} failed {PUT_ATTEMPTS} times; last: {e}")
+            }
+            None => format!(
+                "object store: {path} stayed locked by another writer for {PUT_ATTEMPTS} attempts"
+            ),
+        }))
     }
 
     async fn get(&self, repo: RepoId, key: ObjectKey) -> Result<Option<Bytes>, StoreError> {

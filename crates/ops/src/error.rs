@@ -20,8 +20,11 @@ pub enum Code {
     CaseConflict,
     /// `NOT_FOUND`.
     NotFound,
-    /// `DATA_LOSS`.
+    /// `DATA_LOSS`: stored bytes are missing or fail verification.
     DataLoss,
+    /// `INTERNAL`: a server defect, such as a violated invariant, a failed
+    /// task, or a misconfigured backend.
+    Internal,
     /// `UNAVAILABLE`.
     Unavailable,
     /// `ACL_PENDING`: the requested ACL version has not been backfilled.
@@ -72,7 +75,8 @@ impl From<StoreError> for OpError {
         let code = match e {
             StoreError::InvalidArgument(_) => Code::InvalidArgument,
             StoreError::DataLoss(_) => Code::DataLoss,
-            _ => Code::Unavailable,
+            StoreError::Unavailable(_) => Code::Unavailable,
+            StoreError::Internal(_) => Code::Internal,
         };
         Self::new(code, e.to_string())
     }
@@ -123,6 +127,7 @@ mod tests {
             CaseConflict,
             NotFound,
             DataLoss,
+            Internal,
         ] {
             assert!(!c.retryable(), "{c:?}");
         }
@@ -139,5 +144,6 @@ mod tests {
         );
         assert_eq!(code(StoreError::DataLoss("x".into())), Code::DataLoss);
         assert_eq!(code(StoreError::Unavailable("x".into())), Code::Unavailable);
+        assert_eq!(code(StoreError::Internal("x".into())), Code::Internal);
     }
 }

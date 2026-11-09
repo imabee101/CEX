@@ -33,7 +33,7 @@ impl MemoryMetaStore {
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, StoreError> {
         self.inner
             .lock()
-            .map_err(|_| StoreError::Unavailable("in-memory store lock poisoned".into()))
+            .map_err(|_| StoreError::Internal("in-memory store lock poisoned".into()))
     }
 }
 
