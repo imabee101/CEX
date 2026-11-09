@@ -1,9 +1,11 @@
 # CI runs on pull requests to main and on pushes to main, never on a
-# schedule. The fast tier (`cargo xtask ci`) runs first; the full tier's own
-# steps run only after it passes, and only on pull requests that are ready
-# for review, so a draft gets fast feedback for a fraction of the cost. A
-# push to main runs the fast tier on the merged tree and refreshes the
-# build cache every pull request starts from.
+# schedule. The fast tier (`cargo xtask ci`) runs as two jobs: `lint`, the
+# steps that need no dev environment and finish in minutes, and `test`, the
+# build and the tests. The full tier's own steps start once `lint` passes,
+# alongside `test`, and only on pull requests that are ready for review, so
+# a draft gets fast feedback for a fraction of the cost. A push to main runs
+# the fast tier on the merged tree and refreshes the build caches every pull
+# request starts from.
 name: ci
 
 on:
@@ -25,10 +27,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  fast:
-    name: fast
+  lint:
+    name: lint
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,23 +41,43 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: linux
-          # Only main writes the cache, so pull requests never evict it.
+          shared-key: linux-lint
+          # Only main writes the caches, so pull requests never evict them.
           save-if: ${{ github.event_name == 'push' }}
       - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
-          tool: cargo-nextest@0.9.151,cargo-deny@0.20.2,cargo-semver-checks@0.51.0
+          tool: cargo-deny@0.20.2,cargo-semver-checks@0.51.0
           fallback: none
       - uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1.7.0
         with:
           version: 1.75.0
           setup_only: true
+      - run: cargo xtask ci --part lint
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux-test
+          save-if: ${{ github.event_name == 'push' }}
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-nextest@0.9.151
+          fallback: none
       - run: cargo xtask dev-up
-      - run: cargo xtask ci
+      - run: cargo xtask ci --part test
 
   slow:
     name: slow
-    needs: fast
+    needs: lint
     if: github.event_name == 'pull_request' && !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -67,8 +89,8 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # The fast job's build: the slow tests are in the same binaries.
-          shared-key: linux
+          # The test job's build: the slow tests are in the same binaries.
+          shared-key: linux-test
           save-if: false
       - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
@@ -79,7 +101,7 @@ jobs:
 
   fuzz:
     name: fuzz (${{ matrix.shard }})
-    needs: fast
+    needs: lint
     if: github.event_name == 'pull_request' && !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -106,7 +128,7 @@ jobs:
 
   msrv:
     name: msrv
-    needs: fast
+    needs: lint
     if: github.event_name == 'pull_request' && !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -123,7 +145,7 @@ jobs:
 
   portable:
     name: portable (${{ matrix.os }})
-    needs: fast
+    needs: lint
     if: github.event_name == 'pull_request' && !github.event.pull_request.draft
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45

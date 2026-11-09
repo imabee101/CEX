@@ -46,8 +46,11 @@ enum Cmd {
     /// Run the fast check tier.
     Ci {
         /// Run only these steps.
-        #[arg(long, value_enum)]
+        #[arg(long, value_enum, conflicts_with = "part")]
         only: Vec<Step>,
+        /// Run only this part of the tier.
+        #[arg(long, value_enum)]
+        part: Option<Part>,
     },
     /// Run the full check tier: the fast tier's steps and the full tier's own.
     CiFull {
@@ -99,6 +102,28 @@ enum Step {
     Portable,
 }
 
+/// The two parts of the fast tier, which CI runs on separate machines so
+/// that the full tier can start after the quicker part.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+enum Part {
+    /// The steps that need neither the dev environment nor a build: they
+    /// finish in minutes.
+    Lint,
+    /// The build, and the tests.
+    Test,
+}
+
+/// The fast tier's lint part; the rest of the tier is the test part.
+const LINT_PART: &[Step] = &[
+    Step::Fmt,
+    Step::ProtoCheck,
+    Step::Deny,
+    Step::Clippy,
+    Step::Doc,
+    Step::Semver,
+    Step::Buf,
+];
+
 const FAST_TIER: &[Step] = &[
     Step::Fmt,
     Step::Build,
@@ -120,7 +145,17 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Cmd::DevUp => dev_up(),
         Cmd::DevDown => dev_down(),
-        Cmd::Ci { only } => run_tier("ci", FAST_TIER, &only, None),
+        Cmd::Ci { only, part } => {
+            let only = match part {
+                Some(part) => FAST_TIER
+                    .iter()
+                    .copied()
+                    .filter(|s| LINT_PART.contains(s) == (part == Part::Lint))
+                    .collect(),
+                None => only,
+            };
+            run_tier("ci", FAST_TIER, &only, None)
+        }
         Cmd::CiFull { only, fuzz_shard } => {
             let steps: Vec<Step> = FAST_TIER.iter().chain(FULL_ONLY).copied().collect();
             if fuzz_shard.is_some() && !(only.is_empty() || only.contains(&Step::Fuzz)) {
@@ -980,6 +1015,14 @@ fn install_toolchain(channel: &str) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lint_part_is_part_of_the_fast_tier_and_needs_no_build() {
+        assert!(LINT_PART.iter().all(|s| FAST_TIER.contains(s)));
+        for step in [Step::Build, Step::Test, Step::Doctest] {
+            assert!(!LINT_PART.contains(&step), "{step:?}");
+        }
+    }
 
     #[test]
     fn shards_are_k_of_n() {
