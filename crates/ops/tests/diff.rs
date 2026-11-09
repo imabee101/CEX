@@ -541,3 +541,66 @@ async fn a_text_record_over_binary_bytes_is_data_loss() {
         1
     );
 }
+
+#[tokio::test]
+async fn a_cursor_under_path_filters_returns_exactly_the_filtered_entries_after_it() {
+    let (e, base, next) = order_fixture().await;
+    let o = ops(&e.meta, &e.blobs);
+    // Filters naming a directory, files beside it that sort before its
+    // contents, and one after them.
+    let filters = [path("a"), path("a-c"), path("a.x"), path("a0")];
+    let all = diff_paged(
+        &o,
+        base,
+        next,
+        DiffMode::Names,
+        &filters,
+        ops::MAX_DIFF_PAGE,
+    )
+    .await
+    .unwrap();
+    let paths: Vec<&[u8]> = all.iter().map(|f| f.path.as_slice()).collect();
+    assert_eq!(
+        paths,
+        [
+            &b"a-c"[..],
+            b"a.x",
+            b"a/b-1",
+            b"a/b/c",
+            b"a/b/d",
+            b"a/b0",
+            b"a/bb",
+            b"a0"
+        ]
+    );
+    for after in [
+        "a", "a-c", "a.x", "a/", "a/b", "a/b/c", "a/bb", "a0", "a-", "a.y", "b",
+    ] {
+        let Ok(cursor) = ops::DiffCursor::from_bytes(after.as_bytes()) else {
+            continue;
+        };
+        let page = o
+            .diff(
+                REPO,
+                base,
+                next,
+                &ops::DiffOptions {
+                    mode: DiffMode::Names,
+                    paths: &filters,
+                    after: Some(&cursor),
+                    limit: ops::MAX_DIFF_PAGE,
+                },
+            )
+            .await
+            .unwrap();
+        let want: Vec<&FileDiff> = all
+            .iter()
+            .filter(|f| f.path.as_slice() > after.as_bytes())
+            .collect();
+        assert_eq!(
+            page.files.iter().collect::<Vec<_>>(),
+            want,
+            "after {after:?}"
+        );
+    }
+}

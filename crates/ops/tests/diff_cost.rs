@@ -426,10 +426,11 @@ async fn a_filtered_page_after_a_cursor_reads_only_what_follows_it() {
             "{after}"
         );
     }
-    let (_, first) = page_keys(&e, old, new, &filters, None).await;
-    let (_, late) = page_keys(&e, old, new, &filters, Some("gen-19000")).await;
-    assert!(
-        late < first,
-        "a late page read {late} keys, the first {first}"
-    );
+    // A page reads the nodes for the filtered names it reaches, looked up
+    // 64 at a time: about a dozen keys wherever it starts. Looking up all
+    // 2,000 names would read every shard of the root on both sides.
+    for after in [None, Some("gen-09995"), Some("gen-19000")] {
+        let (_, keys) = page_keys(&e, old, new, &filters, after).await;
+        assert!(keys <= 16, "the page after {after:?} read {keys} keys");
+    }
 }

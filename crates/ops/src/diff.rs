@@ -117,7 +117,60 @@ struct Pairs {
     a: VecDeque<TreeEntry>,
     b: VecDeque<TreeEntry>,
     from: Option<Vec<u8>>,
-    only: Option<VecDeque<Pair>>,
+    only: Option<Only>,
+}
+
+/// The names a path filter selects in one directory, and the pairs already
+/// looked up for them.
+struct Only {
+    tops: (Option<TreeId>, Option<TreeId>),
+    names: VecDeque<Vec<u8>>,
+    ready: VecDeque<Pair>,
+}
+
+/// How many filtered names one batched lookup reads.
+const ONLY_BATCH: usize = 64;
+
+impl Only {
+    async fn next<M: MetaStore>(
+        &mut self,
+        work: &mut TreeWork<'_, M>,
+    ) -> Result<Option<Pair>, DeriveError> {
+        loop {
+            if let Some(pair) = self.ready.pop_front() {
+                return Ok(Some(pair));
+            }
+            if self.names.is_empty() {
+                return Ok(None);
+            }
+            let (a, b) = self.tops;
+            let batch: Vec<Vec<u8>> = self
+                .names
+                .drain(..ONLY_BATCH.min(self.names.len()))
+                .collect();
+            let mut queries: Vec<(TreeId, &[u8])> = Vec::new();
+            for name in &batch {
+                queries.extend(a.map(|a| (a, name.as_slice())));
+                queries.extend(b.map(|b| (b, name.as_slice())));
+            }
+            let mut found = work.lookup_many(&queries).await?.into_iter();
+            for name in batch {
+                let ea = if a.is_some() {
+                    found.next().flatten()
+                } else {
+                    None
+                };
+                let eb = if b.is_some() {
+                    found.next().flatten()
+                } else {
+                    None
+                };
+                if ea != eb {
+                    self.ready.push_back((name, ea, eb));
+                }
+            }
+        }
+    }
 }
 
 impl Pairs {
@@ -143,42 +196,20 @@ impl Pairs {
         })
     }
 
-    /// The pairs for exactly `names` (sorted), looked up in both directories
-    /// in one batched read per level of shards.
-    async fn only<M: MetaStore>(
-        work: &mut TreeWork<'_, M>,
-        a: Option<TreeId>,
-        b: Option<TreeId>,
-        names: &[Vec<u8>],
-    ) -> Result<Self, DeriveError> {
-        let mut queries: Vec<(TreeId, &[u8])> = Vec::new();
-        for name in names {
-            queries.extend(a.map(|a| (a, name.as_slice())));
-            queries.extend(b.map(|b| (b, name.as_slice())));
-        }
-        let mut found = work.lookup_many(&queries).await?.into_iter();
-        let mut pairs = VecDeque::new();
-        for name in names {
-            let ea = if a.is_some() {
-                found.next().flatten()
-            } else {
-                None
-            };
-            let eb = if b.is_some() {
-                found.next().flatten()
-            } else {
-                None
-            };
-            if ea != eb {
-                pairs.push_back((name.clone(), ea, eb));
-            }
-        }
-        Ok(Self {
+    /// The pairs for exactly `names` (sorted), looked up lazily in both
+    /// directories, [`ONLY_BATCH`] names per batched read, so a page reads
+    /// the nodes for the names it reaches, not for every name it is given.
+    fn only(a: Option<TreeId>, b: Option<TreeId>, names: Vec<Vec<u8>>) -> Self {
+        Self {
             a: VecDeque::new(),
             b: VecDeque::new(),
             from: None,
-            only: Some(pairs),
-        })
+            only: Some(Only {
+                tops: (a, b),
+                names: names.into(),
+                ready: VecDeque::new(),
+            }),
+        }
     }
 
     /// Whether every name an entry stands for (for a shard, every name with
@@ -193,7 +224,7 @@ impl Pairs {
     ) -> Result<Option<Pair>, DeriveError> {
         use std::cmp::Ordering;
         if let Some(only) = &mut self.only {
-            return Ok(only.pop_front());
+            return only.next(work).await;
         }
         let from = self.from.as_deref();
         loop {
@@ -480,7 +511,7 @@ impl Dir {
             names.dedup();
             // Like the stream, skip the names wholly before the resume point.
             names.retain(|n| !Pairs::before_from(from.as_deref(), n));
-            Pairs::only(work, a, b, &names).await?
+            Pairs::only(a, b, names)
         };
         Ok(Self {
             pairs,

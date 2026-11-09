@@ -259,6 +259,12 @@ impl Pool {
         }
     }
 
+    /// How many connections wait idle in the pool.
+    #[cfg(test)]
+    pub(crate) fn idle_len(&self) -> usize {
+        self.idle.lock().map_or(0, |idle| idle.len())
+    }
+
     fn reuse(&self) -> Result<Option<Client>, StoreError> {
         let mut idle = self
             .idle

@@ -726,14 +726,24 @@ mod release_tests {
         // The rollback fails on the dead connection; release reports nothing,
         // because the outcome it releases is already known.
         release(tx).await;
-        // The dead connection was not returned: the next one works and is
-        // not inside a transaction.
+        // The connection, still marked as in a transaction, was closed, not
+        // returned to the pool.
+        assert_eq!(pool.idle_len(), 0);
+        // The next connection works and is not inside a transaction: in a
+        // transaction's first statement the two timestamps are equal.
         let conn = pool.checkout().await.unwrap();
-        let other: i32 = conn
-            .query_one("SELECT pg_backend_pid()", &[])
+        let rows = conn
+            .simple_query("SELECT pg_backend_pid(), now() = statement_timestamp()")
             .await
-            .unwrap()
-            .get(0);
-        assert_ne!(other, pid);
+            .unwrap();
+        let row = rows
+            .iter()
+            .find_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(row.get(0), Some(pid.to_string().as_str()));
+        assert_eq!(row.get(1), Some("t"));
     }
 }
