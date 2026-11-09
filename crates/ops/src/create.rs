@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use derived::{AclConfig, CommitGraph, DerivedType, Deriver, RestrictedRoots, RootTree};
+use derived::{AclConfig, AnyType, CommitGraph, Deriver, Mode, RestrictedRoots, RootTree};
 use scion_core::{Changeset, ChangesetId};
 use store::{BlobStore, MetaKey, MetaStore, RepoId};
 use tokio::sync::OnceCell;
@@ -150,9 +150,10 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
     }
 
     /// Creates a changeset. Creating an existing changeset again writes
-    /// nothing, provided its requested ACL version is ready. Concurrent
-    /// creates with the same id, ACL version, case-check setting, and import
-    /// setting on this server share one computation and one write.
+    /// only the eager values it lacks for these options (such as
+    /// RestrictedRoots for a newer ACL config version). Concurrent creates
+    /// with the same id, ACL version, case-check setting, and import setting
+    /// on this server share one computation and one write.
     pub async fn create_changeset(
         &self,
         repo: RepoId,
@@ -161,8 +162,6 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
     ) -> Result<ChangesetId, OpError> {
         validate(&cs, opts)?;
         let id = cs.id();
-        // Requests under different ACL versions must each pass their own
-        // readiness gate, even when another request creates the same id.
         let key = (repo, id, opts.acl.version, opts.case_check, opts.imported);
         let cell = self
             .creating
@@ -195,21 +194,16 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         opts: &CreateOptions,
     ) -> Result<(), OpError> {
         let parts = cs.parts();
+        let eager = eager_types::<M, B>(opts);
         let mut keys = vec![MetaKey::Changeset(id)];
         keys.extend(parts.parents.iter().map(|p| MetaKey::Changeset(*p)));
         let found = self.deriver.meta().get(repo, &keys).await?;
-        let restricted = RestrictedRoots::new(opts.acl.clone());
         if found[0].is_some() {
-            if self
-                .deriver
-                .lookup_many(repo, &[restricted.key(id)])
-                .await?[0]
-                .is_none()
-            {
-                return Err(OpError::new(
-                    Code::AclPending,
-                    "changeset awaits ACL backfill",
-                ));
+            // Created before, perhaps under another ACL config version: make
+            // sure every eager value these options name exists. Each is one
+            // changeset's derivation, from values its parents already have.
+            for t in &eager {
+                self.deriver.get_any(repo, &**t, id).await?;
             }
             return Ok(());
         }
@@ -225,63 +219,32 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
             ));
         }
         let mut cx = self.deriver.cx(repo);
-        // Create never backfills ACL history. Seed the parent's stored value
-        // so RestrictedRoots cannot invoke the recursive on-demand deriver.
-        if let Some(parent) = parts.parents.first() {
-            let key = restricted.key(*parent);
-            let value = self
-                .deriver
-                .lookup_many(repo, &[key])
-                .await?
-                .pop()
-                .flatten()
-                .ok_or_else(|| OpError::new(Code::AclPending, "parent awaits ACL backfill"))?;
-            cx.set_input(key, value);
-            // A storage-format upgrade of the private index also needs an
-            // explicit backfill, never an unbounded history walk in create.
-            let key = CaseIndex.key(*parent);
-            let value = self
-                .deriver
-                .lookup_many(repo, &[key])
-                .await?
-                .pop()
-                .flatten()
-                .ok_or_else(|| {
-                    OpError::new(
-                        Code::DataLoss,
-                        "parent lacks the required case index; operator backfill is required",
-                    )
-                })?;
-            cx.set_input(key, value);
+        for t in &eager {
+            let value = t.derive_any(&mut cx, id, cs).await?;
+            cx.set_value(t.key(id), value);
         }
-        let applied = RootTree::apply(&mut cx, cs).await?;
-        cx.set_value(
-            RootTree.key(id),
-            Bytes::copy_from_slice(applied.root.as_bytes()),
-        );
-        let index = CaseIndex::apply(&mut cx, cs).await?;
-        cx.set_value(CaseIndex.key(id), Bytes::copy_from_slice(index.as_bytes()));
-        if opts.case_check && !opts.imported {
-            let found = CaseIndex::find_conflict(&mut cx.case_nodes, index, &applied.added).await?;
-            if let Some((path, other)) = found {
-                return Err(OpError::at(
-                    Code::CaseConflict,
-                    format!(
-                        "{} conflicts with {} in the same directory",
-                        String::from_utf8_lossy(&path),
-                        String::from_utf8_lossy(&other)
-                    ),
-                    &path,
-                ));
-            }
-        }
-        let graph = CommitGraph.derive(&mut cx, id, cs).await?;
-        cx.set_value(CommitGraph.key(id), graph);
-        let roots = restricted.derive(&mut cx, id, cs).await?;
-        cx.set_value(restricted.key(id), roots);
         self.deriver
             .write(cx, vec![(MetaKey::Changeset(id), Bytes::from(cs.encode()))])
             .await?;
         Ok(())
     }
+}
+
+/// Every eager derived type, in the order create derives them; later types
+/// read earlier types' values for the same changeset. This is the one list
+/// of eager types: create derives exactly these, in one transaction with the
+/// changeset.
+pub fn eager_types<M: MetaStore, B: BlobStore>(
+    opts: &CreateOptions,
+) -> Vec<Box<dyn AnyType<M, B>>> {
+    let types: Vec<Box<dyn AnyType<M, B>>> = vec![
+        Box::new(RootTree),
+        Box::new(CaseIndex {
+            check: opts.case_check && !opts.imported,
+        }),
+        Box::new(CommitGraph),
+        Box::new(RestrictedRoots::new(opts.acl.clone())),
+    ];
+    debug_assert!(types.iter().all(|t| t.mode() == Mode::Eager));
+    types
 }

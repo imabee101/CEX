@@ -149,8 +149,9 @@ Everything that is not a changeset is derived data, and all of it goes through *
 - **Storage:** values are keyed by `(type, version, changeset)` and are deterministic. Writes are insert-if-absent. Concurrent derivations of the same key are coalesced on each server. (INV-20)
 - **Mode:** each type is either eager (derived inside create) or deferred.
 - **Visibility:** clients never see derived formats.
-- **New versions:** a new version gets a new key space. Each repo records, per type, the version that reads use. A backfill derives the new version for every changeset, parents first, in bounded batches; while it runs, create writes eager values for both versions. Reads and creates switch to the new version only once the backfill has covered every changeset. Because create writes every eager value, an existing changeset that lacks an eager value at the readable version is data loss (`DATA_LOSS`), never a pending state.
-- **Background derivation:** a background deriver derives every type for every new `main`, `release/*`, or `tags/*` tip. A request that finds an underived ancestor derives the parents first, in bounded batches.
+- **New versions:** a new version is a new registration of the type with its own key space. While a type migrates, both versions are registered, so create writes eager values for both, and a backfill derives the new version at every `main`, `release/*`, and `tags/*` tip. A per-repo record marks a version's backfill complete; reads switch to the new version only once it exists, and the old version is then unregistered.
+- **Missing values:** a value a request needs and lacks, eager or deferred, is derived on demand, with the ancestors that lack it, parents first. The ancestors are found level by level with one batched read per level, and one request derives at most `MAX_DERIVE_PER_REQUEST` (4,096) changesets; past that the request fails with the retryable `UNAVAILABLE` until the background deriver catches up. A value never depends on how it was derived.
+- **Background derivation:** a background deriver derives every type for every new `main`, `release/*`, or `tags/*` tip.
 
 | Type | Mode | Purpose |
 |---|---|---|

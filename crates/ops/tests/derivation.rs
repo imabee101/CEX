@@ -169,7 +169,7 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
     d2.get(REPO, &RootTree, tip).await.unwrap();
     d2.get(REPO, &CommitGraph, tip).await.unwrap();
     d2.get(REPO, &restricted, tip).await.unwrap();
-    d2.get(REPO, &CaseIndex, tip).await.unwrap();
+    d2.get(REPO, &CaseIndex::default(), tip).await.unwrap();
 
     async fn values<T: DerivedType>(
         meta: &store::PgMetaStore,
@@ -206,8 +206,8 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
         ),
         (
             "CaseIndex",
-            values(&first.meta, &CaseIndex, &ancestors).await,
-            values(&second.meta, &CaseIndex, &ancestors).await,
+            values(&first.meta, &CaseIndex::default(), &ancestors).await,
+            values(&second.meta, &CaseIndex::default(), &ancestors).await,
         ),
     ] {
         assert!(
@@ -221,7 +221,7 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
         d2.get(REPO, &RootTree, *id).await.unwrap();
         d2.get(REPO, &CommitGraph, *id).await.unwrap();
         d2.get(REPO, &restricted, *id).await.unwrap();
-        d2.get(REPO, &CaseIndex, *id).await.unwrap();
+        d2.get(REPO, &CaseIndex::default(), *id).await.unwrap();
     }
     assert_eq!(
         values(&first.meta, &RootTree, &dag.ids).await,
@@ -236,8 +236,8 @@ async fn incremental_derivation_equals_derivation_from_scratch() {
         values(&second.meta, &restricted, &dag.ids).await
     );
     assert_eq!(
-        values(&first.meta, &CaseIndex, &dag.ids).await,
-        values(&second.meta, &CaseIndex, &dag.ids).await
+        values(&first.meta, &CaseIndex::default(), &dag.ids).await,
+        values(&second.meta, &CaseIndex::default(), &dag.ids).await
     );
     // And every root equals the reference root of the changeset's files.
     for id in &ancestors {

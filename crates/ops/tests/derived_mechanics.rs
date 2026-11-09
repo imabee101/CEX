@@ -38,7 +38,7 @@ fn value_keys_keep_their_layout() {
     acl.version = 9;
     assert_eq!(RestrictedRoots::new(Arc::new(acl)).key(cs), key(3, 9));
     assert_eq!(
-        CaseIndex.key(cs),
+        CaseIndex::default().key(cs),
         DerivedKey {
             version: 2,
             ..key(4, 0)

@@ -20,9 +20,6 @@ pub const MAX_TEXT_BYTES: usize = 16 << 20;
 /// How many bytes are checked for NUL when classifying a blob.
 pub const TEXT_SNIFF_BYTES: usize = 8 << 10;
 
-/// The most frame writes one upload has in flight.
-const UPLOAD_CONCURRENCY: usize = 32;
-
 /// Whether a blob is text.
 pub fn is_text(bytes: &[u8]) -> bool {
     bytes.len() <= MAX_TEXT_BYTES && !bytes[..bytes.len().min(TEXT_SNIFF_BYTES)].contains(&0)
@@ -99,7 +96,7 @@ pub async fn upload_blobs<M: MetaStore, B: BlobStore>(
                 .encode(),
             ),
         ));
-        while tasks.len() >= UPLOAD_CONCURRENCY {
+        while tasks.len() >= derived::FRAME_WRITES {
             join_one(&mut tasks).await?;
         }
         let blobs = blobs.clone();

@@ -110,6 +110,17 @@ impl From<DeriveError> for OpError {
             }
             DeriveError::NotFound(m) => Self::new(Code::NotFound, m),
             DeriveError::DataLoss(m) => Self::new(Code::DataLoss, m),
+            DeriveError::CaseConflict { path, other } => Self::at(
+                Code::CaseConflict,
+                format!(
+                    "{} conflicts with {} in the same directory",
+                    String::from_utf8_lossy(&path),
+                    String::from_utf8_lossy(&other)
+                ),
+                &path,
+            ),
+            DeriveError::Pending(m) => Self::new(Code::Unavailable, m),
+            DeriveError::Internal(m) => Self::new(Code::Internal, m),
         }
     }
 }

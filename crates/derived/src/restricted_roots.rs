@@ -120,21 +120,31 @@ impl DerivedType for RestrictedRoots {
     ) -> Result<Bytes, DeriveError> {
         let root = RootTree::decode(&cx.value(&RootTree, id).await?)?;
         let parts = cs.parts();
+        // The first parent's value is a shortcut for roots this changeset
+        // does not touch, used only when it is already stored: the value
+        // never depends on deriving history, so an ACL change costs one
+        // lookup per restricted prefix per changeset, not a walk.
         let parent = match parts.parents.first() {
-            Some(p) => Some(Self::decode(&cx.value(self, *p).await?)?),
+            Some(p) => match cx.stored_value(self, *p).await? {
+                Some(v) => Some(Self::decode(&v)?),
+                None => None,
+            },
             None => None,
         };
         let mut out = BTreeMap::new();
+        let mut look = Vec::new();
         for prefix in self.config.restricted() {
-            if let Some(parent) = &parent
-                && !touches(&parts.file_changes, prefix)
-            {
-                if let Some(t) = parent.get(prefix) {
-                    out.insert(prefix.clone(), *t);
+            match &parent {
+                Some(parent) if !touches(&parts.file_changes, prefix) => {
+                    if let Some(t) = parent.get(prefix) {
+                        out.insert(prefix.clone(), *t);
+                    }
                 }
-                continue;
+                _ => look.push(prefix.clone()),
             }
-            if let Some(EntryTarget::Tree(t)) = cx.trees.lookup_path(root, prefix).await? {
+        }
+        for (prefix, found) in look.iter().zip(cx.trees.lookup_paths(root, &look).await?) {
+            if let Some(EntryTarget::Tree(t)) = found {
                 out.insert(prefix.clone(), t);
             }
         }

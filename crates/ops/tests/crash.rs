@@ -143,7 +143,7 @@ async fn check_references(meta: &PgMetaStore, blobs: &ObjectBlobStore, keys: &BT
                             RootTree.key(*id),
                             CommitGraph.key(*id),
                             restricted.key(*id),
-                            CaseIndex.key(*id),
+                            CaseIndex::default().key(*id),
                         ] {
                             assert!(
                                 meta_has(meta, MetaKey::Derived(d)).await,
@@ -156,7 +156,7 @@ async fn check_references(meta: &PgMetaStore, blobs: &ObjectBlobStore, keys: &BT
                             meta_has(meta, MetaKey::Changeset(d.changeset)).await,
                             "value without its changeset"
                         );
-                        if d.kind == CaseIndex.key(d.changeset).kind {
+                        if d.kind == CaseIndex::default().key(d.changeset).kind {
                             let id: [u8; 32] = bytes.as_ref().try_into().unwrap();
                             assert!(
                                 meta_has(

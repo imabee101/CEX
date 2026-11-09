@@ -63,7 +63,9 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
     let value = meta
         .get(
             REPO,
-            &[store::MetaKey::Derived(ops::case::CaseIndex.key(repo.tip))],
+            &[store::MetaKey::Derived(
+                ops::case::CaseIndex::default().key(repo.tip),
+            )],
         )
         .await
         .unwrap()

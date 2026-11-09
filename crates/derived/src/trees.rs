@@ -219,8 +219,9 @@ fn depth(path: &[u8]) -> usize {
     }
 }
 
-fn data_loss(what: &str) -> DeriveError {
-    DeriveError::DataLoss(format!("tree update: {what}"))
+/// A violated invariant of the tree code: a defect, not bad stored data.
+fn internal(what: &str) -> DeriveError {
+    DeriveError::Internal(format!("tree update: {what}"))
 }
 
 /// Tree nodes used by one derivation: the nodes it has loaded and the new
@@ -294,7 +295,7 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
         self.known
             .get(&id)
             .cloned()
-            .ok_or_else(|| data_loss("node not loaded"))
+            .ok_or_else(|| internal("node not loaded"))
     }
 
     /// Reads one node.
@@ -304,7 +305,7 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
     }
 
     fn put_node(&mut self, entries: Vec<TreeEntry>) -> Result<TreeId, DeriveError> {
-        let tree = Tree::new(entries).map_err(|e| data_loss(&format!("invalid node: {e}")))?;
+        let tree = Tree::new(entries).map_err(|e| internal(&format!("invalid node: {e}")))?;
         let id = tree.id();
         let tree = Arc::new(tree);
         self.known.insert(id, tree.clone());
@@ -337,6 +338,44 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
                     }
                 }
             }
+        }
+    }
+
+    /// Looks up several paths from one root tree, one batched read per
+    /// level of depth across all of them.
+    pub async fn lookup_paths(
+        &mut self,
+        root: TreeId,
+        paths: &[RepoPath],
+    ) -> Result<Vec<Option<EntryTarget>>, DeriveError> {
+        let comps: Vec<Vec<&[u8]>> = paths.iter().map(|p| p.components().collect()).collect();
+        let mut dirs: Vec<Option<TreeId>> = vec![Some(root); paths.len()];
+        let mut out = vec![None; paths.len()];
+        let mut depth = 0;
+        loop {
+            let live: Vec<usize> = (0..paths.len())
+                .filter(|&i| dirs[i].is_some() && depth < comps[i].len())
+                .collect();
+            if live.is_empty() {
+                return Ok(out);
+            }
+            let queries: Vec<(TreeId, &[u8])> = live
+                .iter()
+                .filter_map(|&i| dirs[i].map(|d| (d, comps[i][depth])))
+                .collect();
+            let found = self.lookup_many(&queries).await?;
+            for (&i, f) in live.iter().zip(found) {
+                if depth + 1 == comps[i].len() {
+                    out[i] = f;
+                    dirs[i] = None;
+                } else {
+                    dirs[i] = match f {
+                        Some(EntryTarget::Tree(id)) => Some(id),
+                        _ => None,
+                    };
+                }
+            }
+            depth += 1;
         }
     }
 
@@ -693,7 +732,7 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
                     }
                     (Some(Plan::Dir | Plan::FileThenDir), false) => {}
                     (Some(Plan::File(_)), true) => {
-                        return Err(data_loss("a path is changed twice"));
+                        return Err(internal("a path is changed twice"));
                     }
                 }
                 dir = here;
@@ -725,7 +764,7 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
             for ((_, d, name), t) in queries.iter().zip(found) {
                 if let Some(t) = t {
                     dirs.get_mut(d)
-                        .ok_or_else(|| data_loss("dir"))?
+                        .ok_or_else(|| internal("dir"))?
                         .existing
                         .insert(name.clone(), t);
                 }
@@ -773,7 +812,7 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
                 }
                 for (path, node) in child_nodes {
                     dirs.get_mut(&path)
-                        .ok_or_else(|| data_loss("child dir"))?
+                        .ok_or_else(|| internal("child dir"))?
                         .node = node;
                 }
             }
@@ -837,7 +876,7 @@ impl<'a, M: MetaStore> TreeWork<'a, M> {
                         names: new_names,
                     });
                 }
-                dirs.get_mut(d).ok_or_else(|| data_loss("dir"))?.result = result;
+                dirs.get_mut(d).ok_or_else(|| internal("dir"))?.result = result;
             }
         }
         let root = match dirs[&Vec::new()].result {
@@ -875,7 +914,7 @@ fn apply_updates(
             Update::Delete => map.remove(name).is_some(),
         };
         if !ok {
-            return Err(data_loss("update does not match the stored entries"));
+            return Err(internal("update does not match the stored entries"));
         }
     }
     Ok(())

@@ -11,7 +11,7 @@ mod error;
 
 pub use create::{
     CreateOptions, MAX_AUTHOR_BYTES, MAX_COMPONENT_BYTES, MAX_MESSAGE_BYTES, MAX_PARENTS,
-    MAX_PATH_BYTES, MAX_SIGNATURE_BYTES, Ops,
+    MAX_PATH_BYTES, MAX_SIGNATURE_BYTES, Ops, eager_types,
 };
 pub use diff::{
     DiffCursor, DiffMode, DiffOptions, DiffPage, FileDiff, FileState, MAX_DIFF_PAGE, PATCH_CONTEXT,
