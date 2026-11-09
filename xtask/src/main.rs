@@ -21,6 +21,7 @@ const PROTO_GEN_DIR: &str = "crates/scion-proto/src/gen";
 /// with the `testing` feature.
 const MUTANTS_EXCLUDE: &[&str] = &[
     "crates/store/src/testing.rs",
+    "crates/store/src/testing/**",
     "crates/store/src/fault.rs",
     "crates/store/src/conformance/**",
     "crates/store/src/blob/memory.rs",
