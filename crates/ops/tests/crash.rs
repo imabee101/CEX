@@ -73,7 +73,7 @@ async fn check_references(meta: &PgMetaStore, blobs: &ObjectBlobStore, keys: &BT
                     continue;
                 };
                 let f = Frame::decode(&bytes).unwrap();
-                if f.header().kind == FrameKind::ChunkList {
+                if f.header().kind() == FrameKind::ChunkList {
                     for c in ChunkList::decode(f.payload()).unwrap().chunks {
                         assert!(
                             blobs.contains(REPO, ObjectKey::chunk(c)).await.unwrap(),

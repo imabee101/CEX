@@ -156,9 +156,9 @@ async fn frames_are_compressed_when_that_shrinks_them() {
         async move { blobs.get(REPO, k).await.unwrap().unwrap() }
     };
     let f = frame(ObjectKey::blob(scion_core::BlobId::hash(&text))).await;
-    assert_eq!(Frame::decode(&f).unwrap().header().codec, Codec::Zstd);
+    assert_eq!(Frame::decode(&f).unwrap().header().codec(), Codec::Zstd);
     let f = frame(ObjectKey::blob(scion_core::BlobId::hash(&random))).await;
-    assert_eq!(Frame::decode(&f).unwrap().header().codec, Codec::Raw);
+    assert_eq!(Frame::decode(&f).unwrap().header().codec(), Codec::Raw);
     let root = root_of(&ops, id).await;
     let f = frame(ObjectKey::tree(root)).await;
     Frame::decode(&f).unwrap();
@@ -251,7 +251,13 @@ async fn reads_reject_frames_that_name_another_object() {
         (FrameKind::Chunk, id.as_bytes()),
     ] {
         let repo = RepoId(REPO.0 + 1 + kind as u64);
-        let frame = Frame::encode(kind, *named, Codec::Raw, content.len() as u64, content).unwrap();
+        let frame = Frame::encode(
+            scion_core::FrameId::new(kind, *named),
+            Codec::Raw,
+            content.len() as u64,
+            content,
+        )
+        .unwrap();
         e.blobs
             .put_if_absent(repo, ObjectKey::blob(id), Bytes::from(frame))
             .await

@@ -23,10 +23,27 @@ fn checks_pass_on_golden_vectors_and_their_prefixes() {
             fuzz::check_tree(b);
             fuzz::check_frame(b);
             fuzz::check_chunk_list(b);
+            fuzz::check_id_hex(b);
         }
         inputs += 1;
     }
     let records = VECTORS.lines().filter(|l| l.starts_with("name:")).count();
     assert!(records > 0);
     assert_eq!(inputs, records, "every record has bytes");
+}
+
+#[test]
+fn id_check_passes_on_every_vector_id_and_its_variants() {
+    let ids: Vec<&str> = VECTORS
+        .lines()
+        .filter_map(|l| l.strip_prefix("id:"))
+        .map(str::trim)
+        .collect();
+    assert!(!ids.is_empty());
+    for id in ids {
+        fuzz::check_id_hex(id.as_bytes());
+        fuzz::check_id_hex(id.to_uppercase().as_bytes());
+        fuzz::check_id_hex(&id.as_bytes()[1..]);
+        fuzz::check_id_hex(format!("{id}0").as_bytes());
+    }
 }

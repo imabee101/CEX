@@ -158,11 +158,12 @@
 //! `key: value` lines, in this order:
 //!
 //! - `name`: a unique name.
-//! - `type`: `blob`, `chunk`, `tree`, `changeset`, or `frame`.
+//! - `type`: `blob`, `chunk`, `tree`, `changeset`, `frame`, or `chunk_list`
+//!   (the payload of a chunk-list frame on its own).
 //! - `expect`: `accept` or `reject`.
 //! - `id`: for an accepted `blob`, `chunk`, `tree`, or `changeset`, the
 //!   expected id of `bytes` as 64 hex digits; for an accepted `frame`, the
-//!   id in its header; absent for `reject`.
+//!   id in its header; absent for `chunk_list` and for `reject`.
 //! - `bytes`: the input as lowercase hex (possibly empty).
 //!
 //! A conforming decoder accepts exactly the `accept` records, re-encodes
@@ -180,12 +181,12 @@ mod tree;
 mod wire;
 
 pub use changeset::{
-    Changeset, ChangesetParts, Committer, FileChange, FileKind, MAX_UTC_OFFSET_SECONDS, Timestamp,
+    Changeset, ChangesetParts, Committer, FileChange, FileKind, Timestamp, UTC_OFFSET_LIMIT_SECONDS,
 };
 pub use error::FormatError;
 pub use frame::{
-    ChunkList, Codec, FRAME_DIGEST_LEN, FRAME_MAGIC, Frame, FrameHeader, FrameKind,
-    MAX_FRAME_HEADER_LEN, chunk_count,
+    ChunkList, Codec, FRAME_DIGEST_LEN, FRAME_MAGIC, Frame, FrameHeader, FrameId, FrameKind,
+    FrameLengthRule, MAX_FRAME_HEADER_LEN, chunk_count,
 };
 pub use id::{
     BLOB_CONTEXT, BlobId, CHANGESET_CONTEXT, CHUNK_CONTEXT, ChangesetId, ChunkId, IdHasher,
@@ -194,8 +195,11 @@ pub use id::{
 pub use path::RepoPath;
 pub use tree::{EntryTarget, Tree, TreeEntry};
 
-/// The version byte that starts every changeset and tree node encoding.
-pub const FORMAT_VERSION: u8 = 0x01;
+/// The version byte that starts every changeset encoding.
+pub const CHANGESET_FORMAT_VERSION: u8 = 0x01;
+
+/// The version byte that starts every tree node encoding.
+pub const TREE_FORMAT_VERSION: u8 = 0x01;
 
 /// The longest `bytes` field, name, or path any decoder accepts: 64 MiB.
 pub const MAX_FIELD_BYTES: usize = 64 << 20;

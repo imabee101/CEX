@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use derived::BlobRecord;
-use scion_core::{BlobId, CHUNK_BYTES, ChunkId, ChunkList, Codec, Frame, FrameKind};
+use scion_core::{BlobId, CHUNK_BYTES, ChunkId, ChunkList, Codec, Frame, FrameId, FrameKind};
 use sha2::{Digest, Sha256};
 use store::{BlobStore, MetaKey, MetaStore, ObjectKey, RepoId};
 use tokio::task::JoinSet;
@@ -28,8 +28,8 @@ pub fn is_text(bytes: &[u8]) -> bool {
     bytes.len() <= MAX_TEXT_BYTES && !bytes[..bytes.len().min(TEXT_SNIFF_BYTES)].contains(&0)
 }
 
-fn frame(kind: FrameKind, id: [u8; 32], raw: &[u8]) -> Result<Bytes, OpError> {
-    Ok(derived::encode_frame(kind, id, raw)?)
+fn frame(id: FrameId, raw: &[u8]) -> Result<Bytes, OpError> {
+    Ok(derived::encode_frame(id, raw)?)
 }
 
 /// The frames of one blob, in write order: its chunks, then the blob's own
@@ -39,10 +39,7 @@ fn blob_frames(content: &[u8]) -> Result<(BlobId, Vec<(ObjectKey, Bytes)>), OpEr
     if content.len() <= CHUNK_BYTES {
         return Ok((
             id,
-            vec![(
-                ObjectKey::blob(id),
-                frame(FrameKind::Blob, *id.as_bytes(), content)?,
-            )],
+            vec![(ObjectKey::blob(id), frame(FrameId::Blob(id), content)?)],
         ));
     }
     let mut frames = Vec::new();
@@ -50,15 +47,11 @@ fn blob_frames(content: &[u8]) -> Result<(BlobId, Vec<(ObjectKey, Bytes)>), OpEr
     for piece in content.chunks(CHUNK_BYTES) {
         let cid = ChunkId::hash(piece);
         chunks.push(cid);
-        frames.push((
-            ObjectKey::chunk(cid),
-            frame(FrameKind::Chunk, *cid.as_bytes(), piece)?,
-        ));
+        frames.push((ObjectKey::chunk(cid), frame(FrameId::Chunk(cid), piece)?));
     }
     let list = ChunkList { chunks }.encode();
     let f = Frame::encode(
-        FrameKind::ChunkList,
-        *id.as_bytes(),
+        FrameId::ChunkList(id),
         Codec::Raw,
         content.len() as u64,
         &list,
@@ -139,27 +132,19 @@ fn data_loss(id: impl std::fmt::Display, what: &str) -> OpError {
     OpError::new(Code::DataLoss, format!("blob {id}: {what}"))
 }
 
-fn decode_payload(bytes: &[u8], kind: FrameKind, id: [u8; 32]) -> Result<Vec<u8>, OpError> {
-    let f = Frame::decode(bytes)
-        .map_err(|e| data_loss(BlobId::from_bytes(id), &format!("bad frame: {e}")))?;
+fn decode_payload(bytes: &[u8], id: FrameId) -> Result<Vec<u8>, OpError> {
+    let name = BlobId::from_bytes(*id.as_bytes());
+    let f = Frame::decode(bytes).map_err(|e| data_loss(name, &format!("bad frame: {e}")))?;
     let h = f.header();
-    if h.kind != kind || h.id != id {
-        return Err(data_loss(
-            BlobId::from_bytes(id),
-            "frame names another object",
-        ));
+    if h.id() != id {
+        return Err(data_loss(name, "frame names another object"));
     }
-    match h.codec {
+    match h.codec() {
         Codec::Raw => Ok(f.payload().to_vec()),
-        Codec::Zstd => zstd::bulk::decompress(f.payload(), h.raw_len as usize)
+        Codec::Zstd => zstd::bulk::decompress(f.payload(), h.raw_len() as usize)
             .ok()
-            .filter(|raw| raw.len() as u64 == h.raw_len)
-            .ok_or_else(|| {
-                data_loss(
-                    BlobId::from_bytes(id),
-                    "payload does not decompress to its length",
-                )
-            }),
+            .filter(|raw| raw.len() as u64 == h.raw_len())
+            .ok_or_else(|| data_loss(name, "payload does not decompress to its length")),
     }
 }
 
@@ -259,16 +244,12 @@ async fn sniff_blob<B: BlobStore>(
         .await?
         .ok_or_else(|| data_loss(id, "missing frame"))?;
     let frame = Frame::decode(&bytes).map_err(|e| data_loss(id, &e.to_string()))?;
-    if frame.header().raw_len != size {
+    if frame.header().raw_len() != size {
         return Err(data_loss(id, "frame and blob sizes differ"));
     }
-    let raw = if frame.header().kind == FrameKind::ChunkList {
-        let list = ChunkList::decode(&decode_payload(
-            &bytes,
-            FrameKind::ChunkList,
-            *id.as_bytes(),
-        )?)
-        .map_err(|e| data_loss(id, &e.to_string()))?;
+    let raw = if frame.header().kind() == FrameKind::ChunkList {
+        let list = ChunkList::decode(&decode_payload(&bytes, FrameId::ChunkList(id))?)
+            .map_err(|e| data_loss(id, &e.to_string()))?;
         let first = list
             .chunks
             .first()
@@ -277,13 +258,13 @@ async fn sniff_blob<B: BlobStore>(
             .get(repo, ObjectKey::chunk(*first))
             .await?
             .ok_or_else(|| data_loss(id, "missing first chunk"))?;
-        let raw = decode_payload(&bytes, FrameKind::Chunk, *first.as_bytes())?;
+        let raw = decode_payload(&bytes, FrameId::Chunk(*first))?;
         if raw.len() != CHUNK_BYTES || ChunkId::hash(&raw) != *first {
             return Err(data_loss(id, "invalid first chunk"));
         }
         raw
     } else {
-        let raw = decode_payload(&bytes, FrameKind::Blob, *id.as_bytes())?;
+        let raw = decode_payload(&bytes, FrameId::Blob(id))?;
         if raw.len() as u64 != size || BlobId::hash(&raw) != id {
             return Err(data_loss(id, "invalid blob bytes"));
         }
@@ -305,21 +286,17 @@ pub async fn read_blob<B: BlobStore>(
     let header = Frame::decode(&bytes)
         .map_err(|e| data_loss(id, &format!("bad frame: {e}")))?
         .header()
-        .kind;
+        .kind();
     let raw = if header == FrameKind::ChunkList {
-        let list = ChunkList::decode(&decode_payload(
-            &bytes,
-            FrameKind::ChunkList,
-            *id.as_bytes(),
-        )?)
-        .map_err(|e| data_loss(id, &format!("bad chunk list: {e}")))?;
+        let list = ChunkList::decode(&decode_payload(&bytes, FrameId::ChunkList(id))?)
+            .map_err(|e| data_loss(id, &format!("bad chunk list: {e}")))?;
         let mut raw = Vec::new();
         for c in list.chunks {
             let cb = blobs
                 .get(repo, ObjectKey::chunk(c))
                 .await?
                 .ok_or_else(|| data_loss(id, "a chunk is missing"))?;
-            let piece = decode_payload(&cb, FrameKind::Chunk, *c.as_bytes())?;
+            let piece = decode_payload(&cb, FrameId::Chunk(c))?;
             if ChunkId::hash(&piece) != c {
                 return Err(data_loss(id, "a chunk does not hash to its id"));
             }
@@ -327,7 +304,7 @@ pub async fn read_blob<B: BlobStore>(
         }
         raw
     } else {
-        decode_payload(&bytes, FrameKind::Blob, *id.as_bytes())?
+        decode_payload(&bytes, FrameId::Blob(id))?
     };
     if BlobId::hash(&raw) != id {
         return Err(data_loss(id, "bytes do not hash to the id"));
@@ -391,7 +368,7 @@ mod tests {
             .put_if_absent(
                 RepoId(1),
                 ObjectKey::blob(id),
-                frame(FrameKind::Blob, *id.as_bytes(), b"fake").unwrap(),
+                frame(FrameId::Blob(id), b"fake").unwrap(),
             )
             .await
             .unwrap();

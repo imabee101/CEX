@@ -4,7 +4,7 @@
 mod support;
 
 use object_store::ObjectStoreExt;
-use scion_core::{BlobId, Changeset, ChunkId, Frame, Tree};
+use scion_core::{BlobId, Changeset, ChunkId, ChunkList, Frame, Tree};
 use store::testing::{TestDatabase, object_store};
 use support::vectors::{self, Ty};
 
@@ -45,22 +45,25 @@ async fn canonical_vectors_and_ids_survive_postgres_and_object_storage() {
                 vector.name
             );
             let decoded = match vector.ty {
-                Ty::Blob => Ok((bytes.to_vec(), *BlobId::hash(bytes).as_bytes())),
-                Ty::Chunk => Ok((bytes.to_vec(), *ChunkId::hash(bytes).as_bytes())),
-                Ty::Changeset => Changeset::decode(bytes).map(|v| (v.encode(), *v.id().as_bytes())),
-                Ty::Tree => Tree::decode(bytes).map(|v| (v.encode(), *v.id().as_bytes())),
+                Ty::Blob => Ok((bytes.to_vec(), Some(*BlobId::hash(bytes).as_bytes()))),
+                Ty::Chunk => Ok((bytes.to_vec(), Some(*ChunkId::hash(bytes).as_bytes()))),
+                Ty::Changeset => {
+                    Changeset::decode(bytes).map(|v| (v.encode(), Some(*v.id().as_bytes())))
+                }
+                Ty::Tree => Tree::decode(bytes).map(|v| (v.encode(), Some(*v.id().as_bytes()))),
                 Ty::Frame => Frame::decode(bytes).map(|v| {
                     let h = v.header();
                     (
-                        Frame::encode(h.kind, h.id, h.codec, h.raw_len, v.payload()).unwrap(),
-                        h.id,
+                        Frame::encode(h.id(), h.codec(), h.raw_len(), v.payload()).unwrap(),
+                        Some(*h.id().as_bytes()),
                     )
                 }),
+                Ty::ChunkList => ChunkList::decode(bytes).map(|v| (v.encode(), None)),
             };
             if vector.accept {
                 let (encoded, id) = decoded.unwrap();
                 assert_eq!(encoded, vector.bytes, "{}", vector.name);
-                assert_eq!(Some(id), vector.id, "{}", vector.name);
+                assert_eq!(id, vector.id, "{}", vector.name);
             } else {
                 assert!(
                     decoded.is_err(),

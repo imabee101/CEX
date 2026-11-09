@@ -657,6 +657,10 @@ fn write_fuzz_seeds() -> Result<PathBuf> {
     for line in vectors.lines() {
         if let Some(n) = line.strip_prefix("name: ") {
             name = Some(n.to_owned());
+        } else if let Some(id) = line.strip_prefix("id: ") {
+            // Ids seed the hex id parser's fuzzer.
+            let n = name.as_deref().ok_or("vectors file: id without a name")?;
+            std::fs::write(dir.join(format!("{n}.id")), id.trim())?;
         } else if let Some(hex) = line.strip_prefix("bytes:") {
             let n = name.take().ok_or("vectors file: bytes without a name")?;
             std::fs::write(dir.join(n), decode_hex(hex.trim())?)?;

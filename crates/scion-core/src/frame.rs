@@ -2,7 +2,7 @@
 //! on daemon and client disks, and in blob storage.
 
 use crate::wire::{Reader, put_uvarint, uvarint_len};
-use crate::{CHUNK_BYTES, ChunkId, FormatError, MAX_FIELD_BYTES};
+use crate::{BlobId, CHUNK_BYTES, ChunkId, FormatError, MAX_FIELD_BYTES, TreeId};
 
 /// The four bytes every frame starts with.
 pub const FRAME_MAGIC: [u8; 4] = *b"SCF1";
@@ -12,7 +12,10 @@ pub const FRAME_DIGEST_LEN: usize = 32;
 
 /// The longest possible frame header: magic, kind, id, codec, and two
 /// 10-byte varints.
-pub const MAX_FRAME_HEADER_LEN: usize = 4 + 1 + 32 + 1 + 10 + 10;
+pub const MAX_FRAME_HEADER_LEN: usize = FIXED_HEADER_LEN + 10 + 10;
+
+/// The header bytes before the two varints: magic, kind, id, and codec.
+const FIXED_HEADER_LEN: usize = 4 + 1 + 32 + 1;
 
 /// What a frame holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,90 +88,139 @@ impl Codec {
     }
 }
 
-/// A frame header.
+/// The id in a frame header, typed by what the frame holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameId {
+    /// A whole blob of at most `CHUNK_BYTES`.
+    Blob(BlobId),
+    /// One chunk of a chunked blob.
+    Chunk(ChunkId),
+    /// A tree node.
+    Tree(TreeId),
+    /// The chunk list of the blob with this id, which is larger than
+    /// `CHUNK_BYTES`.
+    ChunkList(BlobId),
+}
+
+impl FrameId {
+    /// The id of kind `kind` with bytes `bytes`.
+    pub const fn new(kind: FrameKind, bytes: [u8; 32]) -> Self {
+        match kind {
+            FrameKind::Blob => Self::Blob(BlobId::from_bytes(bytes)),
+            FrameKind::Chunk => Self::Chunk(ChunkId::from_bytes(bytes)),
+            FrameKind::Tree => Self::Tree(TreeId::from_bytes(bytes)),
+            FrameKind::ChunkList => Self::ChunkList(BlobId::from_bytes(bytes)),
+        }
+    }
+
+    /// What a frame with this id holds.
+    pub const fn kind(&self) -> FrameKind {
+        match self {
+            Self::Blob(_) => FrameKind::Blob,
+            Self::Chunk(_) => FrameKind::Chunk,
+            Self::Tree(_) => FrameKind::Tree,
+            Self::ChunkList(_) => FrameKind::ChunkList,
+        }
+    }
+
+    /// The id's 32 bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        match self {
+            Self::Blob(id) | Self::ChunkList(id) => id.as_bytes(),
+            Self::Chunk(id) => id.as_bytes(),
+            Self::Tree(id) => id.as_bytes(),
+        }
+    }
+}
+
+/// A frame header. Every header that exists obeys the length rules for its
+/// kind and codec: it can only be built by [`FrameHeader::new`] or parsed by
+/// [`FrameHeader::parse_prefix`], both of which check them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameHeader {
-    /// What the frame holds.
-    pub kind: FrameKind,
-    /// The id of the object: a `BlobId`, `ChunkId`, or `TreeId` by kind.
-    pub id: [u8; 32],
-    /// How the payload encodes the raw bytes.
-    pub codec: Codec,
-    /// The length of the object's raw bytes (for a chunk list, the blob's).
-    pub raw_len: u64,
-    /// The length of the payload.
-    pub payload_len: u64,
+    id: FrameId,
+    codec: Codec,
+    raw_len: u64,
+    payload_len: u64,
 }
 
 impl FrameHeader {
     /// Builds a header, checking that its lengths are valid for its kind and
     /// codec.
     pub fn new(
-        kind: FrameKind,
-        id: [u8; 32],
+        id: FrameId,
         codec: Codec,
         raw_len: u64,
         payload_len: u64,
     ) -> Result<Self, FormatError> {
         let h = Self {
-            kind,
             id,
             codec,
             raw_len,
             payload_len,
         };
-        h.check()?;
+        h.check().map_err(FormatError::BadFrameLength)?;
         Ok(h)
     }
 
+    /// What the frame holds.
+    pub const fn kind(&self) -> FrameKind {
+        self.id.kind()
+    }
+
+    /// The id of the object the frame holds.
+    pub const fn id(&self) -> FrameId {
+        self.id
+    }
+
+    /// How the payload encodes the raw bytes.
+    pub const fn codec(&self) -> Codec {
+        self.codec
+    }
+
+    /// The length of the object's raw bytes (for a chunk list, the blob's).
+    pub const fn raw_len(&self) -> u64 {
+        self.raw_len
+    }
+
+    /// The length of the payload.
+    pub const fn payload_len(&self) -> u64 {
+        self.payload_len
+    }
+
     /// The rules every header obeys; the single place they are defined.
-    fn check(&self) -> Result<(), FormatError> {
+    fn check(&self) -> Result<(), FrameLengthRule> {
         let chunk = CHUNK_BYTES as u64;
-        match self.kind {
-            FrameKind::Blob if self.raw_len > chunk => {
-                return Err(FormatError::BadFrameLength(
-                    "a blob frame holds at most CHUNK_BYTES",
-                ));
-            }
+        match self.kind() {
+            FrameKind::Blob if self.raw_len > chunk => return Err(FrameLengthRule::BlobTooLong),
             FrameKind::Chunk if self.raw_len == 0 || self.raw_len > chunk => {
-                return Err(FormatError::BadFrameLength(
-                    "a chunk holds 1 to CHUNK_BYTES bytes",
-                ));
+                return Err(FrameLengthRule::ChunkLength);
             }
             FrameKind::Tree if self.raw_len > MAX_FIELD_BYTES as u64 => {
-                return Err(FormatError::BadFrameLength(
-                    "a tree frame holds at most MAX_FIELD_BYTES",
-                ));
+                return Err(FrameLengthRule::TreeTooLong);
             }
             FrameKind::ChunkList => {
                 if self.codec != Codec::Raw {
-                    return Err(FormatError::BadFrameLength(
-                        "a chunk-list frame uses codec raw",
-                    ));
+                    return Err(FrameLengthRule::ChunkListCodec);
                 }
                 if self.raw_len <= chunk {
-                    return Err(FormatError::BadFrameLength(
-                        "only a blob larger than CHUNK_BYTES has a chunk list",
-                    ));
+                    return Err(FrameLengthRule::ChunkListBlobTooShort);
                 }
-                let count = chunk_count(self.raw_len);
-                if self.payload_len != chunk_list_len(count) {
-                    return Err(FormatError::BadFrameLength(
-                        "chunk-list payload length does not match the blob length",
-                    ));
+                if self.payload_len != chunk_list_len(chunk_count(self.raw_len)) {
+                    return Err(FrameLengthRule::ChunkListPayloadLength);
                 }
                 return Ok(());
             }
             _ => {}
         }
         match self.codec {
-            Codec::Raw if self.payload_len != self.raw_len => Err(FormatError::BadFrameLength(
-                "a raw payload's length equals the raw length",
-            )),
+            Codec::Raw if self.payload_len != self.raw_len => {
+                Err(FrameLengthRule::RawPayloadLength)
+            }
             // Compression is used only when it shrinks the object.
-            Codec::Zstd if self.payload_len >= self.raw_len => Err(FormatError::BadFrameLength(
-                "a zstd payload is shorter than the raw length",
-            )),
+            Codec::Zstd if self.payload_len >= self.raw_len => {
+                Err(FrameLengthRule::ZstdPayloadNotShorter)
+            }
             _ => Ok(()),
         }
     }
@@ -177,8 +229,8 @@ impl FrameHeader {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.encoded_len());
         out.extend_from_slice(&FRAME_MAGIC);
-        out.push(self.kind.code());
-        out.extend_from_slice(&self.id);
+        out.push(self.kind().code());
+        out.extend_from_slice(self.id.as_bytes());
         out.push(self.codec.code());
         put_uvarint(&mut out, self.raw_len);
         put_uvarint(&mut out, self.payload_len);
@@ -187,10 +239,11 @@ impl FrameHeader {
 
     /// The length of the header's encoding.
     pub fn encoded_len(&self) -> usize {
-        4 + 1 + 32 + 1 + uvarint_len(self.raw_len) + uvarint_len(self.payload_len)
+        FIXED_HEADER_LEN + uvarint_len(self.raw_len) + uvarint_len(self.payload_len)
     }
 
-    /// The length of the whole frame: header, payload, and digest.
+    /// The length of the whole frame: header, payload, and digest. It cannot
+    /// overflow: a checked payload is at most `MAX_FIELD_BYTES` long.
     pub fn frame_len(&self) -> u64 {
         self.encoded_len() as u64 + self.payload_len + FRAME_DIGEST_LEN as u64
     }
@@ -204,13 +257,43 @@ impl FrameHeader {
             return Err(FormatError::BadMagic);
         }
         let kind = FrameKind::from_code(r.u8()?)?;
-        let id = r.array32()?;
+        let id = FrameId::new(kind, r.array32()?);
         let codec = Codec::from_code(r.u8()?)?;
         let raw_len = r.uvarint()?;
         let payload_len = r.uvarint()?;
-        let h = Self::new(kind, id, codec, raw_len, payload_len)?;
+        let h = Self::new(id, codec, raw_len, payload_len)?;
         Ok((h, bytes.len() - r.remaining()))
     }
+}
+
+/// A frame length rule, named by what it requires; see [`FrameHeader`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum FrameLengthRule {
+    /// A blob frame holds at most `CHUNK_BYTES`.
+    #[error("a blob frame holds at most CHUNK_BYTES")]
+    BlobTooLong,
+    /// A chunk holds 1 to `CHUNK_BYTES` bytes.
+    #[error("a chunk holds 1 to CHUNK_BYTES bytes")]
+    ChunkLength,
+    /// A tree frame holds at most `MAX_FIELD_BYTES`.
+    #[error("a tree frame holds at most MAX_FIELD_BYTES")]
+    TreeTooLong,
+    /// A chunk-list frame uses codec raw.
+    #[error("a chunk-list frame uses codec raw")]
+    ChunkListCodec,
+    /// Only a blob larger than `CHUNK_BYTES` has a chunk list.
+    #[error("only a blob larger than CHUNK_BYTES has a chunk list")]
+    ChunkListBlobTooShort,
+    /// A chunk list's payload holds exactly one id per chunk of the blob.
+    #[error("chunk-list payload length does not match the blob length")]
+    ChunkListPayloadLength,
+    /// A raw payload's length equals the raw length.
+    #[error("a raw payload's length equals the raw length")]
+    RawPayloadLength,
+    /// A zstd payload is shorter than the raw length.
+    #[error("a zstd payload is shorter than the raw length")]
+    ZstdPayloadNotShorter,
 }
 
 /// A decoded frame, borrowing its payload from the frame bytes.
@@ -226,14 +309,13 @@ impl<'a> Frame<'a> {
     /// For a [`FrameKind::ChunkList`] frame, `payload` must be the canonical
     /// chunk list for a blob of `raw_len` bytes.
     pub fn encode(
-        kind: FrameKind,
-        id: [u8; 32],
+        id: FrameId,
         codec: Codec,
         raw_len: u64,
         payload: &[u8],
     ) -> Result<Vec<u8>, FormatError> {
-        let header = FrameHeader::new(kind, id, codec, raw_len, payload.len() as u64)?;
-        if kind == FrameKind::ChunkList {
+        let header = FrameHeader::new(id, codec, raw_len, payload.len() as u64)?;
+        if header.kind() == FrameKind::ChunkList {
             ChunkList::decode(payload)?;
         }
         let mut out = header.encode();
@@ -262,15 +344,10 @@ impl<'a> Frame<'a> {
         if blake3::hash(&bytes[..digest_at]).as_bytes() != &bytes[digest_at..] {
             return Err(FormatError::DigestMismatch);
         }
-        if header.kind == FrameKind::ChunkList {
-            let list = ChunkList::decode(payload)?;
-            let expected = chunk_count(header.raw_len);
-            if list.chunks.len() as u64 != expected {
-                return Err(FormatError::ChunkCountMismatch {
-                    expected,
-                    actual: list.chunks.len() as u64,
-                });
-            }
+        if header.kind() == FrameKind::ChunkList {
+            // The header already fixed the payload length to exactly the
+            // blob's chunk count, so a well-formed list has that count.
+            ChunkList::decode(payload)?;
         }
         Ok(Self { header, payload })
     }
@@ -340,7 +417,7 @@ mod tests {
         raw: u64,
         payload: u64,
     ) -> Result<FrameHeader, FormatError> {
-        FrameHeader::new(kind, [7; 32], codec, raw, payload)
+        FrameHeader::new(FrameId::new(kind, [7; 32]), codec, raw, payload)
     }
 
     #[test]
@@ -372,6 +449,51 @@ mod tests {
     }
 
     #[test]
+    fn each_rule_is_reported_by_name() {
+        use Codec::*;
+        use FrameKind::*;
+        use FrameLengthRule as R;
+        let rule = |kind, codec, raw, payload| match header(kind, codec, raw, payload) {
+            Err(FormatError::BadFrameLength(rule)) => Some(rule),
+            Ok(_) => None,
+            Err(e) => panic!("unexpected error {e}"),
+        };
+        assert_eq!(rule(Blob, Raw, C + 1, C + 1), Some(R::BlobTooLong));
+        assert_eq!(rule(Chunk, Raw, 0, 0), Some(R::ChunkLength));
+        let over = MAX_FIELD_BYTES as u64 + 1;
+        assert_eq!(rule(Tree, Raw, over, over), Some(R::TreeTooLong));
+        assert_eq!(rule(ChunkList, Zstd, C + 1, 65), Some(R::ChunkListCodec));
+        assert_eq!(rule(ChunkList, Raw, C, 33), Some(R::ChunkListBlobTooShort));
+        assert_eq!(
+            rule(ChunkList, Raw, C + 1, 33),
+            Some(R::ChunkListPayloadLength)
+        );
+        assert_eq!(rule(Blob, Raw, 5, 4), Some(R::RawPayloadLength));
+        assert_eq!(rule(Blob, Zstd, 5, 5), Some(R::ZstdPayloadNotShorter));
+        assert_eq!(rule(Blob, Zstd, 5, 4), None);
+    }
+
+    #[test]
+    fn ids_carry_their_kind() {
+        for kind in [
+            FrameKind::Blob,
+            FrameKind::Chunk,
+            FrameKind::Tree,
+            FrameKind::ChunkList,
+        ] {
+            let id = FrameId::new(kind, [9; 32]);
+            assert_eq!(id.kind(), kind);
+            assert_eq!(id.as_bytes(), &[9; 32]);
+        }
+        let h = header(FrameKind::Tree, Codec::Raw, 2, 2).unwrap();
+        assert_eq!(h.id(), FrameId::Tree(TreeId::from_bytes([7; 32])));
+        assert_eq!(
+            (h.kind(), h.codec(), h.raw_len(), h.payload_len()),
+            (FrameKind::Tree, Codec::Raw, 2, 2)
+        );
+    }
+
+    #[test]
     fn chunk_list_lengths() {
         use FrameKind::ChunkList as L;
         assert!(header(L, Codec::Raw, C, 1 + 32).is_err());
@@ -389,7 +511,13 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip() {
-        let f = Frame::encode(FrameKind::Blob, [1; 32], Codec::Raw, 3, b"abc").unwrap();
+        let f = Frame::encode(
+            FrameId::new(FrameKind::Blob, [1; 32]),
+            Codec::Raw,
+            3,
+            b"abc",
+        )
+        .unwrap();
         let d = Frame::decode(&f).unwrap();
         assert_eq!(d.payload(), b"abc");
         assert_eq!(d.header().encoded_len(), f.len() - 3 - 32);
@@ -407,7 +535,13 @@ mod tests {
 
     #[test]
     fn parse_prefix_reports_truncation() {
-        let f = Frame::encode(FrameKind::Tree, [2; 32], Codec::Raw, 2, &[1, 0]).unwrap();
+        let f = Frame::encode(
+            FrameId::new(FrameKind::Tree, [2; 32]),
+            Codec::Raw,
+            2,
+            &[1, 0],
+        )
+        .unwrap();
         for n in 0..f.len() - 2 - 32 {
             assert_eq!(
                 FrameHeader::parse_prefix(&f[..n]).map(|_| ()),

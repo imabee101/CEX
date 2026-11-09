@@ -483,8 +483,7 @@ async fn legacy_classification_reads_are_concurrent_and_bounded() {
     for i in 0..40 {
         let raw = format!("\0legacy-{i}").into_bytes();
         let id = scion_core::BlobId::hash(&raw);
-        let frame =
-            derived::encode_frame(scion_core::FrameKind::Blob, *id.as_bytes(), &raw).unwrap();
+        let frame = derived::encode_frame(scion_core::FrameId::Blob(id), &raw).unwrap();
         e.blobs
             .put_if_absent(REPO, ObjectKey::blob(id), frame)
             .await

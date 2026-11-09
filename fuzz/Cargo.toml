@@ -10,6 +10,7 @@ publish.workspace = true
 cargo-fuzz = true
 
 [dependencies]
+blake3 = { workspace = true }
 libfuzzer-sys = { workspace = true }
 scion-core = { workspace = true }
 
@@ -37,6 +38,13 @@ bench = false
 [[bin]]
 name = "chunk_list"
 path = "fuzz_targets/chunk_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "id_hex"
+path = "fuzz_targets/id_hex.rs"
 test = false
 doc = false
 bench = false

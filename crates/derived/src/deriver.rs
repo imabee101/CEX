@@ -7,7 +7,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use scion_core::{Changeset, ChangesetId, Codec, Frame, FrameKind, Tree, TreeId};
+use scion_core::{Changeset, ChangesetId, Codec, Frame, FrameId, Tree, TreeId};
 use store::{BlobStore, DerivedKey, MetaKey, MetaStore, ObjectKey, RepoId};
 use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
@@ -451,7 +451,7 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
 /// Encodes an object's frame: the zstd-compressed bytes when compression
 /// shrinks them, else the raw bytes. This is the one place the server picks a
 /// frame's codec.
-pub fn encode_frame(kind: FrameKind, id: [u8; 32], raw: &[u8]) -> Result<Bytes, DeriveError> {
+pub fn encode_frame(id: FrameId, raw: &[u8]) -> Result<Bytes, DeriveError> {
     let payload = zstd::bulk::compress(raw, FRAME_ZSTD_LEVEL)
         .map_err(|e| DeriveError::DataLoss(format!("compressing a frame: {e}")))?;
     let (codec, payload) = if payload.len() < raw.len() {
@@ -459,12 +459,12 @@ pub fn encode_frame(kind: FrameKind, id: [u8; 32], raw: &[u8]) -> Result<Bytes, 
     } else {
         (Codec::Raw, raw)
     };
-    Frame::encode(kind, id, codec, raw.len() as u64, payload)
+    Frame::encode(id, codec, raw.len() as u64, payload)
         .map(Bytes::from)
         .map_err(|e| DeriveError::DataLoss(format!("encoding a frame: {e}")))
 }
 
 /// The frame of a tree node.
 pub fn tree_frame(id: TreeId, tree: &Tree) -> Result<Bytes, DeriveError> {
-    encode_frame(FrameKind::Tree, *id.as_bytes(), &tree.encode())
+    encode_frame(FrameId::Tree(id), &tree.encode())
 }

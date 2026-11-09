@@ -119,6 +119,12 @@ impl<'a> Reader<'a> {
     /// allocate for the count.
     pub(crate) fn count(&mut self, min_item_bytes: usize) -> Result<usize, FormatError> {
         let n = self.uvarint()?;
+        self.fits(n, min_item_bytes)
+    }
+
+    /// Checks that `n` items of at least `min_item_bytes` each fit in the
+    /// remaining input, so a count read from it can size an allocation.
+    pub(crate) fn fits(&self, n: u64, min_item_bytes: usize) -> Result<usize, FormatError> {
         if n > (self.remaining() / min_item_bytes) as u64 {
             return Err(FormatError::Truncated);
         }

@@ -2,7 +2,7 @@
 
 use crate::path::check_name;
 use crate::wire::{Reader, put_bytes, put_uvarint};
-use crate::{BlobId, FORMAT_VERSION, FileKind, FormatError, MAX_TREE_ENTRIES, TreeId};
+use crate::{BlobId, FileKind, FormatError, MAX_TREE_ENTRIES, TREE_FORMAT_VERSION, TreeId};
 
 /// What a tree entry points to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,7 +80,7 @@ impl Tree {
     /// The canonical encoding.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(FORMAT_VERSION);
+        out.push(TREE_FORMAT_VERSION);
         put_uvarint(&mut out, self.entries.len() as u64);
         for e in &self.entries {
             put_bytes(&mut out, &e.name);
@@ -117,16 +117,15 @@ impl Tree {
     pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
         let mut r = Reader::new(bytes);
         let version = r.u8()?;
-        if version != FORMAT_VERSION {
+        if version != TREE_FORMAT_VERSION {
             return Err(FormatError::UnsupportedVersion(version));
         }
-        // Peek the count first so an oversized node is rejected as such.
-        let n = Reader::new(&bytes[1..]).uvarint()?;
+        let n = r.uvarint()?;
         if n > MAX_TREE_ENTRIES as u64 {
             return Err(FormatError::TooManyEntries(n));
         }
         // Smallest entry: a 1-byte length, a 1-byte name, a kind, and an id.
-        let n = r.count(35)?;
+        let n = r.fits(n, 35)?;
         let mut entries: Vec<TreeEntry> = Vec::with_capacity(n);
         for _ in 0..n {
             let name = r.bytes()?;

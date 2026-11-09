@@ -1,7 +1,7 @@
 //! Accessors, bounds, and error details that the format tests do not reach.
 
 use scion_core::{
-    BlobId, Changeset, ChangesetParts, Codec, EntryTarget, FormatError, Frame, FrameKind,
+    BlobId, Changeset, ChangesetParts, Codec, EntryTarget, FormatError, Frame, FrameId, FrameKind,
     MAX_FIELD_BYTES, MAX_FRAME_HEADER_LEN, RepoPath, Tree, TreeEntry, TreeId,
 };
 
@@ -76,7 +76,13 @@ fn max_frame_header_len_is_magic_kind_id_codec_and_two_varints() {
 
 #[test]
 fn trailing_byte_count_is_reported() {
-    let f = Frame::encode(FrameKind::Blob, [1; 32], Codec::Raw, 3, b"abc").unwrap();
+    let f = Frame::encode(
+        FrameId::new(FrameKind::Blob, [1; 32]),
+        Codec::Raw,
+        3,
+        b"abc",
+    )
+    .unwrap();
     for extra in [1usize, 2, 100] {
         let mut long = f.clone();
         long.extend(std::iter::repeat_n(0, extra));
