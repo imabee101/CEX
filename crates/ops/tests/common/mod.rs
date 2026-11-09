@@ -35,7 +35,12 @@ pub struct Env {
 
 pub async fn env() -> Env {
     let db = TestDatabase::create().await;
-    let meta = PgMetaStore::new(db.config().clone(), 16).unwrap();
+    let meta = PgMetaStore::new(
+        db.config().clone(),
+        store::PgTls::LoopbackPlaintext,
+        store::PoolLimits::new(16),
+    )
+    .unwrap();
     meta.migrate().await.unwrap();
     Env {
         db,

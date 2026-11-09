@@ -25,6 +25,8 @@ pub enum Code {
     /// `INTERNAL`: a server defect, such as a violated invariant, a failed
     /// task, or a misconfigured backend.
     Internal,
+    /// `RESOURCE_EXHAUSTED`: the server is overloaded; retry after a delay.
+    ResourceExhausted,
     /// `UNAVAILABLE`.
     Unavailable,
     /// `ACL_PENDING`: the requested ACL version has not been backfilled.
@@ -34,7 +36,10 @@ pub enum Code {
 impl Code {
     /// Whether a retry of the same request may succeed.
     pub fn retryable(self) -> bool {
-        matches!(self, Self::Unavailable | Self::AclPending)
+        matches!(
+            self,
+            Self::ResourceExhausted | Self::Unavailable | Self::AclPending
+        )
     }
 }
 
@@ -76,6 +81,7 @@ impl From<StoreError> for OpError {
             StoreError::InvalidArgument(_) => Code::InvalidArgument,
             StoreError::DataLoss(_) => Code::DataLoss,
             StoreError::Unavailable(_) => Code::Unavailable,
+            StoreError::Overloaded { .. } => Code::ResourceExhausted,
             StoreError::Internal(_) => Code::Internal,
         };
         Self::new(code, e.to_string())
@@ -132,6 +138,7 @@ mod tests {
             assert!(!c.retryable(), "{c:?}");
         }
         assert!(Unavailable.retryable());
+        assert!(ResourceExhausted.retryable());
         assert!(AclPending.retryable());
     }
 
@@ -145,5 +152,11 @@ mod tests {
         assert_eq!(code(StoreError::DataLoss("x".into())), Code::DataLoss);
         assert_eq!(code(StoreError::Unavailable("x".into())), Code::Unavailable);
         assert_eq!(code(StoreError::Internal("x".into())), Code::Internal);
+        assert_eq!(
+            code(StoreError::Overloaded {
+                retry_after: std::time::Duration::from_secs(1)
+            }),
+            Code::ResourceExhausted
+        );
     }
 }

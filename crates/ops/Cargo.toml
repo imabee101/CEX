@@ -20,6 +20,7 @@ tokio = { workspace = true, features = ["sync"] }
 zstd = { workspace = true }
 
 [dev-dependencies]
+store = { workspace = true, features = ["testing"] }
 blake3 = { workspace = true }
 # Read only for the Unicode version their data was generated from.
 icu_casemap_data = { workspace = true }

@@ -24,7 +24,12 @@ mod postgres {
         let db = TestDatabase::create().await;
         // One connection per concurrent client, so the database itself sees
         // the full concurrency.
-        let store = PgMetaStore::new(db.config().clone(), CONCURRENCY).unwrap();
+        let store = PgMetaStore::new(
+            db.config().clone(),
+            store::PgTls::LoopbackPlaintext,
+            store::PoolLimits::new(CONCURRENCY),
+        )
+        .unwrap();
         store.migrate().await.unwrap();
         // Migrating again is a no-op.
         store.migrate().await.unwrap();

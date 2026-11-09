@@ -51,6 +51,7 @@ jsonwebtoken = { version = "11.1.0", default-features = false }
 moka = { version = "0.12.16", default-features = false }
 object_store = { version = "0.14.2", default-features = false }
 tokio-postgres = { version = "0.7.18", default-features = false }
+tokio-postgres-rustls = { version = "0.14.0", default-features = false }
 gix = { version = "0.90.0", default-features = false }
 notify = { version = "8.2.1", default-features = false }
 ignore = { version = "0.4.34" }

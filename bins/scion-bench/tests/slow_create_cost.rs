@@ -13,7 +13,10 @@ use bytes::Bytes;
 use derived::{CacheSizes, Deriver};
 use ops::blob::upload_blobs;
 use ops::{CreateOptions, Ops};
-use scion_bench::{BENCH, BenchParams, FileSpec, REPO, cached_repo, layout};
+mod common;
+
+use common::cached_repo;
+use scion_bench::{BENCH_TIP, BenchParams, FileSpec, REPO, layout};
 use scion_core::{BlobId, Changeset, ChangesetParts, FileChange, FileKind, RepoPath, Timestamp};
 use store::fault::{Counts, FaultBlobStore, FaultMetaStore, Faults};
 use store::testing::{OverlayBlobStore, TestDatabase, named_object_store, object_store};
@@ -56,7 +59,14 @@ async fn measure(p: &BenchParams) -> Vec<Cost> {
     let repo = cached_repo(p).await;
     let files = pick(&layout(p));
     let db = TestDatabase::create_from(&repo.template).await;
-    let meta = Arc::new(PgMetaStore::new(db.config().clone(), 16).unwrap());
+    let meta = Arc::new(
+        PgMetaStore::new(
+            db.config().clone(),
+            store::PgTls::LoopbackPlaintext,
+            store::PoolLimits::new(16),
+        )
+        .unwrap(),
+    );
     let blobs = Arc::new(OverlayBlobStore::new(
         ObjectBlobStore::new(Arc::new(named_object_store(&repo.prefix))),
         ObjectBlobStore::new(Arc::new(object_store())),
@@ -125,10 +135,10 @@ fn median(mut v: Vec<f64>) -> f64 {
 async fn slow_create_cost_is_independent_of_repo_size() {
     let small_params = BenchParams {
         files: 10_000,
-        ..BENCH
+        ..BENCH_TIP
     };
     let small = measure(&small_params).await;
-    let big = measure(&BENCH).await;
+    let big = measure(&BENCH_TIP).await;
     let metrics: [Metric; 6] = [
         ("wall time (ms)", |c| c.time.as_secs_f64() * 1000.0),
         ("metadata reads", |c| c.counts.meta_gets as f64),

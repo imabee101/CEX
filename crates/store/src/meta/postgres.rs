@@ -2,13 +2,12 @@
 //! Postgres wire protocol.
 
 use std::collections::HashSet;
-use std::ops::{Deref, DerefMut};
-use std::sync::Mutex;
 
 use bytes::Bytes;
 use scion_core::{BlobId, ChangesetId, TreeId};
-use tokio::sync::{Semaphore, SemaphorePermit};
-use tokio_postgres::{Client, Config, NoTls, Row};
+use tokio_postgres::{Config, Row};
+
+use super::pg_pool::{PgTls, Pool, PoolLimits, with_conn};
 
 use super::{
     CasOutcome, DerivedKey, MetaKey, MetaStore, RefLogEntry, RefLogReason, RefState, RefUpdate,
@@ -16,9 +15,13 @@ use super::{
 };
 use crate::{PutOutcome, RepoId, StoreError};
 
-/// The schema. Every statement is idempotent, so applying it again is a
-/// no-op. Every key includes `repo`.
-const SCHEMA: &str = "
+/// The schema version [`PgMetaStore::migrate`] brings a database to.
+pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
+
+/// The schema migrations, in order; migration `i` brings the schema to
+/// version `i + 1`. A migration, once released, never changes: a change to
+/// the schema is a new migration. Every key includes `repo`.
+const MIGRATIONS: &[&str] = &["
 CREATE TABLE IF NOT EXISTS changesets (
     repo INT8 NOT NULL,
     id BYTEA NOT NULL CHECK (length(id) = 32),
@@ -70,48 +73,120 @@ CREATE TABLE IF NOT EXISTS ref_log (
     reason TEXT NOT NULL,
     PRIMARY KEY (repo, name, seq)
 );
-";
+"];
 
 /// A [`MetaStore`] in Postgres, or CockroachDB through the Postgres wire
 /// protocol, with a bounded connection pool.
+///
+/// Every transaction runs at `READ COMMITTED`, set explicitly. CockroachDB
+/// may run it at `SERIALIZABLE` instead; a serialization failure is then
+/// reported as retryable.
 #[derive(Debug)]
 pub struct PgMetaStore {
     pool: Pool,
 }
 
 impl PgMetaStore {
-    /// Creates a store that opens at most `max_connections` connections.
-    pub fn new(config: Config, max_connections: usize) -> Result<Self, StoreError> {
-        if max_connections == 0 {
-            return Err(StoreError::invalid("max_connections is 0"));
-        }
+    /// Creates a store that connects with `config`, secured by `tls`, within
+    /// `limits`.
+    pub fn new(config: Config, tls: PgTls, limits: PoolLimits) -> Result<Self, StoreError> {
         Ok(Self {
-            pool: Pool {
-                config,
-                permits: Semaphore::new(max_connections),
-                idle: Mutex::new(Vec::new()),
-            },
+            pool: Pool::new(config, tls, limits)?,
         })
     }
 
-    /// Creates the schema if it does not exist. Run once per database before
-    /// serving.
+    /// Brings the schema up to date by applying the migrations it lacks, in
+    /// one transaction. Concurrent calls, from any number of servers, are
+    /// serialized by a row lock, so each migration is applied exactly once.
+    /// Fails if the database's schema is newer than this code knows.
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        let mut conn = self.pool.get().await?;
-        let tx = conn.transaction().await.map_err(pg)?;
-        tx.batch_execute(SCHEMA).await.map_err(pg)?;
-        tx.commit().await.map_err(pg)
+        // Creating the version table races with other servers doing the
+        // same; Postgres reports the loser as a duplicate, which is success.
+        let (conn, ()) = with_conn!(&self.pool, |c| async {
+            match c
+                .batch_execute(
+                    "CREATE TABLE IF NOT EXISTS schema_version (version INT8 PRIMARY KEY)",
+                )
+                .await
+            {
+                Err(e) if is_duplicate_object(&e) => Ok(()),
+                other => other,
+            }
+        });
+        drop(conn);
+        let conn = self.pool.begin().await?;
+        // Row 0 is the lock every migrator takes, so only one applies
+        // migrations at a time.
+        conn.execute(
+            "INSERT INTO schema_version VALUES (0) ON CONFLICT DO NOTHING",
+            &[],
+        )
+        .await
+        .map_err(pg)?;
+        conn.execute(
+            "SELECT version FROM schema_version WHERE version = 0 FOR UPDATE",
+            &[],
+        )
+        .await
+        .map_err(pg)?;
+        let current: i64 = conn
+            .query_one("SELECT max(version) FROM schema_version", &[])
+            .await
+            .map_err(pg)?
+            .get(0);
+        let known = MIGRATIONS.len() as i64;
+        if current > known {
+            return Err(StoreError::Internal(format!(
+                "the database schema is at version {current}, newer than this server's {known}"
+            )));
+        }
+        for (i, migration) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+            conn.batch_execute(migration).await.map_err(pg)?;
+            conn.execute("INSERT INTO schema_version VALUES ($1)", &[&(i as i64 + 1)])
+                .await
+                .map_err(pg)?;
+        }
+        conn.commit().await
     }
 }
 
-fn pg(e: tokio_postgres::Error) -> StoreError {
+/// Whether `e` reports that an object being created already exists, the
+/// outcome of racing `CREATE ... IF NOT EXISTS` statements.
+fn is_duplicate_object(e: &tokio_postgres::Error) -> bool {
+    use tokio_postgres::error::SqlState;
+    e.code().is_some_and(|c| {
+        *c == SqlState::UNIQUE_VIOLATION
+            || *c == SqlState::DUPLICATE_TABLE
+            || *c == SqlState::DUPLICATE_OBJECT
+    })
+}
+
+/// Classifies a Postgres error by what a retry can fix.
+///
+/// Connection failures, serialization failures and deadlocks, a server out
+/// of resources or shutting down, and cancelled statements (the statement
+/// timeout) are retryable. Everything else the server reports (bad data,
+/// constraint violations, undefined objects, permissions, program limits)
+/// means this code or its configuration is wrong, and a retry cannot help.
+/// An error with no SQLSTATE comes from the connection, not the server.
+pub(crate) fn pg(e: tokio_postgres::Error) -> StoreError {
     // The top-level message of a server error is just "db error"; keep the
     // server's message and code.
-    match e.as_db_error() {
-        Some(db) => {
-            StoreError::Unavailable(format!("postgres: {} ({})", db.message(), db.code().code()))
-        }
-        None => StoreError::Unavailable(format!("postgres: {e}")),
+    let Some(db) = e.as_db_error() else {
+        return StoreError::Unavailable(format!("postgres: {e}"));
+    };
+    let code = db.code().code();
+    let message = format!("postgres: {} ({code})", db.message());
+    let retryable = code.starts_with("08")
+        || code.starts_with("53")
+        || matches!(
+            code,
+            "40001" | "40P01" | "57014" | "57P01" | "57P02" | "57P03" | "57P05"
+        );
+    if retryable {
+        StoreError::Unavailable(message)
+    } else {
+        StoreError::Internal(message)
     }
 }
 
@@ -191,14 +266,13 @@ impl MetaStore for PgMetaStore {
         }
         let repo_p = repo_param(repo);
         let mut created = HashSet::new();
-        let mut conn = self.pool.get().await?;
-        let tx = conn.transaction().await.map_err(pg)?;
+        let conn = self.pool.begin().await?;
         for (table, (ids, values)) in by_table.iter().enumerate() {
             if ids.is_empty() {
                 continue;
             }
             let (name, make) = ID_TABLES[table];
-            for row in tx
+            for row in conn
                 .query(
                     &format!(
                         "INSERT INTO {name} (repo, id, bytes) \
@@ -214,7 +288,7 @@ impl MetaStore for PgMetaStore {
             }
         }
         if !d_kinds.is_empty() {
-            for row in tx
+            for row in conn
                 .query(
                     "INSERT INTO derived (repo, kind, version, param, changeset, bytes) \
                      SELECT $1, k, v, p, c, b \
@@ -236,7 +310,7 @@ impl MetaStore for PgMetaStore {
                 created.insert(MetaKey::Derived(derived_key(&row)?));
             }
         }
-        tx.commit().await.map_err(pg)?;
+        conn.commit().await?;
         Ok(entries
             .iter()
             .map(|(key, _)| {
@@ -273,58 +347,63 @@ impl MetaStore for PgMetaStore {
             }
         }
         let repo_p = repo_param(repo);
-        let mut found = std::collections::HashMap::new();
-        let conn = self.pool.get().await?;
-        for (table, ids) in by_table.iter().enumerate() {
-            if ids.is_empty() {
-                continue;
+        let (_conn, (id_rows, derived_rows)) = with_conn!(&self.pool, |c| async {
+            let mut id_rows = Vec::new();
+            for (table, ids) in by_table.iter().enumerate() {
+                if ids.is_empty() {
+                    continue;
+                }
+                let name = ID_TABLES[table].0;
+                let rows = c
+                    .query(
+                        &format!("SELECT id, bytes FROM {name} WHERE repo = $1 AND id = ANY($2)"),
+                        &[&repo_p, ids],
+                    )
+                    .await?;
+                id_rows.push((table, rows));
             }
-            let (name, make) = ID_TABLES[table];
-            for row in conn
-                .query(
-                    &format!("SELECT id, bytes FROM {name} WHERE repo = $1 AND id = ANY($2)"),
-                    &[&repo_p, ids],
-                )
-                .await
-                .map_err(pg)?
-            {
+            let derived_rows = if d_kinds.is_empty() {
+                Vec::new()
+            } else {
+                c.query(
+                        "SELECT d.kind, d.version, d.param, d.changeset, d.bytes FROM derived d \
+                         JOIN UNNEST($2::int4[], $3::int4[], $4::int8[], $5::bytea[]) AS t(k, v, p, c) \
+                         ON d.kind = t.k AND d.version = t.v AND d.param = t.p AND d.changeset = t.c \
+                         WHERE d.repo = $1",
+                        &[&repo_p, &d_kinds, &d_versions, &d_params, &d_changesets],
+                    )
+                    .await?
+            };
+            Ok::<_, tokio_postgres::Error>((id_rows, derived_rows))
+        });
+        let mut found = std::collections::HashMap::new();
+        for (table, rows) in id_rows {
+            let make = ID_TABLES[table].1;
+            for row in rows {
                 found.insert(
                     make(id_bytes(row.get(0))?),
                     Bytes::from(row.get::<_, Vec<u8>>(1)),
                 );
             }
         }
-        if !d_kinds.is_empty() {
-            for row in conn
-                .query(
-                    "SELECT d.kind, d.version, d.param, d.changeset, d.bytes FROM derived d \
-                     JOIN UNNEST($2::int4[], $3::int4[], $4::int8[], $5::bytea[]) AS t(k, v, p, c) \
-                     ON d.kind = t.k AND d.version = t.v AND d.param = t.p AND d.changeset = t.c \
-                     WHERE d.repo = $1",
-                    &[&repo_p, &d_kinds, &d_versions, &d_params, &d_changesets],
-                )
-                .await
-                .map_err(pg)?
-            {
-                found.insert(
-                    MetaKey::Derived(derived_key(&row)?),
-                    Bytes::from(row.get::<_, Vec<u8>>(4)),
-                );
-            }
+        for row in derived_rows {
+            found.insert(
+                MetaKey::Derived(derived_key(&row)?),
+                Bytes::from(row.get::<_, Vec<u8>>(4)),
+            );
         }
         Ok(keys.iter().map(|k| found.get(k).cloned()).collect())
     }
 
     async fn get_ref(&self, repo: RepoId, name: &str) -> Result<Option<RefState>, StoreError> {
         check_name("ref name", name)?;
-        let conn = self.pool.get().await?;
-        let row = conn
-            .query_opt(
+        let (_conn, row) = with_conn!(&self.pool, |c| async {
+            c.query_opt(
                 "SELECT name, target, seq FROM refs WHERE repo = $1 AND name = $2",
                 &[&repo_param(repo), &name.as_bytes()],
             )
             .await
-            .map_err(pg)?;
+        });
         row.map(|r| ref_state(r.get(0), r.get(1), r.get(2)))
             .transpose()
     }
@@ -344,9 +423,8 @@ impl MetaStore for PgMetaStore {
         let end = prefix_end(prefix.as_bytes());
         let after = after.map(str::as_bytes);
         let limit = i64::try_from(limit).map_err(|_| StoreError::invalid("limit overflows"))?;
-        let conn = self.pool.get().await?;
-        let rows = conn
-            .query(
+        let (_conn, rows) = with_conn!(&self.pool, |c| async {
+            c.query(
                 "SELECT name, target, seq FROM refs \
                  WHERE repo = $1 AND name >= $2 \
                  AND ($3::bytea IS NULL OR name < $3) \
@@ -361,7 +439,7 @@ impl MetaStore for PgMetaStore {
                 ],
             )
             .await
-            .map_err(pg)?;
+        });
         rows.iter()
             .map(|r| ref_state(r.get(0), r.get(1), r.get(2)))
             .collect()
@@ -376,8 +454,7 @@ impl MetaStore for PgMetaStore {
         let repo_p = repo_param(repo);
         let name = update.name.as_bytes();
         let new = update.new.as_bytes().as_slice();
-        let mut conn = self.pool.get().await?;
-        let tx = conn.transaction().await.map_err(pg)?;
+        let tx = self.pool.begin().await?;
         // Lock the row, so the comparison and the write see the same state.
         let current = tx
             .query_opt(
@@ -451,7 +528,7 @@ impl MetaStore for PgMetaStore {
         )
         .await
         .map_err(pg)?;
-        tx.commit().await.map_err(pg)?;
+        tx.commit().await?;
         Ok(CasOutcome::Updated {
             seq: seq_from(seq)?,
         })
@@ -471,15 +548,14 @@ impl MetaStore for PgMetaStore {
             return Ok(Vec::new());
         };
         let limit = i64::try_from(limit).map_err(|_| StoreError::invalid("limit overflows"))?;
-        let conn = self.pool.get().await?;
-        let rows = conn
-            .query(
+        let (_conn, rows) = with_conn!(&self.pool, |c| async {
+            c.query(
                 "SELECT seq, old, new, actor, time_micros, reason FROM ref_log \
                  WHERE repo = $1 AND name = $2 AND seq > $3 ORDER BY seq LIMIT $4",
                 &[&repo_param(repo), &name.as_bytes(), &after, &limit],
             )
             .await
-            .map_err(pg)?;
+        });
         rows.iter()
             .map(|r| {
                 Ok(RefLogEntry {
@@ -536,78 +612,5 @@ fn id_key(key: &MetaKey) -> Option<(usize, &[u8])> {
         MetaKey::Tree(id) => Some((2, id.as_bytes())),
         MetaKey::CaseNode(id) => Some((3, id.as_bytes())),
         MetaKey::Derived(_) => None,
-    }
-}
-
-/// A bounded pool: at most `permits` connections exist at once.
-#[derive(Debug)]
-struct Pool {
-    config: Config,
-    permits: Semaphore,
-    idle: Mutex<Vec<Client>>,
-}
-
-impl Pool {
-    async fn get(&self) -> Result<Conn<'_>, StoreError> {
-        let permit = self
-            .permits
-            .acquire()
-            .await
-            .map_err(|_| StoreError::Unavailable("connection pool closed".into()))?;
-        let reused = loop {
-            let next = self
-                .idle
-                .lock()
-                .map_err(|_| StoreError::Unavailable("connection pool lock poisoned".into()))?
-                .pop();
-            match next {
-                Some(c) if c.is_closed() => continue,
-                other => break other,
-            }
-        };
-        let client = match reused {
-            Some(c) => c,
-            None => {
-                let (client, connection) = self.config.connect(NoTls).await.map_err(pg)?;
-                tokio::spawn(connection);
-                client
-            }
-        };
-        Ok(Conn {
-            client: Some(client),
-            pool: self,
-            _permit: permit,
-        })
-    }
-}
-
-/// A pooled connection, returned to the pool when dropped unless it closed.
-struct Conn<'a> {
-    client: Option<Client>,
-    pool: &'a Pool,
-    _permit: SemaphorePermit<'a>,
-}
-
-impl Deref for Conn<'_> {
-    type Target = Client;
-    fn deref(&self) -> &Client {
-        self.client.as_ref().expect("present until drop")
-    }
-}
-
-impl DerefMut for Conn<'_> {
-    fn deref_mut(&mut self) -> &mut Client {
-        self.client.as_mut().expect("present until drop")
-    }
-}
-
-impl Drop for Conn<'_> {
-    fn drop(&mut self) {
-        if let Some(client) = self.client.take()
-            && !client.is_closed()
-            && let Ok(mut idle) = self.pool.idle.lock()
-        {
-            idle.push(client);
-        }
     }
 }

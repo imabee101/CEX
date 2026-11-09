@@ -1,7 +1,9 @@
 //! The metadata database: changesets, trees, derived values, refs, and the
 //! ref log.
 
+#[cfg(feature = "testing")]
 mod memory;
+mod pg_pool;
 mod postgres;
 
 use std::future::Future;
@@ -11,8 +13,10 @@ use scion_core::{BlobId, ChangesetId, TreeId};
 
 use crate::{PutOutcome, RepoId, StoreError};
 
+#[cfg(feature = "testing")]
 pub use memory::MemoryMetaStore;
-pub use postgres::PgMetaStore;
+pub use pg_pool::{PgTls, PoolLimits};
+pub use postgres::{PgMetaStore, SCHEMA_VERSION};
 
 /// The longest ref name, ref-name prefix, or actor a store accepts, in bytes.
 pub const MAX_NAME_BYTES: usize = 1024;

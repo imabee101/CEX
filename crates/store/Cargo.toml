@@ -12,9 +12,18 @@ object_store = { workspace = true, features = ["aws", "fs"] }
 scion-core = { workspace = true }
 thiserror = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
+rustls = { workspace = true, features = ["ring", "std"] }
 tokio-postgres = { workspace = true, features = ["runtime"] }
+tokio-postgres-rustls = { workspace = true, features = ["ring"] }
+tracing = { workspace = true }
+
+[features]
+# Test-only code: in-memory backends, the conformance suite, fault injection,
+# and dev-environment isolation. Enabled only by dev-dependencies.
+testing = []
 
 [dev-dependencies]
+store = { path = ".", features = ["testing"] }
 blake3 = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

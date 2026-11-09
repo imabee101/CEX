@@ -401,8 +401,8 @@ xtask/               project tooling, run with `cargo xtask`
 - A public crate never uses an exact (`=`) version requirement.
 - Every crate is licensed MIT OR Apache-2.0. `cargo deny` allows only MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-2-Clause, BSD-3-Clause, ISC, MIT-0, Zlib, CC0-1.0, Unlicense, Unicode-3.0, NCSA, and CDLA-Permissive-2.0.
 - Heavy optional functionality in public crates sits behind cargo features, off by default.
-- Public crates use rustls with the ring crypto provider (tonic `tls-ring`). jsonwebtoken uses its `aws_lc_rs` backend.
-**Dependencies:** tokio, tonic, prost, tonic-prost-build, protox, tower, bytes, blake3, sha2, zstd, thiserror, tracing, serde, toml, rustls, ring, jsonwebtoken, moka, object_store, tokio-postgres, gix, notify, ignore, icu_normalizer (`=2.4`, internal crates only), icu_casemap (`=2.4`, internal crates only), icu_normalizer_data and icu_casemap_data (`=2.4`, internal crates only, tests read their Unicode version), imara-diff, fuser, nfsserve, windows (`Win32_Storage_ProjectedFileSystem`), clap, proptest, arbitrary, libfuzzer-sys, turmoil, criterion.
+- Public crates use rustls with the ring crypto provider (tonic `tls-ring`). jsonwebtoken uses its `aws_lc_rs` backend. Because dependencies may bring a second rustls provider, every binary installs ring as rustls's process-default provider at startup, and every rustls configuration names its provider.
+**Dependencies:** tokio, tonic, prost, tonic-prost-build, protox, tower, bytes, blake3, sha2, zstd, thiserror, tracing, serde, toml, rustls, ring, jsonwebtoken, moka, object_store, tokio-postgres, tokio-postgres-rustls, gix, notify, ignore, icu_normalizer (`=2.4`, internal crates only), icu_casemap (`=2.4`, internal crates only), icu_normalizer_data and icu_casemap_data (`=2.4`, internal crates only, tests read their Unicode version), imara-diff, fuser, nfsserve, windows (`Win32_Storage_ProjectedFileSystem`), clap, proptest, arbitrary, libfuzzer-sys, turmoil, criterion.
 **Tools:** cargo-fuzz, cargo-nextest, cargo-deny, cargo-semver-checks, sccache, buf, git, Docker Compose.
 </workspace>
 

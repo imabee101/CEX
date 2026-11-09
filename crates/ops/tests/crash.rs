@@ -200,6 +200,7 @@ fn written(faults: &Faults) -> BTreeSet<Key> {
             Write::Blob(k) => {
                 out.insert(Key::Object(k));
             }
+            Write::Ref(name) => panic!("creating a changeset wrote the ref {name} (INV-2)"),
         }
     }
     out

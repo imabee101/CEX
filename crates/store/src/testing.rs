@@ -107,6 +107,15 @@ impl TestDatabase {
         &self.config
     }
 
+    /// A Postgres connection URL for this database.
+    pub fn url(&self) -> String {
+        format!(
+            "{}/{}",
+            setting("SCION_TEST_PG_URL", DEFAULT_PG_URL).trim_end_matches('/'),
+            self.name
+        )
+    }
+
     /// Opens a connection, driven by a task on the current Tokio runtime.
     pub async fn connect(&self) -> tokio_postgres::Client {
         connect(&self.config).await
@@ -139,6 +148,27 @@ impl Drop for TestDatabase {
                 .expect("dropping the test database failed");
         }
     }
+}
+
+/// The dev environment's S3 settings, as the `AWS_*` environment variables a
+/// child process reads, plus the endpoint and bucket.
+pub fn s3_env() -> (String, String, Vec<(&'static str, String)>) {
+    (
+        setting("SCION_TEST_S3_ENDPOINT", DEFAULT_S3_ENDPOINT),
+        setting("SCION_TEST_S3_BUCKET", DEFAULT_S3_BUCKET),
+        vec![
+            (
+                "AWS_ACCESS_KEY_ID",
+                setting("SCION_TEST_S3_ACCESS_KEY", DEFAULT_S3_ACCESS_KEY),
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY",
+                setting("SCION_TEST_S3_SECRET_KEY", DEFAULT_S3_SECRET_KEY),
+            ),
+            ("AWS_REGION", "us-east-1".to_owned()),
+            ("AWS_ALLOW_HTTP", "true".to_owned()),
+        ],
+    )
 }
 
 /// Returns an object store confined to a key prefix no other test uses, in the

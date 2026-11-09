@@ -93,51 +93,10 @@ pub trait BlobStore: Send + Sync + 'static {
     ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 }
 
-/// A [`BlobStore`] held in process memory. For tests only.
-#[derive(Debug, Default)]
-pub struct MemoryBlobStore {
-    objects: Mutex<Objects>,
-}
-
-type Objects = HashMap<(RepoId, ObjectKey), Bytes>;
-
-impl MemoryBlobStore {
-    /// Creates an empty store.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Objects>, StoreError> {
-        self.objects
-            .lock()
-            .map_err(|_| StoreError::Internal("in-memory store lock poisoned".into()))
-    }
-}
-
-impl BlobStore for MemoryBlobStore {
-    async fn put_if_absent(
-        &self,
-        repo: RepoId,
-        key: ObjectKey,
-        bytes: Bytes,
-    ) -> Result<PutOutcome, StoreError> {
-        Ok(match self.lock()?.entry((repo, key)) {
-            std::collections::hash_map::Entry::Occupied(_) => PutOutcome::Existed,
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(bytes);
-                PutOutcome::Created
-            }
-        })
-    }
-
-    async fn get(&self, repo: RepoId, key: ObjectKey) -> Result<Option<Bytes>, StoreError> {
-        Ok(self.lock()?.get(&(repo, key)).cloned())
-    }
-
-    async fn contains(&self, repo: RepoId, key: ObjectKey) -> Result<bool, StoreError> {
-        Ok(self.lock()?.contains_key(&(repo, key)))
-    }
-}
+#[cfg(feature = "testing")]
+mod memory;
+#[cfg(feature = "testing")]
+pub use memory::MemoryBlobStore;
 
 /// How many times [`ObjectBlobStore::put_if_absent`] tries a write before it
 /// reports the store unavailable.

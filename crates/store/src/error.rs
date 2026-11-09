@@ -13,6 +13,12 @@ pub enum StoreError {
     /// Stored data is missing or does not have the expected shape.
     #[error("stored data is corrupt: {0}")]
     DataLoss(String),
+    /// The backend is overloaded; retry after `retry_after`.
+    #[error("storage overloaded; retry after {retry_after:?}")]
+    Overloaded {
+        /// How long to wait before retrying.
+        retry_after: std::time::Duration,
+    },
     /// The backend failed in a way a retry cannot fix: it is misconfigured,
     /// rejected the request permanently, or broke an internal invariant.
     #[error("storage failed permanently: {0}")]

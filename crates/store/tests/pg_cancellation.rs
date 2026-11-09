@@ -67,9 +67,19 @@ fn batch(round: u64) -> Vec<(MetaKey, Bytes)> {
 async fn an_abandoned_put_applies_its_whole_batch_or_none_of_it() {
     let db = TestDatabase::create().await;
     // One connection, so every call reuses the one an abandoned call held.
-    let store = PgMetaStore::new(db.config().clone(), 1).unwrap();
+    let store = PgMetaStore::new(
+        db.config().clone(),
+        store::PgTls::LoopbackPlaintext,
+        store::PoolLimits::new(1),
+    )
+    .unwrap();
     store.migrate().await.unwrap();
-    let observer = PgMetaStore::new(db.config().clone(), 1).unwrap();
+    let observer = PgMetaStore::new(
+        db.config().clone(),
+        store::PgTls::LoopbackPlaintext,
+        store::PoolLimits::new(1),
+    )
+    .unwrap();
     let repo = RepoId(1);
     let (mut none, mut all) = (0, 0);
     for (round, delay) in delays().enumerate() {
@@ -111,9 +121,19 @@ async fn an_abandoned_put_applies_its_whole_batch_or_none_of_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_abandoned_cas_moves_the_ref_exactly_when_it_writes_its_ref_log_row() {
     let db = TestDatabase::create().await;
-    let store = PgMetaStore::new(db.config().clone(), 1).unwrap();
+    let store = PgMetaStore::new(
+        db.config().clone(),
+        store::PgTls::LoopbackPlaintext,
+        store::PoolLimits::new(1),
+    )
+    .unwrap();
     store.migrate().await.unwrap();
-    let observer = PgMetaStore::new(db.config().clone(), 1).unwrap();
+    let observer = PgMetaStore::new(
+        db.config().clone(),
+        store::PgTls::LoopbackPlaintext,
+        store::PoolLimits::new(1),
+    )
+    .unwrap();
     let repo = RepoId(1);
     let target = |n: u64| ChangesetId::hash(&n.to_le_bytes());
     let mut current = None;

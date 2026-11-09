@@ -4,8 +4,6 @@
 use crate::DeriveError;
 use crate::codec::{Reader, put_uvarint};
 
-const RECORD_VERSION: u8 = 2;
-
 /// What the metadata database knows about a stored blob.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BlobRecord {
@@ -21,9 +19,12 @@ pub struct BlobRecord {
 }
 
 impl BlobRecord {
+    /// The version byte that starts every record's encoding.
+    pub const VERSION: u8 = 2;
+
     /// The record's stored bytes.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![RECORD_VERSION];
+        let mut out = vec![Self::VERSION];
         put_uvarint(&mut out, self.size);
         out.extend_from_slice(&self.sha256);
         match &self.git_sha1 {
@@ -45,7 +46,7 @@ impl BlobRecord {
     pub fn decode(bytes: &[u8]) -> Result<Self, DeriveError> {
         let mut r = Reader::new(bytes, "blob record");
         let version = r.u8()?;
-        if version != 1 && version != RECORD_VERSION {
+        if version != 1 && version != Self::VERSION {
             return Err(DeriveError::DataLoss("unknown blob record version".into()));
         }
         let size = r.uvarint()?;
