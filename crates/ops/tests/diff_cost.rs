@@ -385,3 +385,51 @@ async fn a_path_filter_reads_only_the_nodes_it_names() {
     assert_eq!(files[0].path, b"gen-12345");
     assert!(keys <= 16, "the filter read {keys} keys");
 }
+
+#[tokio::test]
+async fn a_filtered_page_after_a_cursor_reads_only_what_follows_it() {
+    let e = env().await;
+    let (old, new) = siblings_fixture(&e).await;
+    let filters: Vec<_> = (0..2_000)
+        .map(|i| path(&format!("gen-{:05}", i * 10)))
+        .collect();
+    let all = diff_paged(
+        &ops(&e.meta, &e.blobs),
+        old,
+        new,
+        DiffMode::Names,
+        &filters,
+        1000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(all.len(), 2_000);
+    // Forged cursors anywhere give exactly the filtered entries after them.
+    for after in [
+        "gen-00000",
+        "gen-09995",
+        "gen-10000",
+        "gen-19990",
+        "gen-5",
+        "gen",
+    ] {
+        let (files, _) = page_keys(&e, old, new, &filters, Some(after)).await;
+        let want: Vec<&[u8]> = all
+            .iter()
+            .map(|f| f.path.as_slice())
+            .filter(|p| *p > after.as_bytes())
+            .take(100)
+            .collect();
+        assert_eq!(
+            files.iter().map(|f| f.path.as_slice()).collect::<Vec<_>>(),
+            want,
+            "{after}"
+        );
+    }
+    let (_, first) = page_keys(&e, old, new, &filters, None).await;
+    let (_, late) = page_keys(&e, old, new, &filters, Some("gen-19000")).await;
+    assert!(
+        late < first,
+        "a late page read {late} keys, the first {first}"
+    );
+}

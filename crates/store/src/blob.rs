@@ -250,8 +250,9 @@ struct KeyLocks {
 }
 
 /// Holds one key's write lock, and forgets the key when no one else waits.
-/// A turn drops its own reference to the lock under the table's lock, so the
-/// count the last turn sees there is exact.
+/// A turn drops its guard first, then its own reference to the lock under the
+/// table's lock: every reference still alive when a turn checks the count
+/// belongs to a turn that checks later, so the last check sees exactly one.
 struct KeyTurn<'a> {
     locks: &'a KeyLocks,
     key: (RepoId, ObjectKey),

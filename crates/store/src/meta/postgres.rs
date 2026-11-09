@@ -697,3 +697,43 @@ mod classification_tests {
         assert!(matches!(pg(e), StoreError::Unavailable(_)));
     }
 }
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    use crate::testing::TestDatabase;
+
+    #[tokio::test]
+    async fn a_failed_rollback_closes_the_connection_and_the_pool_recovers() {
+        let db = TestDatabase::create().await;
+        let pool = Pool::new(
+            db.config().clone(),
+            PgTls::LoopbackPlaintext,
+            PoolLimits::new(1),
+        )
+        .unwrap();
+        let tx = pool.begin().await.unwrap();
+        let pid: i32 = tx
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        db.connect()
+            .await
+            .query_one("SELECT pg_terminate_backend($1, 10000)", &[&pid])
+            .await
+            .unwrap();
+        // The rollback fails on the dead connection; release reports nothing,
+        // because the outcome it releases is already known.
+        release(tx).await;
+        // The dead connection was not returned: the next one works and is
+        // not inside a transaction.
+        let conn = pool.checkout().await.unwrap();
+        let other: i32 = conn
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_ne!(other, pid);
+    }
+}

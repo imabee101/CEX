@@ -478,6 +478,8 @@ impl Dir {
                 .collect();
             names.sort();
             names.dedup();
+            // Like the stream, skip the names wholly before the resume point.
+            names.retain(|n| !Pairs::before_from(from.as_deref(), n));
             Pairs::only(work, a, b, &names).await?
         };
         Ok(Self {
