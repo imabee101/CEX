@@ -1990,6 +1990,7 @@ dependencies = [
  "store",
  "tokio",
  "tokio-postgres",
+ "zstd",
 ]
 
 [[package]]

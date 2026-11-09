@@ -1,24 +1,19 @@
 //! The bench generator end to end on Postgres and the object store, at a
 //! small size: the tip holds exactly the layout's files with their seeded
 //! contents, built as a chain of `files_per_changeset` changesets; the
-//! cached repo is reused, not rebuilt; and `scion-bench gen` reports it.
+//! cached repo is reused, not rebuilt; `scion-bench gen` reports it; and
+//! the cache that every bench test shares names and evicts repos correctly.
 
 use std::sync::Arc;
 
 use derived::{CacheSizes, DerivedType, Deriver, RootTree};
 mod common;
 
-use common::cached_repo;
+use common::{SMALL, SMALL_GEN, cached_repo};
 use scion_bench::{BENCH_TIP, BenchParams, REPO, content, generate, layout};
 use scion_core::{BlobId, EntryTarget, FileKind, RepoPath};
 use store::testing::{TestDatabase, base_config, object_store};
 use store::{BlobStore, MetaStore, ObjectBlobStore, PgMetaStore};
-
-const SMALL: BenchParams = BenchParams {
-    files: 250,
-    files_per_changeset: 100,
-    ..BENCH_TIP
-};
 
 /// The tip of `SMALL` for `GENERATOR_VERSION` 2.
 const SMALL_TIP: &str = "eaf9830712e2343c5264065184f19e3c5c6f84383a21b80bf0fd5287ce8f612f";
@@ -87,12 +82,10 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
         )
         .await
         .unwrap();
-    assert!(
-        rows[0].is_some(),
-        "cache was not upgraded to private index storage"
-    );
-    // Older caches may retain their v1 public nodes, but current consumers
-    // must have the new private namespace available before creating.
+    // The tip's case index is stored in its private namespace, never as a
+    // tree, which any reader could fetch.
+    assert!(rows[0].is_some(), "the case index's root node is stored");
+    assert!(rows[1].is_none(), "the case index is not stored as a tree");
     assert_eq!(
         meta.get_ref(REPO, "main").await.unwrap().unwrap().target,
         repo.tip
@@ -181,11 +174,7 @@ async fn a_small_bench_repo_holds_its_layout_and_is_reused() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let full = cached_repo(&BenchParams {
-        files: 250,
-        ..BENCH_TIP
-    })
-    .await;
+    let full = cached_repo(&SMALL_GEN).await;
     assert_eq!(
         String::from_utf8(out.stdout).unwrap().trim(),
         full.tip.to_string()
@@ -291,4 +280,103 @@ async fn uploads_run_a_bounded_distance_ahead_of_creates() {
         }
     }
     assert_eq!(creates, 150);
+}
+
+#[test]
+fn keys_tell_parameter_sets_apart() {
+    use common::{FIXTURES, key};
+    assert_eq!(key(&BENCH_TIP), key(&BENCH_TIP));
+    let keys: std::collections::HashSet<String> = [
+        BENCH_TIP,
+        BenchParams {
+            files: 10_000,
+            ..BENCH_TIP
+        },
+        BenchParams {
+            seed: 1,
+            ..BENCH_TIP
+        },
+        BenchParams {
+            max_depth: 11,
+            ..BENCH_TIP
+        },
+        BenchParams {
+            max_size: 1,
+            ..BENCH_TIP
+        },
+    ]
+    .into_iter()
+    .chain(FIXTURES)
+    .map(|p| key(&p))
+    .collect();
+    assert_eq!(keys.len(), 5 + FIXTURES.len());
+}
+
+#[test]
+fn keys_change_with_every_format_input() {
+    use common::{format_inputs, key_for};
+    use ops::CreateOptions;
+    let inputs = format_inputs();
+    let names: std::collections::HashSet<&str> = inputs.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(names.len(), inputs.len(), "input names are distinct");
+    let eager = ops::eager_types::<PgMetaStore, ObjectBlobStore>(&CreateOptions::default());
+    assert_eq!(
+        names
+            .iter()
+            .filter(|k| k.starts_with("derived type "))
+            .count(),
+        eager.len(),
+        "every eager type is an input"
+    );
+    let base = key_for(&BENCH_TIP, &inputs);
+    for i in 0..inputs.len() {
+        let mut changed = inputs.clone();
+        changed[i].1.push('+');
+        assert_ne!(key_for(&BENCH_TIP, &changed), base, "{}", inputs[i].0);
+    }
+}
+
+#[test]
+fn keeps_the_most_recently_used_complete_repos() {
+    use common::to_remove;
+    let uses = |v: &[(&str, Option<u64>)]| {
+        v.iter()
+            .map(|(k, u)| ((*k).to_owned(), *u))
+            .collect::<Vec<_>>()
+    };
+    let mut removed = to_remove(
+        uses(&[
+            ("a", Some(1)),
+            ("b", Some(5)),
+            ("c", None),
+            ("d", Some(3)),
+            ("e", Some(4)),
+        ]),
+        2,
+    );
+    removed.sort();
+    assert_eq!(removed, ["a", "c", "d"]);
+    assert_eq!(to_remove(uses(&[("a", Some(1))]), 3), Vec::<String>::new());
+    assert_eq!(to_remove(uses(&[("a", None)]), 3), ["a"]);
+}
+
+#[test]
+fn bench_names_give_their_key() {
+    use common::key_of;
+    let key = "0123456789abcdef";
+    for name in [
+        format!("bench_{key}"),
+        format!("bench_{key}_build"),
+        format!("bench-{key}"),
+    ] {
+        assert_eq!(key_of(&name), Some(key), "{name}");
+    }
+    for name in [
+        "bench_short",
+        "t_1_2_3_4",
+        "bench-0123456789abcdeg",
+        "bench_0123456789abcdef_x",
+    ] {
+        assert_eq!(key_of(name), None, "{name}");
+    }
 }
