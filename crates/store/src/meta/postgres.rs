@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Mutex;
 
 use bytes::Bytes;
-use scion_core::{ChangesetId, TreeId};
+use scion_core::{BlobId, ChangesetId, TreeId};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio_postgres::{Client, Config, NoTls, Row};
 
@@ -31,13 +31,20 @@ CREATE TABLE IF NOT EXISTS trees (
     bytes BYTEA NOT NULL,
     PRIMARY KEY (repo, id)
 );
+CREATE TABLE IF NOT EXISTS blobs (
+    repo INT8 NOT NULL,
+    id BYTEA NOT NULL CHECK (length(id) = 32),
+    bytes BYTEA NOT NULL,
+    PRIMARY KEY (repo, id)
+);
 CREATE TABLE IF NOT EXISTS derived (
     repo INT8 NOT NULL,
     kind INT4 NOT NULL,
     version INT4 NOT NULL,
+    param INT8 NOT NULL,
     changeset BYTEA NOT NULL CHECK (length(changeset) = 32),
     bytes BYTEA NOT NULL,
-    PRIMARY KEY (repo, kind, version, changeset)
+    PRIMARY KEY (repo, kind, version, param, changeset)
 );
 CREATE TABLE IF NOT EXISTS refs (
     repo INT8 NOT NULL,
@@ -149,10 +156,10 @@ impl MetaStore for PgMetaStore {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
-        let (mut cs_ids, mut cs_bytes) = (Vec::new(), Vec::new());
-        let (mut tree_ids, mut tree_bytes) = (Vec::new(), Vec::new());
-        let (mut d_kinds, mut d_versions, mut d_changesets, mut d_bytes) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // One (ids, bytes) column pair per id-keyed table, in `ID_TABLES` order.
+        let mut by_table: [IdColumns<'_>; ID_TABLES.len()] = Default::default();
+        let (mut d_kinds, mut d_versions, mut d_params, mut d_changesets, mut d_bytes) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         // Insert in key order (MetaKey orders by table, then by key bytes), so
         // concurrent batches over overlapping keys take their index locks in
         // the same order and cannot deadlock.
@@ -160,19 +167,19 @@ impl MetaStore for PgMetaStore {
         sorted.sort_unstable_by_key(|(key, _)| *key);
         for (key, bytes) in sorted {
             match key {
-                MetaKey::Changeset(id) => {
-                    cs_ids.push(id.as_bytes().as_slice());
-                    cs_bytes.push(bytes.as_ref());
-                }
-                MetaKey::Tree(id) => {
-                    tree_ids.push(id.as_bytes().as_slice());
-                    tree_bytes.push(bytes.as_ref());
-                }
                 MetaKey::Derived(d) => {
                     d_kinds.push(i32::from(d.kind));
                     d_versions.push(i32::from(d.version));
+                    d_params.push(d.param as i64);
                     d_changesets.push(d.changeset.as_bytes().as_slice());
                     d_bytes.push(bytes.as_ref());
+                }
+                _ => {
+                    let Some((table, id)) = id_key(key) else {
+                        continue;
+                    };
+                    by_table[table].0.push(id);
+                    by_table[table].1.push(bytes.as_ref());
                 }
             }
         }
@@ -180,44 +187,42 @@ impl MetaStore for PgMetaStore {
         let mut created = HashSet::new();
         let mut conn = self.pool.get().await?;
         let tx = conn.transaction().await.map_err(pg)?;
-        if !cs_ids.is_empty() {
-            for row in tx
-                .query(
-                    "INSERT INTO changesets (repo, id, bytes) \
-                     SELECT $1, i, b FROM UNNEST($2::bytea[], $3::bytea[]) WITH ORDINALITY AS t(i, b, n) \
-                     ORDER BY n ON CONFLICT DO NOTHING RETURNING id",
-                    &[&repo_p, &cs_ids, &cs_bytes],
-                )
-                .await
-                .map_err(pg)?
-            {
-                let id = ChangesetId::from_bytes(id_bytes(row.get(0))?);
-                created.insert(MetaKey::Changeset(id));
+        for (table, (ids, values)) in by_table.iter().enumerate() {
+            if ids.is_empty() {
+                continue;
             }
-        }
-        if !tree_ids.is_empty() {
+            let (name, make) = ID_TABLES[table];
             for row in tx
                 .query(
-                    "INSERT INTO trees (repo, id, bytes) \
-                     SELECT $1, i, b FROM UNNEST($2::bytea[], $3::bytea[]) WITH ORDINALITY AS t(i, b, n) \
-                     ORDER BY n ON CONFLICT DO NOTHING RETURNING id",
-                    &[&repo_p, &tree_ids, &tree_bytes],
+                    &format!(
+                        "INSERT INTO {name} (repo, id, bytes) \
+                         SELECT $1, i, b FROM UNNEST($2::bytea[], $3::bytea[]) WITH ORDINALITY AS t(i, b, n) \
+                         ORDER BY n ON CONFLICT DO NOTHING RETURNING id"
+                    ),
+                    &[&repo_p, ids, values],
                 )
                 .await
                 .map_err(pg)?
             {
-                let id = TreeId::from_bytes(id_bytes(row.get(0))?);
-                created.insert(MetaKey::Tree(id));
+                created.insert(make(id_bytes(row.get(0))?));
             }
         }
         if !d_kinds.is_empty() {
             for row in tx
                 .query(
-                    "INSERT INTO derived (repo, kind, version, changeset, bytes) \
-                     SELECT $1, k, v, c, b \
-                     FROM UNNEST($2::int4[], $3::int4[], $4::bytea[], $5::bytea[]) \
-                     WITH ORDINALITY AS t(k, v, c, b, n) ORDER BY n ON CONFLICT DO NOTHING RETURNING kind, version, changeset",
-                    &[&repo_p, &d_kinds, &d_versions, &d_changesets, &d_bytes],
+                    "INSERT INTO derived (repo, kind, version, param, changeset, bytes) \
+                     SELECT $1, k, v, p, c, b \
+                     FROM UNNEST($2::int4[], $3::int4[], $4::int8[], $5::bytea[], $6::bytea[]) \
+                     WITH ORDINALITY AS t(k, v, p, c, b, n) ORDER BY n ON CONFLICT DO NOTHING \
+                     RETURNING kind, version, param, changeset",
+                    &[
+                        &repo_p,
+                        &d_kinds,
+                        &d_versions,
+                        &d_params,
+                        &d_changesets,
+                        &d_bytes,
+                    ],
                 )
                 .await
                 .map_err(pg)?
@@ -242,66 +247,62 @@ impl MetaStore for PgMetaStore {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let (mut cs_ids, mut tree_ids) = (Vec::new(), Vec::new());
-        let (mut d_kinds, mut d_versions, mut d_changesets) = (Vec::new(), Vec::new(), Vec::new());
+        let mut by_table: [Vec<&[u8]>; ID_TABLES.len()] = Default::default();
+        let (mut d_kinds, mut d_versions, mut d_params, mut d_changesets) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for key in keys {
             match key {
-                MetaKey::Changeset(id) => cs_ids.push(id.as_bytes().as_slice()),
-                MetaKey::Tree(id) => tree_ids.push(id.as_bytes().as_slice()),
                 MetaKey::Derived(d) => {
                     d_kinds.push(i32::from(d.kind));
                     d_versions.push(i32::from(d.version));
+                    d_params.push(d.param as i64);
                     d_changesets.push(d.changeset.as_bytes().as_slice());
+                }
+                _ => {
+                    let Some((table, id)) = id_key(key) else {
+                        continue;
+                    };
+                    by_table[table].push(id);
                 }
             }
         }
         let repo_p = repo_param(repo);
         let mut found = std::collections::HashMap::new();
         let conn = self.pool.get().await?;
-        if !cs_ids.is_empty() {
+        for (table, ids) in by_table.iter().enumerate() {
+            if ids.is_empty() {
+                continue;
+            }
+            let (name, make) = ID_TABLES[table];
             for row in conn
                 .query(
-                    "SELECT id, bytes FROM changesets WHERE repo = $1 AND id = ANY($2)",
-                    &[&repo_p, &cs_ids],
+                    &format!("SELECT id, bytes FROM {name} WHERE repo = $1 AND id = ANY($2)"),
+                    &[&repo_p, ids],
                 )
                 .await
                 .map_err(pg)?
             {
-                let id = ChangesetId::from_bytes(id_bytes(row.get(0))?);
                 found.insert(
-                    MetaKey::Changeset(id),
+                    make(id_bytes(row.get(0))?),
                     Bytes::from(row.get::<_, Vec<u8>>(1)),
                 );
-            }
-        }
-        if !tree_ids.is_empty() {
-            for row in conn
-                .query(
-                    "SELECT id, bytes FROM trees WHERE repo = $1 AND id = ANY($2)",
-                    &[&repo_p, &tree_ids],
-                )
-                .await
-                .map_err(pg)?
-            {
-                let id = TreeId::from_bytes(id_bytes(row.get(0))?);
-                found.insert(MetaKey::Tree(id), Bytes::from(row.get::<_, Vec<u8>>(1)));
             }
         }
         if !d_kinds.is_empty() {
             for row in conn
                 .query(
-                    "SELECT d.kind, d.version, d.changeset, d.bytes FROM derived d \
-                     JOIN UNNEST($2::int4[], $3::int4[], $4::bytea[]) AS t(k, v, c) \
-                     ON d.kind = t.k AND d.version = t.v AND d.changeset = t.c \
+                    "SELECT d.kind, d.version, d.param, d.changeset, d.bytes FROM derived d \
+                     JOIN UNNEST($2::int4[], $3::int4[], $4::int8[], $5::bytea[]) AS t(k, v, p, c) \
+                     ON d.kind = t.k AND d.version = t.v AND d.param = t.p AND d.changeset = t.c \
                      WHERE d.repo = $1",
-                    &[&repo_p, &d_kinds, &d_versions, &d_changesets],
+                    &[&repo_p, &d_kinds, &d_versions, &d_params, &d_changesets],
                 )
                 .await
                 .map_err(pg)?
             {
                 found.insert(
                     MetaKey::Derived(derived_key(&row)?),
-                    Bytes::from(row.get::<_, Vec<u8>>(3)),
+                    Bytes::from(row.get::<_, Vec<u8>>(4)),
                 );
             }
         }
@@ -498,8 +499,36 @@ fn derived_key(row: &Row) -> Result<DerivedKey, StoreError> {
     Ok(DerivedKey {
         kind: narrow(row.get(0))?,
         version: narrow(row.get(1))?,
-        changeset: ChangesetId::from_bytes(id_bytes(row.get(2))?),
+        // Bit-preserving, as written.
+        param: row.get::<_, i64>(2) as u64,
+        changeset: ChangesetId::from_bytes(id_bytes(row.get(3))?),
     })
+}
+
+/// The id and bytes columns bound for one id-keyed table.
+type IdColumns<'a> = (Vec<&'a [u8]>, Vec<&'a [u8]>);
+
+/// Makes the key for a row id of one id-keyed table.
+type IdToKey = fn([u8; 32]) -> MetaKey;
+
+/// The tables keyed by `(repo, id)`, with the key each row id makes.
+const ID_TABLES: [(&str, IdToKey); 3] = [
+    ("blobs", |id| MetaKey::Blob(BlobId::from_bytes(id))),
+    ("changesets", |id| {
+        MetaKey::Changeset(ChangesetId::from_bytes(id))
+    }),
+    ("trees", |id| MetaKey::Tree(TreeId::from_bytes(id))),
+];
+
+/// The index into [`ID_TABLES`] and the id bytes of a key, or `None` for
+/// [`MetaKey::Derived`], which has its own table.
+fn id_key(key: &MetaKey) -> Option<(usize, &[u8])> {
+    match key {
+        MetaKey::Blob(id) => Some((0, id.as_bytes())),
+        MetaKey::Changeset(id) => Some((1, id.as_bytes())),
+        MetaKey::Tree(id) => Some((2, id.as_bytes())),
+        MetaKey::Derived(_) => None,
+    }
 }
 
 /// A bounded pool: at most `permits` connections exist at once.

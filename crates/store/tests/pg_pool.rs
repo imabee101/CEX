@@ -44,20 +44,16 @@ async fn calls_succeed_after_the_server_closes_pooled_connections() {
     let observer = db.connect().await;
     let old = backends(&observer, &db).await;
     assert_eq!(old.len(), 1);
-    observer
-        .execute("SELECT pg_terminate_backend($1)", &[&old[0]])
+    // With a timeout, the server blocks until the backend has exited (one
+    // call, no polling); the pooled client notices the closed socket shortly
+    // after.
+    let terminated: bool = observer
+        .query_one("SELECT pg_terminate_backend($1, 10000)", &[&old[0]])
         .await
-        .unwrap();
-    // Wait until the server has dropped it; the pooled client notices the
-    // closed socket shortly after.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !backends(&observer, &db).await.is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "backend not terminated"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        .unwrap()
+        .get(0);
+    assert!(terminated, "backend not terminated");
+    assert!(backends(&observer, &db).await.is_empty());
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(store.get_ref(RepoId(1), "main").await.unwrap(), None);
     let new = backends(&observer, &db).await;

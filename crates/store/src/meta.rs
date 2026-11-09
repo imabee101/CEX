@@ -7,7 +7,7 @@ mod postgres;
 use std::future::Future;
 
 use bytes::Bytes;
-use scion_core::{ChangesetId, TreeId};
+use scion_core::{BlobId, ChangesetId, TreeId};
 
 use crate::{PutOutcome, RepoId, StoreError};
 
@@ -20,13 +20,17 @@ pub const MAX_NAME_BYTES: usize = 1024;
 /// The most rows one `list_refs` or `ref_log` call returns.
 pub(crate) const MAX_PAGE: usize = 1000;
 
-/// The key of a derived value: `(type, version, changeset)`.
+/// The key of a derived value: `(type, version, param, changeset)`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct DerivedKey {
     /// The derived-data type's code.
     pub kind: u16,
     /// The type's format version; each version is its own key space.
     pub version: u16,
+    /// An extra key component for types keyed by more than the changeset,
+    /// such as an ACL config version; 0 for every other type. Each value is
+    /// its own key space.
+    pub param: u64,
     /// The changeset the value belongs to.
     pub changeset: ChangesetId,
 }
@@ -34,6 +38,9 @@ pub struct DerivedKey {
 /// The key of an immutable metadata record.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum MetaKey {
+    /// A blob's record: its size, SHA-256, and, when imported, git SHA-1.
+    /// Written only after the blob's frames are in blob storage.
+    Blob(BlobId),
     /// A changeset's canonical bytes.
     Changeset(ChangesetId),
     /// A tree node's canonical bytes.
