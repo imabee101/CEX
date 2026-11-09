@@ -111,11 +111,13 @@ type Pair = (Vec<u8>, Option<EntryTarget>, Option<EntryTarget>);
 /// lazily: a shard is expanded only when the merge reaches it, and an entry
 /// or shard whose names all sort before `from` (and none of which is a
 /// prefix of it) is dropped unread. Memory is bounded by the nodes on the
-/// two frontiers.
+/// two frontiers. When a path filter names only some of the directory's
+/// entries, those are looked up directly instead (`only`).
 struct Pairs {
     a: VecDeque<TreeEntry>,
     b: VecDeque<TreeEntry>,
     from: Option<Vec<u8>>,
+    only: Option<VecDeque<Pair>>,
 }
 
 impl Pairs {
@@ -133,7 +135,50 @@ impl Pairs {
         };
         let a = side(a).await?;
         let b = side(b).await?;
-        Ok(Self { a, b, from })
+        Ok(Self {
+            a,
+            b,
+            from,
+            only: None,
+        })
+    }
+
+    /// The pairs for exactly `names` (sorted), looked up in both directories
+    /// in one batched read per level of shards.
+    async fn only<M: MetaStore>(
+        work: &mut TreeWork<'_, M>,
+        a: Option<TreeId>,
+        b: Option<TreeId>,
+        names: &[Vec<u8>],
+    ) -> Result<Self, DeriveError> {
+        let mut queries: Vec<(TreeId, &[u8])> = Vec::new();
+        for name in names {
+            queries.extend(a.map(|a| (a, name.as_slice())));
+            queries.extend(b.map(|b| (b, name.as_slice())));
+        }
+        let mut found = work.lookup_many(&queries).await?.into_iter();
+        let mut pairs = VecDeque::new();
+        for name in names {
+            let ea = if a.is_some() {
+                found.next().flatten()
+            } else {
+                None
+            };
+            let eb = if b.is_some() {
+                found.next().flatten()
+            } else {
+                None
+            };
+            if ea != eb {
+                pairs.push_back((name.clone(), ea, eb));
+            }
+        }
+        Ok(Self {
+            a: VecDeque::new(),
+            b: VecDeque::new(),
+            from: None,
+            only: Some(pairs),
+        })
     }
 
     /// Whether every name an entry stands for (for a shard, every name with
@@ -147,6 +192,9 @@ impl Pairs {
         work: &mut TreeWork<'_, M>,
     ) -> Result<Option<Pair>, DeriveError> {
         use std::cmp::Ordering;
+        if let Some(only) = &mut self.only {
+            return Ok(only.pop_front());
+        }
         let from = self.from.as_deref();
         loop {
             for side in [&mut self.a, &mut self.b] {
@@ -396,19 +444,44 @@ impl Dir {
         a: Option<TreeId>,
         b: Option<TreeId>,
         after: Option<&[u8]>,
+        paths: &[RepoPath],
     ) -> Result<Self, DeriveError> {
-        // Where to resume within this directory: the component of `after`
-        // just below it.
-        let from = after.map(|after| {
-            let rel = if path.is_empty() {
-                after
+        let below = |p: &[u8]| -> Option<Vec<u8>> {
+            if path.is_empty() {
+                Some(p.to_vec())
             } else {
-                &after[path.len() + 1..]
-            };
-            rel.split(|&b| b == b'/').next().unwrap_or(rel).to_vec()
-        });
+                p.strip_prefix(path.as_slice())?
+                    .strip_prefix(b"/")
+                    .map(<[u8]>::to_vec)
+            }
+        };
+        // Where to resume within this directory: entries sorting before the
+        // bound hold no path after `after`. When `after` lies below entry `c`,
+        // the bound is `c/`, so siblings between `c` and `c/` (such as `c-1`)
+        // are skipped too; when `after` is entry `c` itself, the bound is `c`.
+        let from = after
+            .and_then(below)
+            .map(|rel| match rel.iter().position(|&b| b == b'/') {
+                Some(i) => rel[..=i].to_vec(),
+                None => rel,
+            });
+        // A filter below this directory, when no filter covers it whole,
+        // names the only entries to look at.
+        let covered = paths.is_empty() || paths.iter().any(|f| under(&path, f.as_bytes()));
+        let pairs = if covered {
+            Pairs::new(work, a, b, from).await?
+        } else {
+            let mut names: Vec<Vec<u8>> = paths
+                .iter()
+                .filter_map(|f| below(f.as_bytes()))
+                .map(|rel| rel.split(|&b| b == b'/').next().unwrap_or(&rel).to_vec())
+                .collect();
+            names.sort();
+            names.dedup();
+            Pairs::only(work, a, b, &names).await?
+        };
         Ok(Self {
-            pairs: Pairs::new(work, a, b, from).await?,
+            pairs,
             path,
             held: BinaryHeap::new(),
             done: false,
@@ -490,7 +563,8 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         // One frame per directory being walked.
         let mut stack: Vec<Dir> = Vec::new();
         if ra != rb {
-            stack.push(Dir::new(&mut cx.trees, Vec::new(), Some(ra), Some(rb), after).await?);
+            stack
+                .push(Dir::new(&mut cx.trees, Vec::new(), Some(ra), Some(rb), after, paths).await?);
         }
         // Walk until one file past the page, which proves there is a next
         // page.
@@ -520,7 +594,7 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
                     Resume::Partly => after,
                     Resume::None => continue,
                 };
-                stack.push(Dir::new(&mut cx.trees, item.path, da, db, within).await?);
+                stack.push(Dir::new(&mut cx.trees, item.path, da, db, within, paths).await?);
             }
         }
         let next = if files.len() > limit {

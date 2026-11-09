@@ -161,6 +161,23 @@ fn is_duplicate_object(e: &tokio_postgres::Error) -> bool {
     })
 }
 
+/// Whether a server error with SQLSTATE `code` may succeed on retry:
+/// connection exceptions (08), insufficient resources (53), serialization
+/// failures, CockroachDB's ambiguous result, deadlocks, cancelled statements
+/// (the statement timeout), and a server shutting down or starting.
+fn retryable_sqlstate(code: &str) -> bool {
+    code.starts_with("08")
+        || code.starts_with("53")
+        // 40003 is CockroachDB's ambiguous result: the statement may or may
+        // not have committed. A retried ref CAS that had committed reports a
+        // mismatch whose current target is its own; its caller must treat
+        // that as success.
+        || matches!(
+            code,
+            "40001" | "40003" | "40P01" | "57014" | "57P01" | "57P02" | "57P03" | "57P05"
+        )
+}
+
 /// Classifies a Postgres error by what a retry can fix.
 ///
 /// Connection failures, serialization failures, ambiguous results, and
@@ -184,19 +201,19 @@ pub(crate) fn pg(e: tokio_postgres::Error) -> StoreError {
     };
     let code = db.code().code();
     let message = format!("postgres: {} ({code})", db.message());
-    let retryable = code.starts_with("08")
-        || code.starts_with("53")
-        // 40003 is CockroachDB's ambiguous result: the statement may or may
-        // not have committed. Retrying is safe because writes are
-        // insert-if-absent or guarded by idempotency keys.
-        || matches!(
-            code,
-            "40001" | "40003" | "40P01" | "57014" | "57P01" | "57P02" | "57P03" | "57P05"
-        );
-    if retryable {
+    if retryable_sqlstate(code) {
         StoreError::Unavailable(message)
     } else {
         StoreError::Internal(message)
+    }
+}
+
+/// Rolls back a transaction whose outcome is already known. If the rollback
+/// fails, the connection is closed (it is still marked as in a transaction),
+/// which rolls back too, so the known outcome stands.
+async fn release(tx: super::pg_pool::Conn<'_>) {
+    if let Err(e) = tx.rollback().await {
+        tracing::warn!(error = %e, "rolling back failed; the connection is closed instead");
     }
 }
 
@@ -477,7 +494,7 @@ impl MetaStore for PgMetaStore {
             .transpose()?;
         if current.as_ref().map(|c| c.target) != update.expected {
             // Release the row lock and keep the connection for the pool.
-            tx.rollback().await?;
+            release(tx).await;
             return Ok(CasOutcome::Mismatch { current });
         }
         let seq = match current {
@@ -513,7 +530,7 @@ impl MetaStore for PgMetaStore {
                             .await
                             .map_err(pg)?;
                         let current = ref_state(current.get(0), current.get(1), current.get(2))?;
-                        tx.rollback().await?;
+                        release(tx).await;
                         return Ok(CasOutcome::Mismatch {
                             current: Some(current),
                         });
@@ -622,5 +639,61 @@ fn id_key(key: &MetaKey) -> Option<(usize, &[u8])> {
         MetaKey::Tree(id) => Some((2, id.as_bytes())),
         MetaKey::CaseNode(id) => Some((3, id.as_bytes())),
         MetaKey::Derived(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+    use crate::meta::pg_pool::died_idle;
+    use crate::testing::TestDatabase;
+
+    #[test]
+    fn sqlstates_are_retryable_only_when_a_retry_can_succeed() {
+        for code in [
+            "08006", "08001", "53300", "53200", "40001", "40003", "40P01", "57014", "57P01",
+            "57P02", "57P03", "57P05",
+        ] {
+            assert!(retryable_sqlstate(code), "{code}");
+        }
+        for code in [
+            "23505", "23514", "22001", "42P01", "42501", "54000", "28P01", "XX000",
+        ] {
+            assert!(!retryable_sqlstate(code), "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_side_error_is_internal_and_never_replayed() {
+        let db = TestDatabase::create().await;
+        let client = db.connect().await;
+        // A text value for an integer parameter fails to encode, client side,
+        // with no SQLSTATE.
+        let e = client
+            .query("SELECT $1::int4", &[&"not a number"])
+            .await
+            .unwrap_err();
+        assert!(e.code().is_none());
+        assert!(!died_idle(&e));
+        assert!(matches!(pg(e), StoreError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn a_dead_connection_is_retryable_and_replayable() {
+        let db = TestDatabase::create().await;
+        let client = db.connect().await;
+        let pid: i32 = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        db.connect()
+            .await
+            .query_one("SELECT pg_terminate_backend($1, 10000)", &[&pid])
+            .await
+            .unwrap();
+        let e = client.query("SELECT 1", &[]).await.unwrap_err();
+        assert!(died_idle(&e), "{e:?}");
+        assert!(matches!(pg(e), StoreError::Unavailable(_)));
     }
 }

@@ -250,10 +250,12 @@ struct KeyLocks {
 }
 
 /// Holds one key's write lock, and forgets the key when no one else waits.
+/// A turn drops its own reference to the lock under the table's lock, so the
+/// count the last turn sees there is exact.
 struct KeyTurn<'a> {
     locks: &'a KeyLocks,
     key: (RepoId, ObjectKey),
-    lock: KeyLock,
+    lock: Option<KeyLock>,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
@@ -271,10 +273,11 @@ impl KeyLocks {
         let mut turn = KeyTurn {
             locks: self,
             key,
-            lock,
+            lock: Some(lock),
             guard: None,
         };
-        turn.guard = Some(turn.lock.clone().lock_owned().await);
+        let lock = turn.lock.clone().expect("set above, taken only on drop");
+        turn.guard = Some(lock.lock_owned().await);
         Ok(turn)
     }
 }
@@ -283,9 +286,13 @@ impl Drop for KeyTurn<'_> {
     fn drop(&mut self) {
         drop(self.guard.take());
         if let Ok(mut locks) = self.locks.locks.lock() {
-            // The table and this turn hold the only references: nobody else
-            // is writing or waiting for this key.
-            if Arc::strong_count(&self.lock) == 2 {
+            drop(self.lock.take());
+            // Only the table's reference is left: nobody is writing or
+            // waiting for this key.
+            if locks
+                .get(&self.key)
+                .is_some_and(|l| Arc::strong_count(l) == 1)
+            {
                 locks.remove(&self.key);
             }
         }
@@ -409,5 +416,36 @@ mod key_lock_tests {
         assert!(waited.is_err(), "the key was held");
         drop(first);
         assert!(locks.locks.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod key_lock_race_tests {
+    use super::*;
+
+    /// Many writers of one key on many threads, finishing together, leave
+    /// no entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn turns_finishing_together_leave_no_entry() {
+        let locks = Arc::new(KeyLocks::default());
+        for round in 0..2000u32 {
+            let key = (
+                RepoId(1),
+                ObjectKey::blob(BlobId::hash(&(round % 4).to_le_bytes())),
+            );
+            let gate = Arc::new(tokio::sync::Barrier::new(8));
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let (locks, gate) = (locks.clone(), gate.clone());
+                tasks.spawn(async move {
+                    gate.wait().await;
+                    drop(locks.turn(key).await.unwrap());
+                });
+            }
+            while let Some(r) = tasks.join_next().await {
+                r.unwrap();
+            }
+            assert!(locks.locks.lock().unwrap().is_empty(), "round {round}");
+        }
     }
 }

@@ -303,3 +303,85 @@ async fn every_page_of_a_wide_directory_reads_only_the_nodes_on_its_path() {
         assert!(keys <= 16, "the {what} page read {keys} keys");
     }
 }
+
+/// Keys read by one Names-mode diff page on a cold server.
+async fn page_keys(
+    e: &Env,
+    a: scion_core::ChangesetId,
+    b: scion_core::ChangesetId,
+    paths: &[scion_core::RepoPath],
+    after: Option<&str>,
+) -> (Vec<ops::FileDiff>, u64) {
+    let faults = Faults::new();
+    let meta = Arc::new(FaultMetaStore::new(e.meta.clone(), faults.clone()));
+    let blobs = Arc::new(FaultBlobStore::new(e.blobs.clone(), faults.clone()));
+    let after = after.map(|a| ops::DiffCursor::from_bytes(a.as_bytes()).unwrap());
+    let got = ops(&meta, &blobs)
+        .diff(
+            REPO,
+            a,
+            b,
+            &ops::DiffOptions {
+                mode: DiffMode::Names,
+                paths,
+                after: after.as_ref(),
+                limit: 100,
+            },
+        )
+        .await
+        .unwrap();
+    (got.files, faults.counts().meta_get_keys)
+}
+
+/// 20,000 changed files named `gen-NNNNN` beside a changed directory `gen/`:
+/// in path order they all come before `gen/`'s contents.
+async fn siblings_fixture(e: &Env) -> (scion_core::ChangesetId, scion_core::ChangesetId) {
+    let plain = ops(&e.meta, &e.blobs);
+    let files = |content: &[u8]| -> Vec<_> {
+        (0..20_000)
+            .map(|i| (path(&format!("gen-{i:05}")), write(content)))
+            .chain((0..300).map(|i| (path(&format!("gen/f{i:03}")), write(content))))
+            .collect()
+    };
+    let old = commit(
+        &plain,
+        &[],
+        "old",
+        files(b"old\n"),
+        &[Bytes::from_static(b"old\n")],
+    )
+    .await
+    .unwrap();
+    let new = commit(
+        &plain,
+        &[old],
+        "new",
+        files(b"new\n"),
+        &[Bytes::from_static(b"new\n")],
+    )
+    .await
+    .unwrap();
+    (old, new)
+}
+
+#[tokio::test]
+async fn resuming_inside_a_directory_skips_the_siblings_sorting_before_it() {
+    let e = env().await;
+    let (old, new) = siblings_fixture(&e).await;
+    let (files, keys) = page_keys(&e, old, new, &[], Some("gen/f100")).await;
+    assert_eq!(files[0].path, b"gen/f101");
+    assert_eq!(files.len(), 100);
+    // The root and `gen/` on both sides, and the RootTree values; walking
+    // the 20,000 siblings would read their shards (more than 40 keys).
+    assert!(keys <= 16, "resuming read {keys} keys");
+}
+
+#[tokio::test]
+async fn a_path_filter_reads_only_the_nodes_it_names() {
+    let e = env().await;
+    let (old, new) = siblings_fixture(&e).await;
+    let (files, keys) = page_keys(&e, old, new, &[path("gen-12345")], None).await;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, b"gen-12345");
+    assert!(keys <= 16, "the filter read {keys} keys");
+}

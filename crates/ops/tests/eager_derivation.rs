@@ -343,3 +343,58 @@ async fn filling_in_an_existing_changeset_never_case_checks_its_history() {
     let index = ops::case::CaseIndex::default().key(imported.id());
     assert!(e.meta.get(REPO, &[MetaKey::Derived(index)]).await.unwrap()[0].is_some());
 }
+
+#[tokio::test]
+async fn creating_a_child_never_case_checks_its_history() {
+    let e = env().await;
+    let plain = ops(&e.meta, &e.blobs);
+    upload(&plain, b"r\n").await;
+    // An exempt imported changeset with names that conflict by case, stored
+    // with no derived values, as after a CaseIndex version bump.
+    let mut parts = changeset(
+        &[],
+        "imported",
+        vec![
+            (path("README"), write(b"r\n")),
+            (path("readme"), write(b"r\n")),
+        ],
+    )
+    .into_parts();
+    parts.git_headers = Some(b"author x 0 +0000\n\nimported".to_vec());
+    let imported = scion_core::Changeset::new(parts).unwrap();
+    e.meta
+        .put(
+            REPO,
+            &[(
+                MetaKey::Changeset(imported.id()),
+                Bytes::from(imported.encode()),
+            )],
+        )
+        .await
+        .unwrap();
+    // A new child that touches neither name is created, with the check on.
+    upload(&plain, b"n\n").await;
+    plain
+        .create_changeset(
+            REPO,
+            changeset(
+                &[imported.id()],
+                "child",
+                vec![(path("new"), write(b"n\n"))],
+            ),
+            &CreateOptions::default(),
+        )
+        .await
+        .unwrap();
+    // The check still applies to the new changeset itself.
+    let conflicting = changeset(
+        &[imported.id()],
+        "conflict",
+        vec![(path("NEW"), write(b"n\n")), (path("new"), write(b"n\n"))],
+    );
+    let err = plain
+        .create_changeset(REPO, conflicting, &CreateOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Code::CaseConflict);
+}

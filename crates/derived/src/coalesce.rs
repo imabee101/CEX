@@ -28,11 +28,13 @@ impl<K, V> std::fmt::Debug for Coalescer<K, V> {
     }
 }
 
-/// One caller's hold on a key's entry.
+/// One caller's hold on a key's entry. References to an entry are cloned
+/// and dropped only under the table's lock, so the count the last holder
+/// sees there is exact.
 struct Hold<'a, K: Eq + Hash + Clone, V> {
     table: &'a Coalescer<K, V>,
     key: K,
-    cell: Arc<OnceCell<V>>,
+    cell: Option<Arc<OnceCell<V>>>,
 }
 
 impl<K: Eq + Hash + Clone, V> Drop for Hold<'_, K, V> {
@@ -42,12 +44,12 @@ impl<K: Eq + Hash + Clone, V> Drop for Hold<'_, K, V> {
             .cells
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // The table and this hold are the only references: no other caller
-        // is computing or waiting.
+        drop(self.cell.take());
+        // Only the table's reference is left: no caller is computing or
+        // waiting.
         if cells
             .get(&self.key)
-            .is_some_and(|c| Arc::ptr_eq(c, &self.cell))
-            && Arc::strong_count(&self.cell) == 2
+            .is_some_and(|c| Arc::strong_count(c) == 1)
         {
             cells.remove(&self.key);
         }
@@ -62,19 +64,21 @@ impl<K: Eq + Hash + Clone, V: Clone> Coalescer<K, V> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V, E>>,
     {
-        let cell = self
-            .cells
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key.clone())
-            .or_default()
-            .clone();
-        let hold = Hold {
+        let mut hold = Hold {
             table: self,
-            key,
-            cell,
+            key: key.clone(),
+            cell: None,
         };
-        hold.cell.get_or_try_init(compute).await.cloned()
+        hold.cell = Some(
+            self.cells
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key)
+                .or_default()
+                .clone(),
+        );
+        let cell = hold.cell.as_ref().expect("set above, taken only on drop");
+        cell.get_or_try_init(compute).await.cloned()
     }
 
     /// How many keys are in flight.
@@ -124,5 +128,33 @@ mod tests {
         // A failed computation leaves nothing behind either.
         assert_eq!(table.run(2, || async { Err::<u32, _>(()) }).await, Err(()));
         assert_eq!(table.in_flight(), 0);
+    }
+}
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+
+    /// Many callers on many threads, finishing together, leave no entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn callers_finishing_together_leave_nothing_behind() {
+        let table: Arc<Coalescer<u8, u32>> = Arc::new(Coalescer::default());
+        for round in 0..5000u32 {
+            let gate = Arc::new(tokio::sync::Barrier::new(16));
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..16 {
+                let (table, gate) = (table.clone(), gate.clone());
+                tasks.spawn(async move {
+                    gate.wait().await;
+                    table
+                        .run((round % 4) as u8, || async { Ok::<_, ()>(7) })
+                        .await
+                });
+            }
+            while let Some(r) = tasks.join_next().await {
+                assert_eq!(r.unwrap(), Ok(7));
+            }
+            assert_eq!(table.in_flight(), 0, "round {round}");
+        }
     }
 }

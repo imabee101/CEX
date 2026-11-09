@@ -204,12 +204,16 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
                 format!("parent changeset {p}"),
             ));
         }
-        let eager = eager_types::<M, B>(opts);
         // Bring every type's parent values up to date first, each within its
         // own per-request bound, so one request makes progress on all of them
-        // and a retry continues every type from where it stopped.
+        // and a retry continues every type from where it stopped. Ancestors
+        // are never case-checked: only the changeset being created is.
+        let unchecked = CreateOptions {
+            case_check: false,
+            ..opts.clone()
+        };
         let mut pending = None;
-        for t in &eager {
+        for t in &eager_types::<M, B>(&unchecked) {
             if !t.reads_parents() {
                 continue;
             }
@@ -225,7 +229,7 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
             return Err(e.into());
         }
         let mut cx = self.deriver.cx(repo);
-        for t in &eager {
+        for t in &eager_types::<M, B>(opts) {
             let value = t.derive_any(&mut cx, id, cs).await?;
             cx.set_value(t.key(id), value);
         }
