@@ -457,7 +457,10 @@ fn a_one_step_search_fits_a_budget_of_one() {
 
 /// Each call is stamped as its request is issued, with no wait in between:
 /// on one thread, ordering the history by call stamp orders it by the
-/// moment the store received each request.
+/// moment the store received each request. And every client's first request
+/// is outstanding together even for a store that answers at once: the
+/// overlap the conformance check relies on comes from the recorder, so it is
+/// checked here.
 #[tokio::test(flavor = "current_thread")]
 async fn record_stamps_each_call_as_its_request_is_issued() {
     let issued = Arc::new(std::sync::atomic::AtomicU64::new(0));
