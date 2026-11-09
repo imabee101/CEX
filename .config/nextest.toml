@@ -3,18 +3,24 @@
 # excludes the slow group, and a test outside it is terminated, and fails, after
 # 30 s. The full tier (`cargo xtask ci-full`) runs everything.
 #
-# No concurrency limit is set for tests that use the dev environment: every test
-# gets its own database and key prefix, and nextest's default of one test per CPU
-# stays far below the Postgres connection limit in compose.yaml. The one
-# exception is the `wide` group below.
+# Tests that use the dev environment run in parallel: each has its own database
+# and key prefix. Their Postgres connections must stay below max_connections
+# (1,000) in compose.yaml. A test opens at most 17 (a 16-connection pool and
+# one admin connection), except the `wide` group, which opens about 65 each.
+# With at most 32 tests at once and at most 4 of them wide, the worst case is
+# 4 × 65 + 28 × 17 = 736 connections.
 
 [test-groups]
-slow = { max-threads = "num-cpus" }
+# Slow tests build large fixtures (up to the 3M-file bench repo); four at once
+# fit in a 16 GB CI runner.
+slow = { max-threads = 4 }
 # Tests that open one Postgres connection per client at 64-way concurrency;
 # four at a time stay well below the connection limit in compose.yaml.
 wide = { max-threads = 4 }
 
 [profile.default]
+# The connection budget above assumes at most 32 tests at once.
+test-threads = 32
 default-filter = "not test(/(^|::)slow_/)"
 retries = 0
 fail-fast = true

@@ -21,14 +21,18 @@ services:
       - -c
       - full_page_writes=off
       - -c
-      - max_connections=500
+      - max_connections=1000
+    # Bounded, so a leak fails loudly instead of consuming host memory. The
+    # largest database, the cached bench repo, is about 2 GB.
     tmpfs:
-      - /var/lib/postgresql
+      - /var/lib/postgresql:size=12g
     ports:
       - 127.0.0.1:55432:5432
     healthcheck:
       # TCP probe: during initialization the server listens on the socket only.
-      test: ["CMD", "pg_isready", "--host=127.0.0.1", "--username=scion", "--dbname=scion_template"]
+      # It connects to `postgres`, never to the template: a session on the
+      # template makes `CREATE DATABASE ... TEMPLATE` fail.
+      test: ["CMD", "pg_isready", "--host=127.0.0.1", "--username=scion", "--dbname=postgres"]
       interval: 5s
       timeout: 3s
       retries: 10
