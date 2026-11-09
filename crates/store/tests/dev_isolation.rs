@@ -71,3 +71,72 @@ async fn object_store_supports_put_if_absent() {
     let stored = store.get(&key).await.unwrap().bytes().await.unwrap();
     assert_eq!(&stored[..], b"first");
 }
+
+#[tokio::test]
+async fn sweeping_removes_only_what_exited_test_processes_left() {
+    use object_store::ObjectStoreExt;
+    // Names a test helper would make for a process that has exited (Linux
+    // pids stay below 2^22) and for this running process.
+    let dead = format!("t_{}_1_{}", u32::MAX, std::process::id());
+    let live = format!("t_{}_1_999999", std::process::id());
+    let mut admin = store::testing::base_config();
+    admin.dbname("postgres");
+    let (client, connection) = admin.connect(tokio_postgres::NoTls).await.unwrap();
+    tokio::spawn(connection);
+    for name in [&dead, &live] {
+        client
+            .batch_execute(&format!("CREATE DATABASE \"{name}\""))
+            .await
+            .unwrap();
+        store::testing::named_object_store(name)
+            .put(&"r/b/k".into(), b"x".to_vec().into())
+            .await
+            .unwrap();
+    }
+
+    // Only these two names are considered, so the test does not depend on
+    // whatever else the dev environment holds.
+    let swept = store::testing::sweep_orphans_among(|n| n == dead || n == live)
+        .await
+        .unwrap();
+    assert_eq!(
+        swept,
+        store::testing::Swept {
+            databases: 1,
+            prefixes: 1,
+            objects: 1
+        }
+    );
+
+    let exists = |name: String| {
+        let client = &client;
+        async move {
+            client
+                .query_one(
+                    "SELECT count(*) FROM pg_database WHERE datname = $1",
+                    &[&name],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+                == 1
+        }
+    };
+    assert!(!exists(dead.clone()).await);
+    assert!(exists(live.clone()).await);
+    let has_object = |name: &str| {
+        let store = store::testing::named_object_store(name);
+        async move { store.head(&"r/b/k".into()).await.is_ok() }
+    };
+    assert!(!has_object(&dead).await);
+    assert!(has_object(&live).await);
+
+    client
+        .batch_execute(&format!("DROP DATABASE \"{live}\""))
+        .await
+        .unwrap();
+    store::testing::named_object_store(&live)
+        .delete(&"r/b/k".into())
+        .await
+        .unwrap();
+}
