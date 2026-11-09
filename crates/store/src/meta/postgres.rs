@@ -274,18 +274,15 @@ impl MetaStore for PgMetaStore {
         let mut sorted: Vec<&(MetaKey, Bytes)> = entries.iter().collect();
         sorted.sort_unstable_by_key(|(key, _)| *key);
         for (key, bytes) in sorted {
-            match key {
-                MetaKey::Derived(d) => {
+            match locate(key) {
+                Located::Derived(d) => {
                     d_kinds.push(i32::from(d.kind));
                     d_versions.push(i32::from(d.version));
                     d_params.push(d.param as i64);
                     d_changesets.push(d.changeset.as_bytes().as_slice());
                     d_bytes.push(bytes.as_ref());
                 }
-                _ => {
-                    let Some((table, id)) = id_key(key) else {
-                        continue;
-                    };
+                Located::Id(table, id) => {
                     by_table[table].0.push(id);
                     by_table[table].1.push(bytes.as_ref());
                 }
@@ -358,19 +355,14 @@ impl MetaStore for PgMetaStore {
         let (mut d_kinds, mut d_versions, mut d_params, mut d_changesets) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for key in keys {
-            match key {
-                MetaKey::Derived(d) => {
+            match locate(key) {
+                Located::Derived(d) => {
                     d_kinds.push(i32::from(d.kind));
                     d_versions.push(i32::from(d.version));
                     d_params.push(d.param as i64);
                     d_changesets.push(d.changeset.as_bytes().as_slice());
                 }
-                _ => {
-                    let Some((table, id)) = id_key(key) else {
-                        continue;
-                    };
-                    by_table[table].push(id);
-                }
+                Located::Id(table, id) => by_table[table].push(id),
             }
         }
         let repo_p = repo_param(repo);
@@ -630,15 +622,21 @@ const ID_TABLES: [(&str, IdToKey); 4] = [
     ("case_nodes", |id| MetaKey::CaseNode(TreeId::from_bytes(id))),
 ];
 
-/// The index into [`ID_TABLES`] and the id bytes of a key, or `None` for
-/// [`MetaKey::Derived`], which has its own table.
-fn id_key(key: &MetaKey) -> Option<(usize, &[u8])> {
+/// The table a key's row lives in.
+enum Located<'a> {
+    /// The id-keyed table at this index into [`ID_TABLES`], and the id.
+    Id(usize, &'a [u8]),
+    /// The `derived` table.
+    Derived(&'a DerivedKey),
+}
+
+fn locate(key: &MetaKey) -> Located<'_> {
     match key {
-        MetaKey::Blob(id) => Some((0, id.as_bytes())),
-        MetaKey::Changeset(id) => Some((1, id.as_bytes())),
-        MetaKey::Tree(id) => Some((2, id.as_bytes())),
-        MetaKey::CaseNode(id) => Some((3, id.as_bytes())),
-        MetaKey::Derived(_) => None,
+        MetaKey::Blob(id) => Located::Id(0, id.as_bytes()),
+        MetaKey::Changeset(id) => Located::Id(1, id.as_bytes()),
+        MetaKey::Tree(id) => Located::Id(2, id.as_bytes()),
+        MetaKey::CaseNode(id) => Located::Id(3, id.as_bytes()),
+        MetaKey::Derived(d) => Located::Derived(d),
     }
 }
 
