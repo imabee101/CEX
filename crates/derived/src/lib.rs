@@ -11,6 +11,7 @@
 //! which lives in the ops crate with the name folding it uses.
 
 mod blob_record;
+mod coalesce;
 mod codec;
 mod commit_graph;
 mod deriver;
@@ -20,6 +21,7 @@ mod root_tree;
 mod trees;
 
 pub use blob_record::BlobRecord;
+pub use coalesce::Coalescer;
 pub use commit_graph::{CommitGraph, GraphNode};
 pub use deriver::{
     AnyType, CacheSizes, DERIVE_BATCH, DeriveCx, DerivedType, Deriver, FRAME_WRITES,

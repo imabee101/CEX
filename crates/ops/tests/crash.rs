@@ -260,3 +260,39 @@ async fn a_crash_at_every_write_step_leaves_no_broken_reference() {
         }
     }
 }
+
+/// A transient store failure at any write step fails the create retryably,
+/// without crashing the server, and leaves no broken reference; the retry
+/// on the same server succeeds.
+#[tokio::test]
+async fn a_transient_failure_at_every_write_step_is_retryable() {
+    let env = env().await;
+    let plain = ops(&env.meta, &env.blobs);
+    let mut m = Model::default();
+    let (c, b) = m.apply(&[
+        ("dir/a", Some((FileKind::Regular, b"a"))),
+        ("dir/old", Some((FileKind::Regular, b"o"))),
+    ]);
+    let base = commit(&plain, &[], "base", c, &b).await.unwrap();
+    let faults = Faults::new();
+    let meta = Arc::new(FaultMetaStore::new(env.meta.clone(), faults.clone()));
+    let blobs = Arc::new(FaultBlobStore::new(env.blobs.clone(), faults.clone()));
+    flow(&meta, &blobs, base, 1000).await.unwrap();
+    let steps = faults.writes().len() as u64;
+    for step in 0..steps {
+        let variant = 1001 + step as u32;
+        let faults = Faults::new();
+        faults.fail_transiently_at(step);
+        let meta = Arc::new(FaultMetaStore::new(env.meta.clone(), faults.clone()));
+        let blobs = Arc::new(FaultBlobStore::new(env.blobs.clone(), faults.clone()));
+        let err = flow(&meta, &blobs, base, variant).await.unwrap_err();
+        assert!(err.code.retryable(), "step {step}: {err}");
+        assert!(!faults.crashed());
+        let mut keys = written(&faults);
+        check_references(&env.meta, &env.blobs, &keys).await;
+        let id = flow(&meta, &blobs, base, variant).await.unwrap();
+        keys.extend(written(&faults));
+        keys.insert(Key::Meta(MetaKey::Changeset(id)));
+        check_references(&env.meta, &env.blobs, &keys).await;
+    }
+}

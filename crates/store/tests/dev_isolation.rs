@@ -77,8 +77,8 @@ async fn sweeping_removes_only_what_exited_test_processes_left() {
     use object_store::ObjectStoreExt;
     // Names a test helper would make for a process that has exited (Linux
     // pids stay below 2^22) and for this running process.
-    let dead = format!("t_{}_1_{}", u32::MAX, std::process::id());
-    let live = format!("t_{}_1_999999", std::process::id());
+    let dead = store::testing::name_for(u32::MAX, 1, u64::from(std::process::id()));
+    let live = store::testing::name_for(std::process::id(), 1, 999_999);
     let mut admin = store::testing::base_config();
     admin.dbname("postgres");
     let (client, connection) = admin.connect(tokio_postgres::NoTls).await.unwrap();

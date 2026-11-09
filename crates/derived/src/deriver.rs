@@ -4,16 +4,16 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use scion_core::{Changeset, ChangesetId, Codec, Frame, FrameId, Tree, TreeId};
 use store::{BlobStore, DerivedKey, MetaKey, MetaStore, ObjectKey, RepoId};
-use tokio::sync::OnceCell;
+
 use tokio::task::JoinSet;
 
-use crate::DeriveError;
 use crate::trees::{TreeCache, TreeWork};
+use crate::{Coalescer, DeriveError};
 
 /// The zstd level of every frame the server creates. Frames are created once
 /// per id (INV-44), so the level only has to be fixed, not reproducible.
@@ -104,8 +104,6 @@ impl Default for CacheSizes {
     }
 }
 
-type Inflight = Mutex<HashMap<(RepoId, DerivedKey), Arc<OnceCell<Bytes>>>>;
-
 /// Derives and serves derived values for one server. Every value is written
 /// insert-if-absent under its `(type, version, param, changeset)` key, and
 /// concurrent derivations of one key on this server share one computation
@@ -117,7 +115,7 @@ pub struct Deriver<M, B> {
     case_nodes: TreeCache,
     values: moka::sync::Cache<(RepoId, DerivedKey), Bytes>,
     changesets: moka::sync::Cache<(RepoId, ChangesetId), Arc<Changeset>>,
-    inflight: Inflight,
+    inflight: Coalescer<(RepoId, DerivedKey), Bytes>,
 }
 
 impl<M, B> std::fmt::Debug for Deriver<M, B> {
@@ -226,7 +224,7 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
                     u32::try_from(n + 256).unwrap_or(u32::MAX)
                 })
                 .build(),
-            inflight: Mutex::new(HashMap::new()),
+            inflight: Coalescer::default(),
         }
     }
 
@@ -486,15 +484,9 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
         cs: &Changeset,
     ) -> Result<Bytes, DeriveError> {
         let key = t.key(id);
-        let cell = self
+        let value = self
             .inflight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry((repo, key))
-            .or_default()
-            .clone();
-        let result = cell
-            .get_or_try_init(|| async {
+            .run((repo, key), || async {
                 // Another server may have stored it since we looked.
                 if let Some(v) = self
                     .meta
@@ -511,18 +503,7 @@ impl<M: MetaStore, B: BlobStore> Deriver<M, B> {
                 self.write(cx, Vec::new()).await?;
                 Ok::<Bytes, DeriveError>(value)
             })
-            .await
-            .cloned();
-        {
-            let mut map = self
-                .inflight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if map.get(&(repo, key)).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
-                map.remove(&(repo, key));
-            }
-        }
-        let value = result?;
+            .await?;
         self.values.insert((repo, key), value.clone());
         Ok(value)
     }

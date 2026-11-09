@@ -243,7 +243,8 @@ impl FrameHeader {
     }
 
     /// The length of the whole frame: header, payload, and digest. It cannot
-    /// overflow: a checked payload is at most `MAX_FIELD_BYTES` long.
+    /// overflow: the longest checked payload, the chunk list of a blob of
+    /// `u64::MAX` bytes, is under 2^48 bytes.
     pub fn frame_len(&self) -> u64 {
         self.encoded_len() as u64 + self.payload_len + FRAME_DIGEST_LEN as u64
     }

@@ -23,7 +23,7 @@ pub struct BlobRecord {
 
 impl BlobRecord {
     /// The version byte that starts every record's encoding.
-    pub const VERSION: u8 = 2;
+    pub const VERSION: u8 = 3;
 
     /// The record's stored bytes.
     pub fn encode(&self) -> Vec<u8> {
@@ -107,15 +107,15 @@ mod tests {
         *text_2.last_mut().unwrap() = 2;
         let mut tag_2 = good.clone();
         tag_2[1 + 1 + 32] = 2;
-        let mut version_1 = good.clone();
-        version_1[0] = 1;
+        let mut version_2 = good.clone();
+        version_2[0] = 2;
         let mut long_size = good.clone();
         long_size.splice(1..2, [0x87, 0x00]);
         for bad in [
             trailing,
             text_2,
             tag_2,
-            version_1,
+            version_2,
             long_size,
             good[..good.len() - 1].to_vec(),
         ] {

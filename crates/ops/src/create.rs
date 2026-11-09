@@ -3,14 +3,13 @@
 //! in one transaction. It takes no locks and never reads or writes a ref
 //! (INV-2); its cost is O(changed files × path depth) (INV-1).
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use derived::{AclConfig, AnyType, CommitGraph, Deriver, Mode, RestrictedRoots, RootTree};
 use scion_core::{Changeset, ChangesetId};
 use store::{BlobStore, MetaKey, MetaStore, RepoId};
-use tokio::sync::OnceCell;
 
 use crate::case::CaseIndex;
 use crate::{Code, OpError};
@@ -51,7 +50,7 @@ impl Default for CreateOptions {
 }
 
 type CreateKey = (RepoId, ChangesetId, u64, bool, bool);
-type Creating = Mutex<HashMap<CreateKey, Arc<OnceCell<()>>>>;
+type Creating = derived::Coalescer<CreateKey, ()>;
 
 /// Server-side operations over one pair of stores.
 pub struct Ops<M, B> {
@@ -128,7 +127,7 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
     pub fn new(deriver: Arc<Deriver<M, B>>) -> Self {
         Self {
             deriver,
-            creating: Mutex::new(HashMap::new()),
+            creating: derived::Coalescer::default(),
         }
     }
 
@@ -163,27 +162,10 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         validate(&cs, opts)?;
         let id = cs.id();
         let key = (repo, id, opts.acl.version, opts.case_check, opts.imported);
-        let cell = self
-            .creating
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(key)
-            .or_default()
-            .clone();
-        let result = cell
-            .get_or_try_init(|| self.create_inner(repo, id, &cs, opts))
-            .await
-            .map(|_| ());
-        {
-            let mut map = self
-                .creating
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if map.get(&key).is_some_and(|c| Arc::ptr_eq(c, &cell)) {
-                map.remove(&key);
-            }
-        }
-        result.map(|()| id)
+        self.creating
+            .run(key, || self.create_inner(repo, id, &cs, opts))
+            .await?;
+        Ok(id)
     }
 
     async fn create_inner(

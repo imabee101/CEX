@@ -405,16 +405,21 @@ fn members() -> Result<Vec<Member>> {
     Ok(out)
 }
 
-/// The crates published with a semver promise: those whose manifest does not
-/// inherit the workspace's `publish = false`.
+/// The crates published with a semver promise: those whose manifest leaves
+/// `publish` unset (Cargo's default, true) or sets it to true, rather than
+/// inheriting the workspace's `publish = false` or setting false.
 fn public_crates() -> Result<Vec<String>> {
     Ok(members()?
         .into_iter()
         .filter(|m| {
-            m.manifest
-                .get("package")
-                .and_then(|p| p.get("publish"))
-                .is_none()
+            match m.manifest.get("package").and_then(|p| p.get("publish")) {
+                None => true,
+                Some(toml::Value::Boolean(publish)) => *publish,
+                // `publish.workspace = true` inherits the workspace's false;
+                // a registry list publishes.
+                Some(toml::Value::Array(registries)) => !registries.is_empty(),
+                Some(_) => false,
+            }
         })
         .map(|m| m.name)
         .collect())

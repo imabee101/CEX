@@ -116,8 +116,8 @@ const PUT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 /// Keys are `<repo>/<b|c|t>/<hex id>`.
 ///
 /// Writes are robust to contention and transient failures. Concurrent puts
-/// of one key in this process are coalesced: they run one at a time, so at
-/// most one is in flight. A put that fails transiently is retried with
+/// of one key in this process are serialized: they run one at a time, so at
+/// most one is in flight, and each later one finds the key written. A put that fails transiently is retried with
 /// bounded, jittered backoff; that is safe because a key is content-addressed
 /// and every frame for an id is byte-identical (INV-44), so a retry can only
 /// find the same bytes. A conditional write that reports the key exists is
@@ -266,13 +266,16 @@ impl KeyLocks {
             .entry(key)
             .or_default()
             .clone();
-        let guard = Some(lock.clone().lock_owned().await);
-        Ok(KeyTurn {
+        // The turn exists before the wait, so a caller cancelled while it
+        // waits still releases its reference and lets the entry go.
+        let mut turn = KeyTurn {
             locks: self,
             key,
             lock,
-            guard,
-        })
+            guard: None,
+        };
+        turn.guard = Some(turn.lock.clone().lock_owned().await);
+        Ok(turn)
     }
 }
 
@@ -389,5 +392,22 @@ mod tests {
         );
         let store = ObjectBlobStore::new(Arc::new(object_store::memory::InMemory::new()));
         assert!(format!("{store:?}").starts_with("ObjectBlobStore"));
+    }
+}
+
+#[cfg(test)]
+mod key_lock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_caller_cancelled_while_waiting_leaves_no_entry() {
+        let locks = KeyLocks::default();
+        let key = (RepoId(1), ObjectKey::blob(BlobId::hash(b"k")));
+        let first = locks.turn(key).await.unwrap();
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(10), locks.turn(key)).await;
+        assert!(waited.is_err(), "the key was held");
+        drop(first);
+        assert!(locks.locks.lock().unwrap().is_empty());
     }
 }

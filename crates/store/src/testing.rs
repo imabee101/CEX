@@ -39,12 +39,40 @@ pub fn unique_name() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    format!(
-        "t_{}_{}_{}",
+    name_for(
         std::process::id(),
         nanos,
-        NEXT.fetch_add(1, Ordering::Relaxed)
+        NEXT.fetch_add(1, Ordering::Relaxed),
     )
+}
+
+/// The name `unique_name` makes for process `pid` of this machine and PID
+/// namespace: `t_<namespace>_<pid>_<nanos>_<n>`.
+pub fn name_for(pid: u32, nanos: u128, n: u64) -> String {
+    format!("t_{}_{pid}_{nanos}_{n}", process_namespace())
+}
+
+/// This process's PID namespace, as 16 hex digits hashed from the machine's
+/// boot id and the namespace's inode, or `0` where they cannot be read. A
+/// pid identifies a process only within its namespace, so only names from
+/// this namespace are ever swept.
+fn process_namespace() -> &'static str {
+    static NAMESPACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAMESPACE.get_or_init(|| {
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id");
+        let ns = std::fs::read_link("/proc/self/ns/pid");
+        match (boot, ns) {
+            (Ok(boot), Ok(ns)) => {
+                use std::hash::{Hash, Hasher};
+                // The same in every process of one build; a sweeper from
+                // another build sees different names and leaves them alone.
+                let mut h = std::hash::DefaultHasher::new();
+                (boot.trim(), ns).hash(&mut h);
+                format!("{:016x}", h.finish())
+            }
+            _ => "0".to_owned(),
+        }
+    })
 }
 
 /// Connection settings for the dev environment's Postgres server, with no
@@ -289,9 +317,14 @@ const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const SWEEP_DELETE_CONCURRENCY: usize = 32;
 
 /// The test process that created a database or key prefix, from its name
-/// (`t_<pid>_<nanos>_<n>`); `None` for names no test helper creates.
+/// (`t_<namespace>_<pid>_<nanos>_<n>`), if it was made in this process's PID
+/// namespace; `None` otherwise, or for names no test helper creates.
 fn owner_pid(name: &str) -> Option<u32> {
     let mut parts = name.strip_prefix("t_")?.split('_');
+    let namespace = parts.next()?;
+    if namespace == "0" || namespace != process_namespace() {
+        return None;
+    }
     let pid = parts.next()?.parse().ok()?;
     let nanos_ok = parts.next()?.parse::<u128>().is_ok();
     let n_ok = parts.next()?.parse::<u64>().is_ok();
@@ -494,16 +527,22 @@ fn test_tmp_root() -> std::path::PathBuf {
 mod tests {
     #[test]
     fn only_names_made_by_test_helpers_have_an_owner() {
-        use super::owner_pid;
-        assert_eq!(owner_pid("t_42_1700000000000000000_7"), Some(42));
+        use super::{name_for, owner_pid};
+        assert_eq!(
+            owner_pid(&name_for(42, 1_700_000_000_000_000_000, 7)),
+            Some(42)
+        );
+        let ns = super::process_namespace();
+        assert_ne!(ns, "0", "this test runs where namespaces can be read");
+        let other_namespace = "t_0123456789abcdef_42_1700000000000000000_7".to_owned();
         for name in [
+            other_namespace.as_str(),
+            &format!("t_{ns}_42_1700000000000000000"),
+            &format!("t_{ns}_42_1700000000000000000_7_8"),
+            &format!("t_{ns}_x_1_2"),
+            &format!("t_{ns}_42_1_x"),
             "bench_7b4173f81314ef72",
             "scion_template",
-            "t_42_1700000000000000000",
-            "t_42_1700000000000000000_7_8",
-            "t_x_1_2",
-            "t__1_2",
-            "t_42_1_x",
         ] {
             assert_eq!(owner_pid(name), None, "{name}");
         }
@@ -511,10 +550,10 @@ mod tests {
 
     #[test]
     fn names_of_running_processes_are_not_orphans() {
-        let own = format!("t_{}_1_0", std::process::id());
+        let own = super::name_for(std::process::id(), 1, 0);
         assert!(!super::is_orphan(&own));
         // No process has this pid: Linux pids stay below 2^22.
-        assert!(super::is_orphan(&format!("t_{}_1_0", u32::MAX)));
+        assert!(super::is_orphan(&super::name_for(u32::MAX, 1, 0)));
         assert!(!super::is_orphan("bench_7b4173f81314ef72"));
     }
 

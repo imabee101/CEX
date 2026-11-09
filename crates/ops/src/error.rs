@@ -53,6 +53,8 @@ pub struct OpError {
     pub message: String,
     /// The paths the failure is about, if any.
     pub paths: Vec<Vec<u8>>,
+    /// For `RESOURCE_EXHAUSTED`, how long to wait before retrying.
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl OpError {
@@ -62,6 +64,7 @@ impl OpError {
             code,
             message: message.into(),
             paths: Vec::new(),
+            retry_after: None,
         }
     }
 
@@ -71,12 +74,17 @@ impl OpError {
             code,
             message: message.into(),
             paths: vec![path.to_vec()],
+            retry_after: None,
         }
     }
 }
 
 impl From<StoreError> for OpError {
     fn from(e: StoreError) -> Self {
+        let retry_after = match e {
+            StoreError::Overloaded { retry_after } => Some(retry_after),
+            _ => None,
+        };
         let code = match e {
             StoreError::InvalidArgument(_) => Code::InvalidArgument,
             StoreError::DataLoss(_) => Code::DataLoss,
@@ -84,7 +92,10 @@ impl From<StoreError> for OpError {
             StoreError::Overloaded { .. } => Code::ResourceExhausted,
             StoreError::Internal(_) => Code::Internal,
         };
-        Self::new(code, e.to_string())
+        Self {
+            retry_after,
+            ..Self::new(code, e.to_string())
+        }
     }
 }
 
@@ -164,11 +175,17 @@ mod tests {
         assert_eq!(code(StoreError::DataLoss("x".into())), Code::DataLoss);
         assert_eq!(code(StoreError::Unavailable("x".into())), Code::Unavailable);
         assert_eq!(code(StoreError::Internal("x".into())), Code::Internal);
+        let overloaded = OpError::from(StoreError::Overloaded {
+            retry_after: std::time::Duration::from_secs(1),
+        });
+        assert_eq!(overloaded.code, Code::ResourceExhausted);
         assert_eq!(
-            code(StoreError::Overloaded {
-                retry_after: std::time::Duration::from_secs(1)
-            }),
-            Code::ResourceExhausted
+            overloaded.retry_after,
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            OpError::from(StoreError::Unavailable("x".into())).retry_after,
+            None
         );
     }
 }
