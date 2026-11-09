@@ -18,6 +18,8 @@ mod deriver;
 mod error;
 mod restricted_roots;
 mod root_tree;
+#[cfg(feature = "testing")]
+pub mod testing;
 mod trees;
 
 pub use blob_record::BlobRecord;

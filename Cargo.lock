@@ -420,6 +420,7 @@ name = "derived"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "derived",
  "moka",
  "scion-core",
  "store",

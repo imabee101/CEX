@@ -7,10 +7,12 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use common::*;
 use ops::{DiffMode, FileDiff};
-use scion_core::{ChangesetId, FileKind};
+use scion_core::{ChangesetId, FileKind, MAX_TREE_ENTRIES, RepoPath};
+use store::{BlobStore, MetaStore};
 
 /// Applies a unified patch to `old`.
 fn apply_patch(old: &[u8], patch: &[u8]) -> Vec<u8> {
@@ -59,170 +61,347 @@ fn apply_patch(old: &[u8], patch: &[u8]) -> Vec<u8> {
     }
     out
 }
+/// A random history of `n` changesets on one repo, and how many are merges:
+/// new roots, linear steps, and merges taking files from their other
+/// parent, with random writes, deletes, kind changes, files that become
+/// directories and back, and (when `wide` passes `MAX_TREE_ENTRIES`) a
+/// sharded directory.
+/// and (when `wide` passes `MAX_TREE_ENTRIES`) a sharded directory.
+async fn random_history<M: MetaStore, B: BlobStore>(
+    o: &ops::Ops<M, B>,
+    rng: &mut Rng,
+    n: usize,
+    wide: u64,
+    label: &str,
+) -> (Vec<(ChangesetId, Model)>, usize) {
+    let mut merges = 0;
+    let mut out: Vec<(ChangesetId, Model)> = Vec::new();
+    while out.len() < n {
+        let i = out.len();
+        let (parents, mut changes) = if i == 0 || rng.one_in(12) {
+            (Vec::new(), Changes::new(&Model::default()))
+        } else {
+            let p1 = i - 1 - rng.index(i.min(4));
+            let mut changes = Changes::new(&out[p1].1);
+            let mut parents = vec![out[p1].0];
+            let p2 = rng.index(i);
+            if p2 != p1 && rng.one_in(4) {
+                merges += 1;
+                parents.push(out[p2].0);
+                let theirs: Vec<_> = out[p2].1.files.iter().collect();
+                for _ in 0..3.min(theirs.len()) {
+                    let (p, (k, c)) = theirs[rng.index(theirs.len())];
+                    changes.write(p, *k, c);
+                }
+            }
+            (parents, changes)
+        };
+        if i == 0 {
+            fill_wide(&mut changes, wide);
+        }
+        let n_ops = 1 + rng.below(6);
+        changes.random(rng, n_ops, 4, wide);
+        if changes.specs.is_empty() && parents.len() < 2 {
+            continue;
+        }
+        let (fc, contents) = changes.file_changes();
+        let id = commit(o, &parents, &format!("{label}/{i}"), fc, &contents)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: changeset {i}: {e}"));
+        out.push((id, changes.next));
+    }
+    (out, merges)
+}
 
-fn text(rng: &mut Rng, lines: u64) -> Vec<u8> {
-    (0..lines)
-        .flat_map(|_| format!("line {}\n", rng.below(6)).into_bytes())
+/// A random cursor: any bytes from the names' alphabet, valid or not.
+fn random_cursor(rng: &mut Rng) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"a-.x0/bcwn1\0";
+    (0..rng.below(9))
+        .map(|_| ALPHABET[rng.index(ALPHABET.len())])
         .collect()
 }
 
-#[tokio::test]
-async fn diffs_equal_a_naive_comparison() {
-    let env = env().await;
-    let ops = ops(&env.meta, &env.blobs);
-    let mut rng = Rng(42);
-    let paths = [
-        "a", "b/c", "b/d/e", "b/d/f", "g/h", "big/x1", "big/x2", "bin",
-    ];
-    let mut models: Vec<(ChangesetId, Model)> = Vec::new();
-    let mut model = Model::default();
-    let mut parent: Option<ChangesetId> = None;
-    // Seed a sharded directory too.
-    let spec: Vec<(String, Vec<u8>)> = (0..4200)
-        .map(|i| (format!("big/n{i:04}"), b"same\n".to_vec()))
-        .collect();
-    let s: Vec<Spec<'_>> = spec
-        .iter()
-        .map(|(p, c)| (p.as_str(), Some((FileKind::Regular, c.as_slice()))))
-        .collect();
-    let (fc, contents) = model.apply(&s);
-    let id = commit(&ops, &[], "seed", fc, &contents[..1]).await.unwrap();
-    models.push((id, model.clone()));
-    parent = Some(id).or(parent);
-    for step in 0..10 {
-        let mut spec: Vec<(String, Option<Vec<u8>>)> = Vec::new();
-        for p in paths {
-            if rng.below(3) != 0 {
-                continue;
-            }
-            let content = if p == "bin" {
-                let mut b = text(&mut rng, 3);
-                b.insert(0, 0);
-                Some(b)
-            } else if model.files.contains_key(p.as_bytes()) && rng.below(4) == 0 {
-                None
-            } else {
-                let n = 1 + rng.below(12);
-                Some(text(&mut rng, n))
-            };
-            spec.push((p.to_owned(), content));
-        }
-        if rng.below(2) == 0 {
-            spec.push((
-                format!("big/n{:04}", rng.below(4200)),
-                Some(format!("changed {step}\n").into_bytes()),
-            ));
-        }
-        let s: Vec<Spec<'_>> = spec
-            .iter()
-            .map(|(p, c)| {
-                (
-                    p.as_str(),
-                    c.as_ref().map(|c| (FileKind::Regular, c.as_slice())),
-                )
-            })
-            .collect();
-        let mut next = model.clone();
-        let (fc, contents) = next.apply(&s);
-        match commit(&ops, &[parent.unwrap()], &format!("{step}"), fc, &contents).await {
-            Ok(id) => {
-                model = next;
-                parent = Some(id);
-                models.push((id, model.clone()));
-            }
-            Err(e) => assert_eq!(e.code, ops::Code::NoOpChange, "{e}"),
-        }
+/// Random path filters: none, or a few of the files, their directories,
+/// paths beneath files, and paths that exist on neither side.
+fn random_filters(rng: &mut Rng, ma: &Model, mb: &Model, wide: u64) -> Vec<RepoPath> {
+    if rng.one_in(3) {
+        return Vec::new();
     }
-    assert!(models.len() > 6);
-    for (i, (a, ma)) in models.iter().enumerate() {
-        for (b, mb) in models.iter().skip(i.saturating_sub(2)).take(4) {
-            let want: Vec<Vec<u8>> = ma
-                .files
-                .keys()
-                .chain(mb.files.keys())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .filter(|p| ma.files.get(*p) != mb.files.get(*p))
-                .cloned()
-                .collect();
-            let got: Vec<FileDiff> = diff_all(&ops, *a, *b, DiffMode::Patch, &[]).await.unwrap();
-            assert_eq!(got.iter().map(|f| f.path.clone()).collect::<Vec<_>>(), want);
-            for f in &got {
-                let old = ma
-                    .files
-                    .get(&f.path)
-                    .map(|(_, c)| c.clone())
-                    .unwrap_or_default();
-                let new = mb
-                    .files
-                    .get(&f.path)
-                    .map(|(_, c)| c.clone())
-                    .unwrap_or_default();
-                // Each side's entry is exactly the model's: kind, blob, and size.
-                let state = |m: &Model| {
-                    m.files.get(&f.path).map(|(k, c)| ops::FileState {
-                        kind: *k,
-                        blob: scion_core::BlobId::hash(c),
-                        size: c.len() as u64,
-                    })
-                };
-                assert_eq!(f.old, state(ma), "{}", String::from_utf8_lossy(&f.path));
-                assert_eq!(f.new, state(mb), "{}", String::from_utf8_lossy(&f.path));
-                if old.contains(&0) || new.contains(&0) {
-                    assert!(f.binary && f.patch.is_empty());
-                    continue;
-                }
-                assert!(!f.binary);
-                assert_eq!(
-                    apply_patch(&old, &f.patch),
-                    new,
-                    "{}",
-                    String::from_utf8_lossy(&f.path)
+    let files: Vec<&Vec<u8>> = ma.files.keys().chain(mb.files.keys()).collect();
+    let mut out = BTreeSet::new();
+    for _ in 0..1 + rng.below(3) {
+        let p = match rng.below(4) {
+            0 if !files.is_empty() => files[rng.index(files.len())].clone(),
+            1 if !files.is_empty() => {
+                let f = files[rng.index(files.len())];
+                let cut = f.iter().position(|&b| b == b'/').unwrap_or(f.len());
+                f[..cut].to_vec()
+            }
+            2 if !files.is_empty() => {
+                let mut f = files[rng.index(files.len())].clone();
+                f.extend_from_slice(b"/a");
+                f
+            }
+            _ => random_path(rng, 4, wide),
+        };
+        out.insert(p);
+    }
+    out.into_iter().map(|p| RepoPath::new(p).unwrap()).collect()
+}
+
+fn kept(p: &[u8], filters: &[RepoPath]) -> bool {
+    filters.is_empty()
+        || filters.iter().any(|f| {
+            let f = f.as_bytes();
+            p == f || (p.len() > f.len() && p.starts_with(f) && p[f.len()] == b'/')
+        })
+}
+
+fn is_text(c: &[u8]) -> bool {
+    !c[..c.len().min(ops::blob::TEXT_SNIFF_BYTES)].contains(&0)
+}
+
+/// The model's diff: every kept path whose (kind, content) differs.
+fn model_diff(ma: &Model, mb: &Model, filters: &[RepoPath], after: &[u8]) -> Vec<Vec<u8>> {
+    ma.files
+        .keys()
+        .chain(mb.files.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|p| ma.files.get(*p) != mb.files.get(*p))
+        .filter(|p| kept(p, filters) && p.as_slice() > after)
+        .cloned()
+        .collect()
+}
+
+/// Every page from `after` on, checking that each page but the last is
+/// full and that only the last has no cursor.
+async fn pages<M: MetaStore, B: BlobStore>(
+    o: &ops::Ops<M, B>,
+    (a, b): (ChangesetId, ChangesetId),
+    mode: DiffMode,
+    paths: &[RepoPath],
+    mut after: Option<ops::DiffCursor>,
+    limit: usize,
+) -> Vec<FileDiff> {
+    let mut files = Vec::new();
+    loop {
+        let options = ops::DiffOptions {
+            mode,
+            paths,
+            after: after.as_ref(),
+            limit,
+        };
+        let page = o.diff(REPO, a, b, &options).await.unwrap();
+        match page.next {
+            Some(next) => {
+                assert_eq!(page.files.len(), limit, "a page before the last is short");
+                assert_eq!(next.to_bytes(), page.files.last().unwrap().path);
+                after = Some(ops::DiffCursor::from_bytes(&next.to_bytes()).unwrap());
+                files.extend(page.files);
+            }
+            None => {
+                assert!(page.files.len() <= limit);
+                assert!(
+                    !page.files.is_empty() || files.is_empty(),
+                    "the last page is empty though an earlier one is not"
                 );
-                let pluses = f
-                    .patch
-                    .split(|&b| b == b'\n')
-                    .filter(|l| l.starts_with(b"+"))
-                    .count() as u64;
-                let minuses = f
-                    .patch
-                    .split(|&b| b == b'\n')
-                    .filter(|l| l.starts_with(b"-"))
-                    .count() as u64;
-                assert_eq!((f.added_lines, f.removed_lines), (pluses, minuses));
+                files.extend(page.files);
+                return files;
             }
-            // Names mode reports the same entries, with no contents read.
-            let names = diff_all(&ops, *a, *b, DiffMode::Names, &[]).await.unwrap();
-            assert_eq!(
-                names
-                    .iter()
-                    .map(|f| (&f.path, f.old, f.new))
-                    .collect::<Vec<_>>(),
-                got.iter()
-                    .map(|f| (&f.path, f.old, f.new))
-                    .collect::<Vec<_>>()
-            );
-            assert!(
-                names
-                    .iter()
-                    .all(|f| f.patch.is_empty() && f.added_lines == 0)
-            );
-            // Filters select exactly the files under them.
-            let filter = [path("b/d"), path("big")];
-            let filtered = diff_all(&ops, *a, *b, DiffMode::Names, &filter)
-                .await
-                .unwrap();
-            let want_filtered: Vec<_> = got
-                .iter()
-                .filter(|f| f.path.starts_with(b"b/d/") || f.path.starts_with(b"big/"))
-                .map(|f| f.path.clone())
-                .collect();
-            assert_eq!(
-                filtered.into_iter().map(|f| f.path).collect::<Vec<_>>(),
-                want_filtered
-            );
         }
     }
+}
+
+/// Checks one diff of `a` against `b` with random filters, page size, and
+/// mode against the models, then forged cursors, then which trees a cold
+/// server reads for it.
+async fn check_pair(
+    e: &Env,
+    o: &ops::Ops<store::PgMetaStore, store::ObjectBlobStore>,
+    rng: &mut Rng,
+    (a, ma): (ChangesetId, &Model),
+    (b, mb): (ChangesetId, &Model),
+    wide: u64,
+    label: &str,
+) {
+    let filters = random_filters(rng, ma, mb, wide);
+    let mode = [DiffMode::Names, DiffMode::Stat, DiffMode::Patch][rng.index(3)];
+    let want = model_diff(ma, mb, &filters, b"");
+    // Small pages, and pages near and at the maximum; a diff of thousands
+    // of files is read in at most about 64 pages, to keep the test fast.
+    let limit = [1, 2, 3, 7, ops::MAX_DIFF_PAGE - 1, ops::MAX_DIFF_PAGE][rng.index(6)]
+        .max(want.len() / 64)
+        .min(ops::MAX_DIFF_PAGE);
+    let label = format!("{label} filters {filters:?} page {limit} {mode:?}");
+    let got = pages(o, (a, b), mode, &filters, None, limit).await;
+    assert_eq!(
+        got.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        want,
+        "{label}"
+    );
+    let full_patch = if mode == DiffMode::Stat {
+        pages(o, (a, b), DiffMode::Patch, &filters, None, ops::MAX_DIFF_PAGE).await
+    } else {
+        Vec::new()
+    };
+    for (k, f) in got.iter().enumerate() {
+        let p = String::from_utf8_lossy(&f.path);
+        let state = |m: &Model| {
+            m.files.get(&f.path).map(|(k, c)| ops::FileState {
+                kind: *k,
+                blob: scion_core::BlobId::hash(c),
+                size: c.len() as u64,
+            })
+        };
+        assert_eq!((f.old, f.new), (state(ma), state(mb)), "{label}: {p}");
+        let content = |m: &Model| m.files.get(&f.path).map(|(_, c)| c.clone());
+        let (old, new) = (content(ma), content(mb));
+        if mode == DiffMode::Names {
+            assert!(!f.binary && f.patch.is_empty() && f.added_lines + f.removed_lines == 0);
+            continue;
+        }
+        let binary = [&old, &new].into_iter().flatten().any(|c| !is_text(c));
+        assert_eq!(f.binary, binary, "{label}: {p}");
+        if binary {
+            assert!(f.patch.is_empty() && f.added_lines + f.removed_lines == 0);
+            continue;
+        }
+        let (old, new) = (old.unwrap_or_default(), new.unwrap_or_default());
+        match mode {
+            DiffMode::Patch => {
+                assert_eq!(apply_patch(&old, &f.patch), new, "{label}: {p}");
+                let count = |prefix: u8| {
+                    f.patch
+                        .split(|&b| b == b'\n')
+                        .filter(|l| l.first() == Some(&prefix))
+                        .count() as u64
+                };
+                assert_eq!((f.added_lines, f.removed_lines), (count(b'+'), count(b'-')));
+            }
+            _ => {
+                assert!(f.patch.is_empty());
+                let full = &full_patch[k];
+                assert_eq!(
+                    (f.added_lines, f.removed_lines),
+                    (full.added_lines, full.removed_lines),
+                    "{label}: {p}"
+                );
+            }
+        }
+    }
+    // A cursor a client forges returns exactly the entries after it, or is
+    // refused as an invalid argument.
+    for _ in 0..3 {
+        let bytes = random_cursor(rng);
+        match ops::DiffCursor::from_bytes(&bytes) {
+            Ok(cursor) => {
+                let got = pages(o, (a, b), DiffMode::Names, &filters, Some(cursor), limit).await;
+                assert_eq!(
+                    got.into_iter().map(|f| f.path).collect::<Vec<_>>(),
+                    model_diff(ma, mb, &filters, &bytes),
+                    "{label}: after {bytes:?}"
+                );
+            }
+            Err(err) => {
+                assert!(RepoPath::new(bytes.as_slice()).is_err(), "{bytes:?}");
+                assert_eq!(err.code, ops::Code::InvalidArgument, "{bytes:?}");
+            }
+        }
+    }
+    // A cold server reads only the tree nodes of directories that hold a
+    // filter or lie under one.
+    if !filters.is_empty() {
+        let reads = Arc::new(TreeReads::new(e.meta.clone()));
+        let cold = ops(&reads, &e.blobs);
+        pages(&cold, (a, b), DiffMode::Names, &filters, None, limit).await;
+        let mut allowed = BTreeSet::new();
+        for m in [ma, mb] {
+            let files = m.files.iter().map(|(p, (k, c))| (p.clone(), *k, c.clone()));
+            for (dir, ids) in reference_nodes(files).1 {
+                let leads_to_filter = filters.iter().any(|f| {
+                    let f = f.as_bytes();
+                    f.len() > dir.len() && f.starts_with(&dir) && f[dir.len()] == b'/'
+                });
+                if dir.is_empty() || kept(&dir, &filters) || leads_to_filter
+                {
+                    allowed.extend(ids);
+                }
+            }
+        }
+        let read = reads.take();
+        for t in read {
+            assert!(allowed.contains(&t), "{label}: read a tree outside the filters");
+        }
+    }
+}
+
+/// Diffs between random pairs of changesets of random histories equal a
+/// naive comparison of the two file maps, with random path filters, page
+/// sizes, modes, and forged cursors; patches apply to the old text and give
+/// the new one; and a filtered diff reads no tree outside its filters.
+async fn naive_comparison(seeds: &[u64], wide: u64) {
+    let env = env().await;
+    let o = ops(&env.meta, &env.blobs);
+    let (mut merges, mut swaps) = (0, 0);
+    for &seed in seeds {
+        let mut rng = Rng(0xd1ff_0000 + seed);
+        let label = format!("seed {seed}");
+        let (history, m) = random_history(&o, &mut rng, 16, wide, &label).await;
+        merges += m;
+        // Paths that are a file in one changeset and a directory in another.
+        let files: BTreeSet<&Vec<u8>> = history.iter().flat_map(|(_, m)| m.files.keys()).collect();
+        swaps += files
+            .iter()
+            .filter(|f| {
+                let mut under = f.to_vec();
+                under.push(b'/');
+                files.iter().any(|g| g.starts_with(&under))
+            })
+            .count();
+        for _ in 0..16 {
+            let x = rng.index(history.len());
+            // Old against recent, neighbours, and a changeset with itself.
+            let y = match rng.below(3) {
+                0 => history.len() - 1 - rng.index(history.len().min(3)),
+                1 => x.saturating_sub(rng.index(3)),
+                _ => rng.index(history.len()),
+            };
+            let (a, b) = if rng.one_in(2) { (x, y) } else { (y, x) };
+            check_pair(
+                &env,
+                &o,
+                &mut rng,
+                (history[a].0, &history[a].1),
+                (history[b].0, &history[b].1),
+                wide,
+                &label,
+            )
+            .await;
+        }
+    }
+    assert!(swaps > 0, "no path was both a file and a directory");
+    assert!(merges > 0, "no merges");
+}
+
+#[tokio::test]
+async fn diffs_with_a_sharded_directory_equal_a_naive_comparison() {
+    naive_comparison(&[0], MAX_TREE_ENTRIES as u64 + 200).await;
+}
+
+#[tokio::test]
+async fn more_diffs_with_a_sharded_directory_equal_a_naive_comparison() {
+    naive_comparison(&[1], MAX_TREE_ENTRIES as u64 + 200).await;
+}
+
+#[tokio::test]
+async fn diffs_of_small_histories_equal_a_naive_comparison() {
+    naive_comparison(&[2, 3, 4, 5, 6, 7], 0).await;
+}
+
+#[tokio::test]
+async fn more_diffs_of_small_histories_equal_a_naive_comparison() {
+    naive_comparison(&[8, 9, 10, 11, 12, 13], 0).await;
 }
 
 /// A file is "binary differs" when either side is binary: text to binary
@@ -383,8 +562,14 @@ async fn a_cursor_at_any_path_returns_exactly_the_entries_after_it() {
     for after in [
         "a", "a-c", "a/", "a/b", "a/b/", "a/b/c", "a/c", "a0", "aa", "b/a", "zz", "\u{1}",
     ] {
-        let Ok(cursor) = ops::DiffCursor::from_bytes(after.as_bytes()) else {
-            continue;
+        let cursor = match ops::DiffCursor::from_bytes(after.as_bytes()) {
+            Ok(cursor) => cursor,
+            Err(err) => {
+                // Only a path is a cursor; one ending in `/` is refused.
+                assert!(after.ends_with('/'), "{after:?}: {err}");
+                assert_eq!(err.code, ops::Code::InvalidArgument, "{after:?}");
+                continue;
+            }
         };
         let page = o
             .diff(

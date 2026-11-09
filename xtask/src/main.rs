@@ -25,6 +25,7 @@ const MUTANTS_EXCLUDE: &[&str] = &[
     "crates/store/src/conformance/**",
     "crates/store/src/blob/memory.rs",
     "crates/store/src/meta/memory.rs",
+    "crates/derived/src/testing.rs",
 ];
 
 /// scion-core's language-neutral test vectors, used as fuzz seeds.

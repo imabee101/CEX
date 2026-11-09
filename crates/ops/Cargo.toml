@@ -20,6 +20,7 @@ tokio = { workspace = true, features = ["sync"] }
 zstd = { workspace = true }
 
 [dev-dependencies]
+derived = { workspace = true, features = ["testing"] }
 store = { workspace = true, features = ["testing"] }
 blake3 = { workspace = true }
 # Read only for the Unicode version their data was generated from.
