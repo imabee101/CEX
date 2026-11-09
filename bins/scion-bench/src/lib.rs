@@ -280,14 +280,26 @@ pub fn content(p: &BenchParams, f: &FileSpec) -> Vec<u8> {
 /// How many changesets' blobs are uploaded ahead of the create chain.
 const UPLOADS_AHEAD: usize = 6;
 
-/// Builds the tip into the given stores: uploads every file and creates a
-/// chain of changesets adding them; returns the last changeset.
+/// Builds the tip of [`layout`]`(p)` into the given stores; returns it.
 pub async fn generate<M: MetaStore + 'static, B: BlobStore + 'static>(
     p: &BenchParams,
     meta: Arc<M>,
     blobs: Arc<B>,
 ) -> ChangesetId {
-    let files = Arc::new(layout(p));
+    build(p, Arc::new(layout(p)), meta, blobs).await
+}
+
+/// Builds a tip holding `files`, with the contents `p` gives them, into the
+/// given stores: uploads every file and creates a chain of changesets of at
+/// most `p.files_per_changeset` files adding them in order; returns the last
+/// changeset. `files` must be non-empty, with distinct paths, none a prefix
+/// directory of another.
+pub async fn build<M: MetaStore + 'static, B: BlobStore + 'static>(
+    p: &BenchParams,
+    files: Arc<Vec<FileSpec>>,
+    meta: Arc<M>,
+    blobs: Arc<B>,
+) -> ChangesetId {
     let ops = Ops::new(Arc::new(Deriver::new(
         meta.clone(),
         blobs.clone(),
