@@ -984,10 +984,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "import"
-version = "0.1.0"
-
-[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1846,10 +1842,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rpc"
-version = "0.1.0"
-
-[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2001,18 +1993,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scion-cache"
-version = "0.1.0"
-
-[[package]]
-name = "scion-client"
-version = "0.1.0"
-
-[[package]]
-name = "scion-conformance"
-version = "0.1.0"
-
-[[package]]
 name = "scion-core"
 version = "0.1.0"
 dependencies = [
@@ -2021,34 +2001,6 @@ dependencies = [
  "sha2",
  "thiserror",
 ]
-
-[[package]]
-name = "scion-daemon"
-version = "0.1.0"
-
-[[package]]
-name = "scion-export"
-version = "0.1.0"
-
-[[package]]
-name = "scion-fsck"
-version = "0.1.0"
-
-[[package]]
-name = "scion-import"
-version = "0.1.0"
-
-[[package]]
-name = "scion-proto"
-version = "0.1.0"
-
-[[package]]
-name = "scion-server"
-version = "0.1.0"
-
-[[package]]
-name = "scn"
-version = "0.1.0"
 
 [[package]]
 name = "scopeguard"
@@ -2165,10 +2117,6 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "sim"
-version = "0.1.0"
 
 [[package]]
 name = "simd_cesu8"
@@ -2738,10 +2686,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vfs"
-version = "0.1.0"
 
 [[package]]
 name = "walkdir"

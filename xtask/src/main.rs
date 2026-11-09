@@ -12,27 +12,20 @@ type Result<T = (), E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 /// Seconds each fuzz target runs in the full tier.
 const FUZZ_BUDGET_SECONDS: u64 = 30 * 60;
 
-/// Crates published with a semver promise.
-const PUBLIC_CRATES: &[&str] = &[
-    "scion-core",
-    "scion-proto",
-    "scion-client",
-    "scion-conformance",
-];
-
-/// Crates whose tests also run on macOS and Windows in the full tier.
-const PORTABLE_TEST_CRATES: &[&str] = &[
-    "scion-core",
-    "scion-proto",
-    "scion-client",
-    "scion-conformance",
-    "vfs",
-];
-
 /// The crate whose release tags are the baseline for `buf breaking`.
 const PROTO_CRATE: &str = "scion-proto";
 const PROTO_DIR: &str = "crates/scion-proto/proto";
 const PROTO_GEN_DIR: &str = "crates/scion-proto/src/gen";
+
+/// Source files cargo-mutants never mutates: test support compiled only
+/// with the `testing` feature.
+const MUTANTS_EXCLUDE: &[&str] = &[
+    "crates/store/src/testing.rs",
+    "crates/store/src/fault.rs",
+    "crates/store/src/conformance/**",
+    "crates/store/src/blob/memory.rs",
+    "crates/store/src/meta/memory.rs",
+];
 
 /// scion-core's language-neutral test vectors, used as fuzz seeds.
 const VECTORS_FILE: &str = "crates/scion-core/vectors/v1.txt";
@@ -257,6 +250,9 @@ enum Tier {
 }
 
 fn run_tier(name: &str, steps: &[Step], only: &[Step], tier: Tier) -> Result {
+    if let Some(step) = only.iter().find(|s| !steps.contains(s)) {
+        return Err(format!("{name}: step {step:?} is not part of this tier").into());
+    }
     let selected: Vec<Step> = if only.is_empty() {
         steps.to_vec()
     } else {
@@ -337,11 +333,19 @@ fn run_step(step: Step, tier: Tier) -> Result {
             ]))
         }
         Step::Portable => {
+            let crates = portable_crates()?;
             let mut args = vec!["--no-tests=warn"];
-            for krate in PORTABLE_TEST_CRATES {
-                args.extend(["--package", krate]);
+            for krate in &crates {
+                args.extend(["--package", krate.as_str()]);
             }
-            nextest(tier, &args)
+            nextest(tier, &args)?;
+            if !in_ci() {
+                eprintln!(
+                    "portable: ran on {} only; the macOS and Windows runs happen in CI",
+                    std::env::consts::OS
+                );
+            }
+            Ok(())
         }
     }
 }
@@ -369,6 +373,74 @@ fn msrv() -> Result<String> {
         .ok_or_else(|| "workspace.package.rust-version is missing".into())
 }
 
+/// A workspace member's name and manifest.
+struct Member {
+    name: String,
+    manifest: toml::Table,
+}
+
+/// Every crate in the workspace's `crates/` and `bins/` directories.
+fn members() -> Result<Vec<Member>> {
+    let mut out = Vec::new();
+    for dir in ["crates", "bins"] {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(root().join(dir))?
+            .map(|e| e.map(|e| e.path()))
+            .collect::<Result<_, _>>()?;
+        entries.sort();
+        for path in entries {
+            let manifest_path = path.join("Cargo.toml");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let manifest = read_toml(&manifest_path)?;
+            let name = manifest
+                .get("package")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| format!("{}: no package name", manifest_path.display()))?
+                .to_owned();
+            out.push(Member { name, manifest });
+        }
+    }
+    Ok(out)
+}
+
+/// The crates published with a semver promise: those whose manifest does not
+/// inherit the workspace's `publish = false`.
+fn public_crates() -> Result<Vec<String>> {
+    Ok(members()?
+        .into_iter()
+        .filter(|m| {
+            m.manifest
+                .get("package")
+                .and_then(|p| p.get("publish"))
+                .is_none()
+        })
+        .map(|m| m.name)
+        .collect())
+}
+
+/// The crates whose tests also run on macOS and Windows in the full tier:
+/// every public crate, and any crate that sets
+/// `package.metadata.scion.portable-tests = true`.
+fn portable_crates() -> Result<Vec<String>> {
+    let public = public_crates()?;
+    Ok(members()?
+        .into_iter()
+        .filter(|m| {
+            public.contains(&m.name)
+                || m.manifest
+                    .get("package")
+                    .and_then(|p| p.get("metadata"))
+                    .and_then(|m| m.get("scion"))
+                    .and_then(|s| s.get("portable-tests"))
+                    .and_then(toml::Value::as_bool)
+                    == Some(true)
+        })
+        .map(|m| m.name)
+        .collect())
+}
+
 // ---------------------------------------------------------------- releases
 
 /// The newest release tag `<krate>-v<semver>`, or `None` if never released.
@@ -394,14 +466,14 @@ fn last_release(krate: &str) -> Result<Option<String>> {
 }
 
 fn semver() -> Result {
-    for krate in PUBLIC_CRATES {
-        match last_release(krate)? {
+    for krate in public_crates()? {
+        match last_release(&krate)? {
             None => eprintln!("semver-checks: {krate} skipped (never released)"),
             Some(tag) => run(cargo([
                 "semver-checks",
                 "check-release",
                 "--package",
-                krate,
+                &krate,
                 "--baseline-rev",
                 &tag,
             ]))?,
@@ -434,6 +506,15 @@ fn buf_breaking() -> Result {
 fn proto(check: bool) -> Result {
     let root = root();
     let proto_dir = root.join(PROTO_DIR);
+    if !proto_dir.exists() {
+        // The scion.v1 proto arrives with scion-proto in milestone 5; until
+        // then there is no generated code to be stale.
+        if check {
+            eprintln!("proto: {PROTO_DIR} does not exist yet; nothing to check");
+            return Ok(());
+        }
+        return Err(format!("proto: {PROTO_DIR} does not exist").into());
+    }
     let mut files = Vec::new();
     collect_files(&proto_dir, "proto", &mut files)?;
     let files: Vec<PathBuf> = files
@@ -554,13 +635,24 @@ fn fuzz_all() -> Result {
     let budget = Duration::from_secs(FUZZ_BUDGET_SECONDS);
     let setup = fuzz_setup()?;
     run(fuzz_command(&setup, "build", None, None))?;
-    let mut children = Vec::new();
+    let mut children: Vec<(&String, std::process::Child)> = Vec::new();
     for target in &targets {
         let mut c = fuzz_command(&setup, "run", Some(target), Some(budget));
         eprintln!("$ cargo fuzz run {target} (budget {}s)", budget.as_secs());
-        let child = c
-            .spawn()
-            .map_err(|e| format!("cannot start fuzzer `{target}`: {e}"))?;
+        let child = match c.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // Stop the fuzzers already running rather than leave them
+                // for their whole budget. This is cleanup on the way to
+                // reporting the spawn error, so its own failures (a fuzzer
+                // that already exited) change nothing.
+                for (_, mut running) in children {
+                    let _ = running.kill();
+                    let _ = running.wait();
+                }
+                return Err(format!("cannot start fuzzer `{target}`: {e}").into());
+            }
+        };
         children.push((target, child));
     }
     let mut failed = Vec::new();
@@ -702,6 +794,9 @@ fn mutants(args: &[OsString]) -> Result {
     let mut c = cmd("git");
     c.args(["diff", "--merge-base", "main"]);
     let diff = output(c).map_err(|e| format!("cannot diff against main: {e}"))?;
+    if diff.trim().is_empty() {
+        return Err("mutants: no changes against main, so nothing to mutate".into());
+    }
     let dir = root().join("target/xtask");
     std::fs::create_dir_all(&dir)?;
     let diff_file = dir.join("mutants.diff");
@@ -720,7 +815,14 @@ fn mutants(args: &[OsString]) -> Result {
         "--minimum-test-timeout=120",
         "--in-diff",
     ]);
-    c.arg(&diff_file).args(args);
+    c.arg(&diff_file);
+    // Test-support code is exercised by the tests, not tested by them, and a
+    // mutant that breaks it (for example the database cleanup) only harms
+    // the run.
+    for glob in MUTANTS_EXCLUDE {
+        c.args(["--exclude", glob]);
+    }
+    c.args(args);
     // The mutant source copies and their builds live under target/, not in
     // the system temp directory, which may be small or in RAM.
     let tmp = root().join("target/mutants-tmp");

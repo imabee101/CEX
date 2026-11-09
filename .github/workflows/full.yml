@@ -1,6 +1,6 @@
 # Full tier on every merge to main and nightly. Each step of
-# `cargo xtask ci-full` runs as its own job; public-crate and vfs tests also run
-# on macOS and Windows.
+# `cargo xtask ci-full` runs as its own job; the portable crates' tests (every
+# public crate, and any crate that opts in) also run on macOS and Windows.
 name: full
 
 on:

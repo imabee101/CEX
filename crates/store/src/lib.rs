@@ -7,11 +7,11 @@
 //!
 //! - [`MetaStore`] holds the metadata database: changesets, trees, derived
 //!   values, refs, and the ref log. Backends: [`PgMetaStore`] (Postgres, and
-//!   CockroachDB through the Postgres wire protocol) and, for tests only,
-//!   [`MemoryMetaStore`].
+//!   CockroachDB through the Postgres wire protocol) and, for tests only with
+//!   the `testing` feature, `MemoryMetaStore`.
 //! - [`BlobStore`] holds frames in blob storage. Backends: [`ObjectBlobStore`]
 //!   over any `object_store` store (S3-compatible or the local filesystem)
-//!   and, for tests only, [`MemoryBlobStore`].
+//!   and, for tests only with the `testing` feature, `MemoryBlobStore`.
 //!
 //! Every key includes a [`RepoId`], so deduplication never crosses repos.
 //! Immutable records are written insert-if-absent and never overwritten; refs

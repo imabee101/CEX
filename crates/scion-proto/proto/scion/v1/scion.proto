@@ -1,4 +1,0 @@
-syntax = "proto3";
-
-// The Scion version-control API, version 1.
-package scion.v1;

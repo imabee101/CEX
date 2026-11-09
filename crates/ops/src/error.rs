@@ -133,7 +133,7 @@ mod tests {
     /// lists `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `LAND_RETRIES_EXHAUSTED`,
     /// and `ACL_PENDING`).
     #[test]
-    fn only_unavailable_and_acl_pending_are_retryable() {
+    fn only_overload_unavailable_and_acl_pending_are_retryable() {
         use Code::*;
         for c in [
             InvalidArgument,

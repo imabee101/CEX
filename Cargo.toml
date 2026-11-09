@@ -4,7 +4,6 @@ members = [
     "crates/*",
     "bins/*",
     "fuzz",
-    "tests/sim",
     "xtask",
 ]
 
@@ -18,15 +17,9 @@ publish = false
 [workspace.dependencies]
 # Workspace crates. Public crates carry a version so they can be published.
 scion-core = { path = "crates/scion-core", version = "0.1.0" }
-scion-proto = { path = "crates/scion-proto", version = "0.1.0" }
-scion-client = { path = "crates/scion-client", version = "0.1.0" }
-scion-conformance = { path = "crates/scion-conformance", version = "0.1.0" }
 store = { path = "crates/store" }
 derived = { path = "crates/derived" }
 ops = { path = "crates/ops" }
-rpc = { path = "crates/rpc" }
-vfs = { path = "crates/vfs" }
-import = { path = "crates/import" }
 
 # Third-party crates: the AGENTS.md Dependencies line, each at the newest release
 # compatible with the MSRV. Members opt into the features they need.
