@@ -215,3 +215,53 @@ async fn a_schema_newer_than_the_code_is_refused() {
         "{refused:?}"
     );
 }
+
+#[tokio::test]
+async fn tls_never_falls_back_to_plaintext() {
+    // The dev Postgres serves no TLS. A store that requires TLS must fail to
+    // connect rather than continue in plaintext.
+    let db = TestDatabase::create().await;
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_no_client_auth();
+    let store = PgMetaStore::new(
+        db.config().clone(),
+        PgTls::Rustls(Arc::new(config)),
+        limits(1),
+    )
+    .unwrap();
+    assert!(store.get_ref(RepoId(1), "main").await.is_err());
+}
+
+#[tokio::test]
+async fn a_cas_mismatch_keeps_its_connection() {
+    use scion_core::ChangesetId;
+    use store::{RefLogReason, RefUpdate};
+    let db = TestDatabase::create().await;
+    let store = PgMetaStore::new(db.config().clone(), PgTls::LoopbackPlaintext, limits(1)).unwrap();
+    store.migrate().await.unwrap();
+    let observer = db.connect().await;
+    let update = |expected: Option<u8>| RefUpdate {
+        name: "main",
+        expected: expected.map(|e| ChangesetId::from_bytes([e; 32])),
+        new: ChangesetId::from_bytes([1; 32]),
+        actor: "test",
+        time_micros: 0,
+        reason: RefLogReason::Manual,
+    };
+    store.update_ref(RepoId(1), &update(None)).await.unwrap();
+    let before = backends(&observer, &db).await;
+    for _ in 0..5 {
+        let outcome = store.update_ref(RepoId(1), &update(Some(9))).await.unwrap();
+        assert!(matches!(outcome, store::CasOutcome::Mismatch { .. }));
+    }
+    assert_eq!(
+        backends(&observer, &db).await,
+        before,
+        "a mismatch closed its connection"
+    );
+}

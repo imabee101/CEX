@@ -163,25 +163,35 @@ fn is_duplicate_object(e: &tokio_postgres::Error) -> bool {
 
 /// Classifies a Postgres error by what a retry can fix.
 ///
-/// Connection failures, serialization failures and deadlocks, a server out
-/// of resources or shutting down, and cancelled statements (the statement
-/// timeout) are retryable. Everything else the server reports (bad data,
-/// constraint violations, undefined objects, permissions, program limits)
-/// means this code or its configuration is wrong, and a retry cannot help.
-/// An error with no SQLSTATE comes from the connection, not the server.
+/// Connection failures, serialization failures, ambiguous results, and
+/// deadlocks, a server out of resources or shutting down, and cancelled
+/// statements (the statement timeout) are retryable. Everything else the
+/// server reports (bad data, constraint violations, undefined objects,
+/// permissions, program limits) means this code or its configuration is
+/// wrong, and a retry cannot help. An error without a SQLSTATE is
+/// retryable only when the connection itself failed.
 pub(crate) fn pg(e: tokio_postgres::Error) -> StoreError {
     // The top-level message of a server error is just "db error"; keep the
     // server's message and code.
     let Some(db) = e.as_db_error() else {
-        return StoreError::Unavailable(format!("postgres: {e}"));
+        // A failure of the connection is retryable; one of encoding or
+        // decoding values, or of the protocol, is a defect.
+        return if e.is_closed() || super::pg_pool::connection_failed(&e) {
+            StoreError::Unavailable(format!("postgres: {e}"))
+        } else {
+            StoreError::Internal(format!("postgres: {e}"))
+        };
     };
     let code = db.code().code();
     let message = format!("postgres: {} ({code})", db.message());
     let retryable = code.starts_with("08")
         || code.starts_with("53")
+        // 40003 is CockroachDB's ambiguous result: the statement may or may
+        // not have committed. Retrying is safe because writes are
+        // insert-if-absent or guarded by idempotency keys.
         || matches!(
             code,
-            "40001" | "40P01" | "57014" | "57P01" | "57P02" | "57P03" | "57P05"
+            "40001" | "40003" | "40P01" | "57014" | "57P01" | "57P02" | "57P03" | "57P05"
         );
     if retryable {
         StoreError::Unavailable(message)
@@ -466,6 +476,8 @@ impl MetaStore for PgMetaStore {
             .map(|r| ref_state(r.get(0), r.get(1), r.get(2)))
             .transpose()?;
         if current.as_ref().map(|c| c.target) != update.expected {
+            // Release the row lock and keep the connection for the pool.
+            tx.rollback().await?;
             return Ok(CasOutcome::Mismatch { current });
         }
         let seq = match current {
@@ -500,12 +512,10 @@ impl MetaStore for PgMetaStore {
                             )
                             .await
                             .map_err(pg)?;
+                        let current = ref_state(current.get(0), current.get(1), current.get(2))?;
+                        tx.rollback().await?;
                         return Ok(CasOutcome::Mismatch {
-                            current: Some(ref_state(
-                                current.get(0),
-                                current.get(1),
-                                current.get(2),
-                            )?),
+                            current: Some(current),
                         });
                     }
                 }
