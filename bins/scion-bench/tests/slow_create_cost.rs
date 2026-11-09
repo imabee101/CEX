@@ -1,10 +1,13 @@
 //! Create cost does not grow with repo size (INV-1): on Postgres and the
 //! object store, creating a changeset on the 3,000,000-file bench repo costs
 //! within 1.5× of the same change on a 10,000-file repo from the same
-//! generator. INV-1 bounds cost by changed files × path depth, so both
-//! changes modify the same number of files at the same depth, one per
-//! top-level directory; each run uses a fresh server, so every tree read
-//! reaches the store.
+//! generator, by every store-call measure. INV-1 bounds cost by changed files ×
+//! path depth, so each run makes the same changes in both repos: per picked
+//! file (one per top-level directory, all at one depth), it modifies the file,
+//! adds a name beside it and a file in a new directory beside it, and deletes
+//! the previous run's two additions. Each run uses a fresh server, so every
+//! tree read reaches the store. Wall time is reported but not asserted: it
+//! depends on the machine's load.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,23 +79,39 @@ async fn measure(p: &BenchParams) -> Vec<Cost> {
         repo.tip
     );
     let mut costs = Vec::new();
+    let mut tip = repo.tip;
     for run in 0..RUNS + 1 {
-        let contents: Vec<Bytes> = files
+        // Per picked file: modify it, add a name beside it, and add a file in
+        // a new directory beside it, and delete the two files the previous
+        // run added: every kind of change, and new names for the case check.
+        let dir = |f: &FileSpec| f.path.rsplit_once('/').unwrap().0.to_owned();
+        let mut writes: Vec<String> = Vec::new();
+        let mut deletes: Vec<String> = Vec::new();
+        for f in &files {
+            writes.push(f.path.clone());
+            writes.push(format!("{}/added{run}", dir(f)));
+            writes.push(format!("{}/newdir{run}/file", dir(f)));
+            if run > 0 {
+                deletes.push(format!("{}/added{}", dir(f), run - 1));
+                deletes.push(format!("{}/newdir{}/file", dir(f), run - 1));
+            }
+        }
+        let contents: Vec<Bytes> = writes
             .iter()
-            .map(|f| Bytes::from(format!("run {run} of {}\n", f.path)))
+            .map(|p| Bytes::from(format!("run {run} of {p}\n")))
             .collect();
         upload_blobs(&*meta, &blobs, REPO, &contents).await.unwrap();
         let mut parts = ChangesetParts::default();
-        parts.parents = vec![repo.tip];
+        parts.parents = vec![tip];
         parts.author = b"Bench <bench@scion.invalid>".to_vec();
         parts.author_date = Timestamp::new(1_800_000_000, 0).unwrap();
         parts.message = format!("cost run {run}").into_bytes();
-        parts.file_changes = files
+        parts.file_changes = writes
             .iter()
             .zip(&contents)
-            .map(|(f, c)| {
+            .map(|(p, c)| {
                 (
-                    RepoPath::new(f.path.as_bytes()).unwrap(),
+                    RepoPath::new(p.as_bytes()).unwrap(),
                     FileChange::File {
                         kind: FileKind::Regular,
                         blob: BlobId::hash(c),
@@ -100,8 +119,14 @@ async fn measure(p: &BenchParams) -> Vec<Cost> {
                     },
                 )
             })
+            .chain(
+                deletes
+                    .iter()
+                    .map(|p| (RepoPath::new(p.as_bytes()).unwrap(), FileChange::Deleted)),
+            )
             .collect();
         let cs = Changeset::new(parts).unwrap();
+        let parent = cs.id();
         // A fresh server, with cold caches, counting its store calls.
         let faults = Faults::new();
         let fm = Arc::new(FaultMetaStore::new(meta.clone(), faults.clone()));
@@ -111,6 +136,7 @@ async fn measure(p: &BenchParams) -> Vec<Cost> {
         ops.create_changeset(REPO, cs, &CreateOptions::default())
             .await
             .unwrap();
+        tip = parent;
         let time = started.elapsed();
         // The first run warms the database's own caches and is not counted.
         if run > 0 {
@@ -139,8 +165,22 @@ async fn slow_create_cost_is_independent_of_repo_size() {
     };
     let small = measure(&small_params).await;
     let big = measure(&BENCH_TIP).await;
-    let metrics: [Metric; 6] = [
-        ("wall time (ms)", |c| c.time.as_secs_f64() * 1000.0),
+    // Wall time is reported, not asserted: it depends on the machine's
+    // load. The store calls are the deterministic measure of cost.
+    let time = |costs: &[Cost]| {
+        median(
+            costs
+                .iter()
+                .map(|c| c.time.as_secs_f64() * 1000.0)
+                .collect(),
+        )
+    };
+    eprintln!(
+        "wall time (ms): 10k-file repo {:.2}, 3M-file repo {:.2}",
+        time(&small),
+        time(&big)
+    );
+    let metrics: [Metric; 5] = [
         ("metadata reads", |c| c.counts.meta_gets as f64),
         ("metadata keys read", |c| c.counts.meta_get_keys as f64),
         ("metadata bytes read", |c| c.counts.meta_get_bytes as f64),
