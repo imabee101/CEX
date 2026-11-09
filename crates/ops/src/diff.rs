@@ -9,11 +9,14 @@ use imara_diff::{Algorithm, Diff, InternedInput};
 use scion_core::{BlobId, ChangesetId, EntryTarget, FileKind, RepoPath, TreeId};
 use store::{BlobStore, MetaStore, RepoId};
 
-use crate::blob::{MAX_TEXT_BYTES, blob_is_text, is_text, read_blob};
+use crate::blob::{MAX_TEXT_BYTES, classify_blobs, is_text, read_blob};
 use crate::{OpError, Ops};
 
 /// Lines of context around each patch hunk.
 pub const PATCH_CONTEXT: u32 = 3;
+
+/// Bound temporary classification state independently of the diff's size.
+const CLASSIFICATION_FILES: usize = 256;
 
 /// What a diff reports per path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -290,42 +293,51 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         out.sort_by(|x, y| x.path.cmp(&y.path));
         if mode != DiffMode::Names {
             let blobs = d.blobs();
-            for f in &mut out {
-                if [f.old, f.new]
-                    .into_iter()
-                    .flatten()
-                    .any(|s| s.size > MAX_TEXT_BYTES as u64)
-                {
-                    f.binary = true;
-                    continue;
-                }
-                for s in [f.old, f.new].into_iter().flatten() {
-                    if !blob_is_text(&**d.meta(), &**blobs, repo, s.blob, s.size).await? {
+            for files in out.chunks_mut(CLASSIFICATION_FILES) {
+                for f in files.iter_mut() {
+                    if [f.old, f.new]
+                        .into_iter()
+                        .flatten()
+                        .any(|s| s.size > MAX_TEXT_BYTES as u64)
+                    {
                         f.binary = true;
-                        break;
+                        continue;
                     }
                 }
-                if f.binary {
-                    continue;
-                }
-                let old = match f.old {
-                    Some(s) => read_blob(&**blobs, repo, s.blob).await?,
-                    None => Vec::new(),
-                };
-                let new = match f.new {
-                    Some(s) => read_blob(&**blobs, repo, s.blob).await?,
-                    None => Vec::new(),
-                };
-                if !is_text(&old) || !is_text(&new) {
-                    f.binary = true;
-                    continue;
-                }
-                let mut patch = Vec::new();
-                let (added, removed) = unified(&old, &new, &mut patch);
-                f.added_lines = added;
-                f.removed_lines = removed;
-                if mode == DiffMode::Patch {
-                    f.patch = patch;
+                let requests: Vec<_> = files
+                    .iter()
+                    .filter(|f| !f.binary)
+                    .flat_map(|f| [f.old, f.new].into_iter().flatten())
+                    .map(|s| (s.blob, s.size))
+                    .collect();
+                let text = classify_blobs(&**d.meta(), blobs, repo, &requests).await?;
+                for f in files {
+                    if f.binary {
+                        continue;
+                    }
+                    f.binary = [f.old, f.new].into_iter().flatten().any(|s| !text[&s.blob]);
+                    if f.binary {
+                        continue;
+                    }
+                    let old = match f.old {
+                        Some(s) => read_blob(&**blobs, repo, s.blob).await?,
+                        None => Vec::new(),
+                    };
+                    let new = match f.new {
+                        Some(s) => read_blob(&**blobs, repo, s.blob).await?,
+                        None => Vec::new(),
+                    };
+                    if !is_text(&old) || !is_text(&new) {
+                        f.binary = true;
+                        continue;
+                    }
+                    let mut patch = Vec::new();
+                    let (added, removed) = unified(&old, &new, &mut patch);
+                    f.added_lines = added;
+                    f.removed_lines = removed;
+                    if mode == DiffMode::Patch {
+                        f.patch = patch;
+                    }
                 }
             }
         }

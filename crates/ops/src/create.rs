@@ -149,9 +149,10 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
         self.create_changeset(repo, cs, opts).await
     }
 
-    /// Creates a changeset. Creating an existing changeset again succeeds
-    /// and writes nothing; concurrent creates of one changeset on this
-    /// server share one computation and one write.
+    /// Creates a changeset. Creating an existing changeset again writes
+    /// nothing, provided its requested ACL version is ready. Concurrent
+    /// creates with the same id, ACL version, case-check setting, and import
+    /// setting on this server share one computation and one write.
     pub async fn create_changeset(
         &self,
         repo: RepoId,
@@ -246,7 +247,10 @@ impl<M: MetaStore, B: BlobStore> Ops<M, B> {
                 .pop()
                 .flatten()
                 .ok_or_else(|| {
-                    OpError::new(Code::Unavailable, "parent case index awaits backfill")
+                    OpError::new(
+                        Code::DataLoss,
+                        "parent lacks the required case index; operator backfill is required",
+                    )
                 })?;
             cx.set_input(key, value);
         }

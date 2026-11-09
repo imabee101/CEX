@@ -2,7 +2,7 @@
 //! `CHUNK_BYTES`, and recorded in the metadata store only after their
 //! frames are stored (INV-22).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -163,31 +163,97 @@ fn decode_payload(bytes: &[u8], kind: FrameKind, id: [u8; 32]) -> Result<Vec<u8>
     }
 }
 
-/// Classifies from upload metadata without fetching content. Legacy records
-/// read at most the first (4 MiB) chunk, never the rest of a binary blob.
-pub(crate) async fn blob_is_text<M: MetaStore, B: BlobStore>(
+/// The maximum number of blob records in a classification metadata read.
+const CLASSIFICATION_BATCH_SIZE: usize = 256;
+/// The maximum number of legacy first-chunk reads in flight.
+const SNIFF_CONCURRENCY: usize = 16;
+
+/// Classifies distinct blobs with bounded metadata batches. Legacy records
+/// are sniffed concurrently, with at most `SNIFF_CONCURRENCY` tasks in flight.
+pub(crate) async fn classify_blobs<M: MetaStore, B: BlobStore>(
     meta: &M,
+    blobs: &Arc<B>,
+    repo: RepoId,
+    requests: &[(BlobId, u64)],
+) -> Result<HashMap<BlobId, bool>, OpError> {
+    let mut sizes = BTreeMap::new();
+    for &(id, size) in requests {
+        if sizes
+            .insert(id, size)
+            .is_some_and(|previous| previous != size)
+        {
+            return Err(data_loss(id, "tree entries disagree on blob size"));
+        }
+    }
+    let mut out = HashMap::new();
+    let keys: Vec<_> = sizes
+        .iter()
+        .filter_map(|(&id, &size)| {
+            if size > MAX_TEXT_BYTES as u64 {
+                out.insert(id, false);
+                None
+            } else {
+                Some(MetaKey::Blob(id))
+            }
+        })
+        .collect();
+    let mut tasks = JoinSet::new();
+    for batch in keys.chunks(CLASSIFICATION_BATCH_SIZE) {
+        let records = meta.get(repo, batch).await?;
+        if records.len() != batch.len() {
+            return Err(OpError::new(
+                Code::DataLoss,
+                "incomplete blob metadata batch",
+            ));
+        }
+        for (key, bytes) in batch.iter().zip(records) {
+            let MetaKey::Blob(id) = *key else {
+                unreachable!("blob keys only")
+            };
+            let bytes = bytes.ok_or_else(|| data_loss(id, "missing blob record"))?;
+            let record = BlobRecord::decode(&bytes)?;
+            if record.size != sizes[&id] {
+                return Err(data_loss(id, "tree and blob sizes differ"));
+            }
+            if let Some(text) = record.text {
+                out.insert(id, text);
+            } else {
+                if tasks.len() >= SNIFF_CONCURRENCY {
+                    collect_classification(&mut tasks, &mut out).await?;
+                }
+                let blobs = blobs.clone();
+                tasks.spawn(
+                    async move { Ok((id, sniff_blob(&*blobs, repo, id, record.size).await?)) },
+                );
+            }
+        }
+    }
+    while !tasks.is_empty() {
+        collect_classification(&mut tasks, &mut out).await?;
+    }
+    Ok(out)
+}
+
+async fn collect_classification(
+    tasks: &mut JoinSet<Result<(BlobId, bool), OpError>>,
+    out: &mut HashMap<BlobId, bool>,
+) -> Result<(), OpError> {
+    if let Some(result) = tasks.join_next().await {
+        let (id, text) = result
+            .map_err(|e| OpError::new(Code::DataLoss, format!("blob sniff task failed: {e}")))??;
+        out.insert(id, text);
+    }
+    Ok(())
+}
+
+/// A legacy classification reads at most the first (4 MiB) chunk, never
+/// the rest of a binary blob.
+async fn sniff_blob<B: BlobStore>(
     blobs: &B,
     repo: RepoId,
     id: BlobId,
     size: u64,
 ) -> Result<bool, OpError> {
-    if size > MAX_TEXT_BYTES as u64 {
-        return Ok(false);
-    }
-    let record = meta
-        .get(repo, &[MetaKey::Blob(id)])
-        .await?
-        .pop()
-        .flatten()
-        .ok_or_else(|| data_loss(id, "missing blob record"))?;
-    let record = BlobRecord::decode(&record)?;
-    if record.size != size {
-        return Err(data_loss(id, "tree and blob sizes differ"));
-    }
-    if let Some(text) = record.text {
-        return Ok(text);
-    }
     let bytes = blobs
         .get(repo, ObjectKey::blob(id))
         .await?
